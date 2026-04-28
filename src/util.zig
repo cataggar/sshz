@@ -13,8 +13,7 @@ const trace_level: TraceLevel = .Info;
 pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
     if (builtin.os.tag != .freestanding) {
         if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
-            const writer = std.io.getStdErr().writer();
-            _ = writer.print(fmt ++ "\n", args) catch 0;
+            std.debug.print(fmt ++ "\n", args);
         }
     }
 }
@@ -22,9 +21,8 @@ pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
 pub fn tracedump(level: TraceLevel, comptime fmt: []const u8, args: anytype, data: []const u8) void {
     if (builtin.os.tag != .freestanding) {
         if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
-            const writer = std.io.getStdErr().writer();
-            _ = writer.print(fmt ++ "\n", args) catch 0;
-            _ = dump(writer, data) catch 0;
+            std.debug.print(fmt ++ "\n", args);
+            dump(data);
         }
     }
 }
@@ -51,31 +49,31 @@ pub fn asPackedBytes(T: type, ptr: anytype) []u8 {
 }
 
 // xxd style hexdump
-pub fn dump(writer: anytype, data: []const u8) !void {
+pub fn dump(data: []const u8) void {
     const bytes_per_line = 16;
     std.debug.assert(bytes_per_line % 2 == 0);
     var off: usize = 0;
 
     while (off < data.len) : (off += bytes_per_line) {
-        try writer.print("{x:0>8}: ", .{off});
         const bytes_to_show = if (off + bytes_per_line > data.len) data.len - off else bytes_per_line;
+        std.debug.print("{x:0>8}: ", .{off});
         for (0..bytes_per_line) |n| {
             if (n < bytes_to_show) {
-                try writer.print("{x:0>2}", .{data[off + n]});
+                std.debug.print("{x:0>2}", .{data[off + n]});
             } else {
-                try writer.print("  ", .{});
+                std.debug.print("  ", .{});
             }
             if (n % 2 == 1) {
-                try writer.print(" ", .{});
+                std.debug.print(" ", .{});
             }
         }
-        try writer.print(" ", .{});
+        std.debug.print(" ", .{});
         for (0..bytes_per_line) |n| {
             if (n < bytes_to_show) {
-                try writer.print("{c}", .{if (std.ascii.isPrint(data[off + n])) data[off + n] else '.'});
+                std.debug.print("{c}", .{if (std.ascii.isPrint(data[off + n])) data[off + n] else '.'});
             }
         }
-        try writer.print("\n", .{});
+        std.debug.print("\n", .{});
     }
 }
 

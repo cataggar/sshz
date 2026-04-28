@@ -38,7 +38,7 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
     if (b64_slice_opt) |b64_slice| {
         TRACEDUMP(.Debug, "b64", .{}, b64_slice);
         var decoder = std.base64.Base64DecoderWithIgnore.init(std.base64.standard_alphabet_chars, '=', "\n");
-        const decoded_size = try decoder.calcSizeUpperBound(b64_slice.len);
+        const decoded_size = decoder.calcSizeUpperBound(b64_slice.len);
         if (decoded_size > keydata_bin_buf.len) {
             return PrivKeyError.PrivKeyOutofSpace;
         }

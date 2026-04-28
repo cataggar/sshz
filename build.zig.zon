@@ -1,17 +1,14 @@
 .{
-    .name = "misshod",
+    .name = .misshod,
     .version = "0.0.1",
-    .minimum_zig_version = "0.14.0",
+    .fingerprint = 0x7170711567835565,
+    .minimum_zig_version = "0.16.0",
 
-    .dependencies = .{
-    },
+    .dependencies = .{},
 
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
     },
 }
