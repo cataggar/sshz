@@ -83,8 +83,8 @@ pub fn dump(writer: anytype, data: []const u8) !void {
     var off: usize = 0;
 
     while (off < data.len) : (off += bytes_per_line) {
-        try writer.print("{x:0>8}: ", .{off});
         const bytes_to_show = if (off + bytes_per_line > data.len) data.len - off else bytes_per_line;
+        try writer.print("{x:0>8}: ", .{off});
         for (0..bytes_per_line) |n| {
             if (n < bytes_to_show) {
                 try writer.print("{x:0>2}", .{data[off + n]});
