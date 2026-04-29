@@ -43,6 +43,7 @@ pub const MsgId = enum(u8) {
     SSH_MSG_CHANNEL_DATA = 94,
     SSH_MSG_CHANNEL_EXTENDED_DATA = 95,
     SSH_MSG_CHANNEL_EOF = 96,
+    SSH_MSG_CHANNEL_CLOSE = 97,
     SSH_MSG_CHANNEL_REQUEST = 98,
     SSH_MSG_CHANNEL_SUCCESS = 99,
 };
@@ -286,6 +287,7 @@ test "MsgId enum values match SSH RFC" {
     try std.testing.expectEqual(@as(u8, 90), @intFromEnum(MsgId.SSH_MSG_CHANNEL_OPEN));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(MsgId.SSH_MSG_CHANNEL_DATA));
     try std.testing.expectEqual(@as(u8, 96), @intFromEnum(MsgId.SSH_MSG_CHANNEL_EOF));
+    try std.testing.expectEqual(@as(u8, 97), @intFromEnum(MsgId.SSH_MSG_CHANNEL_CLOSE));
 }
 
 test "MaxPayload is reasonable" {

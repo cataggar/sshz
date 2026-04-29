@@ -44,6 +44,8 @@ pub const SessionState = enum {
     ChannelDataRx,
     ChannelDataTx,
     ChannelDataTxComplete,
+    ChannelCloseWrite,
+    ChannelClosed,
 };
 
 pub const Session = struct {
@@ -66,6 +68,7 @@ pub const Session = struct {
     encrypted: bool,
     channel_write_buf: [64]u8 = undefined, // FIXME size
     channel_write_buf_nbytes: usize,
+    channel_close_sent: bool,
 
     privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
@@ -87,6 +90,7 @@ pub const Session = struct {
             .privkey_passphrase = null,
             .auth_passphrase = null,
             .channel_write_buf_nbytes = 0,
+            .channel_close_sent = false,
         };
     }
 
@@ -449,6 +453,18 @@ pub const Session = struct {
                 self.channel_write_buf_nbytes = 0;
                 self.setSessionState(.ChannelData);
             },
+            .ChannelCloseWrite => {
+                // RFC 4254 §5.3 - send CHANNEL_CLOSE back to peer
+                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE));
+                try pkt.writeU32(0); // channel
+                self.channel_close_sent = true;
+                self.setSessionState(.ChannelClosed);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+            },
+            .ChannelClosed => {
+                misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
+            },
         }
     }
 
@@ -691,6 +707,32 @@ pub const Session = struct {
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
                 misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE) => {
+                // RFC 4254 §5.3 - must send CLOSE back if not already sent
+                _ = try rdr.readU32(); // channel
+                if (self.channel_close_sent) {
+                    misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
+                } else {
+                    self.setSessionState(.ChannelCloseWrite);
+                    self.setIoSessionState(.Idle);
+                }
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
+                // RFC 4253 §11.2 - must be silently ignored
+                self.setIoSessionState(.ReadPktHdr);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
+                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
+                const always_display = try rdr.readBoolean();
+                const message = try rdr.readU32LenString();
+                _ = try rdr.readU32LenString(); // language tag
+                if (always_display) {
+                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
+                } else {
+                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
+                }
+                self.setIoSessionState(.ReadPktHdr);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
                 // RFC 4253 §11.2 - must be silently ignored
