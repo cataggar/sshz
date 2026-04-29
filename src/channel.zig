@@ -9,7 +9,6 @@ pub const ChannelState = enum {
     RspWrite,
     Connected,
     Data,
-    DataRxAdjustWindow,
     DataRx,
     DataTx,
     DataTxComplete,
@@ -52,6 +51,21 @@ pub const Channel = struct {
 
     pub fn secureZero(self: *Self) void {
         std.crypto.secureZero(u8, &self.write_buf);
+    }
+
+    /// Decrement local_window by the amount of data received.
+    pub fn consumeLocalWindow(self: *Self, len: u32) void {
+        self.local_window -|= len; // saturating subtract
+    }
+
+    /// Returns true if local_window has dropped below the replenish threshold.
+    pub fn needsWindowAdjust(self: *const Self) bool {
+        return self.local_window < Protocol.MaxPayload / 2;
+    }
+
+    /// Returns the number of bytes to add to bring local_window back to MaxPayload.
+    pub fn windowAdjustAmount(self: *const Self) u32 {
+        return Protocol.MaxPayload - self.local_window;
     }
 };
 
@@ -126,7 +140,7 @@ pub const ChannelTable = struct {
             .ConfirmWrite, .RspWrite, .CloseWrite, .OpenFailureWrite => true,
             .Connected => true,
             .Data => true,
-            .DataRxAdjustWindow, .DataTx, .DataTxComplete => true,
+            .DataTx, .DataTxComplete => true,
             .DataRx, .Open, .Closed => false,
         };
     }
@@ -332,4 +346,43 @@ test "findNextRunnable returns null when no channels runnable" {
     const ch1 = table.allocChannel(20, 32768, 32768).?;
     ch1.state = .DataRx;
     try std.testing.expect(table.findNextRunnable() == null);
+}
+
+test "consumeLocalWindow decrements local_window" {
+    var ch = Channel.init(0, 1, 32768, 32768);
+    const initial = ch.local_window;
+    ch.consumeLocalWindow(100);
+    try std.testing.expectEqual(initial - 100, ch.local_window);
+}
+
+test "consumeLocalWindow saturates at zero" {
+    var ch = Channel.init(0, 1, 32768, 32768);
+    ch.local_window = 50;
+    ch.consumeLocalWindow(200);
+    try std.testing.expectEqual(@as(u32, 0), ch.local_window);
+}
+
+test "needsWindowAdjust triggers below half MaxPayload" {
+    var ch = Channel.init(0, 1, 32768, 32768);
+    // At full window — no adjust needed
+    try std.testing.expect(!ch.needsWindowAdjust());
+
+    // Just above threshold — no adjust
+    ch.local_window = Protocol.MaxPayload / 2;
+    try std.testing.expect(!ch.needsWindowAdjust());
+
+    // Below threshold — adjust needed
+    ch.local_window = Protocol.MaxPayload / 2 - 1;
+    try std.testing.expect(ch.needsWindowAdjust());
+}
+
+test "windowAdjustAmount replenishes to MaxPayload" {
+    var ch = Channel.init(0, 1, 32768, 32768);
+    ch.local_window = 100;
+    const adjust = ch.windowAdjustAmount();
+    try std.testing.expectEqual(Protocol.MaxPayload - 100, adjust);
+
+    // After applying the adjust, window should be MaxPayload
+    ch.local_window += adjust;
+    try std.testing.expectEqual(Protocol.MaxPayload, ch.local_window);
 }
