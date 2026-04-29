@@ -57,7 +57,7 @@ pub const Session = struct {
     keydata: Protocol.KeyDataBi,
     rand: std.Random = undefined,
     encrypted: bool,
-    channel_write_buf: [64]u8 = undefined, // FIXME size
+    channel_write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     channel_write_buf_nbytes: usize,
     channel_close_sent: bool,
 
