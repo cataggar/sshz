@@ -84,6 +84,8 @@ pub const KexHashOrder = enum { // https://datatracker.ietf.org/doc/html/rfc5656
 
 pub const MaxSSHPacket = 4096; // Can be smaller https://datatracker.ietf.org/doc/html/rfc4253#section-5.3
 pub const MaxPayload = (MaxSSHPacket - (sizeof_PktHdr + 255 + mac_algo.key_length));
+// Max channel data: MaxPayload minus channel data framing (msgid:1 + channel:4 + string_len:4)
+pub const MaxChannelDataLen = MaxPayload - 9;
 pub const MaxIVLen = 20; // number of bytes to generate for IVs
 pub const MaxKeyLen = 64; // number of bytes to generate for keys
 
@@ -293,6 +295,13 @@ test "MsgId enum values match SSH RFC" {
 test "MaxPayload is reasonable" {
     try std.testing.expect(MaxPayload > 0);
     try std.testing.expect(MaxPayload < MaxSSHPacket);
+}
+
+test "MaxChannelDataLen accounts for framing overhead" {
+    // Channel data framing: msgid(1) + channel(4) + string_len(4) = 9 bytes
+    try std.testing.expectEqual(MaxPayload - 9, MaxChannelDataLen);
+    try std.testing.expect(MaxChannelDataLen > 0);
+    try std.testing.expect(MaxChannelDataLen > 64); // must be larger than old hardcoded value
 }
 
 test "KeyDataBi.clear zeros all key material" {

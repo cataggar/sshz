@@ -66,7 +66,7 @@ pub const Session = struct {
     username: []const u8,
     rand: std.Random = undefined,
     encrypted: bool,
-    channel_write_buf: [64]u8 = undefined, // FIXME size
+    channel_write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     channel_write_buf_nbytes: usize,
     channel_close_sent: bool,
 
@@ -717,6 +717,22 @@ pub const Session = struct {
                     self.setSessionState(.ChannelCloseWrite);
                     self.setIoSessionState(.Idle);
                 }
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
+                // RFC 4253 §11.2 - must be silently ignored
+                self.setIoSessionState(.ReadPktHdr);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
+                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
+                const always_display = try rdr.readBoolean();
+                const message = try rdr.readU32LenString();
+                _ = try rdr.readU32LenString(); // language tag
+                if (always_display) {
+                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
+                } else {
+                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
+                }
+                self.setIoSessionState(.ReadPktHdr);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
                 // RFC 4253 §11.2 - must be silently ignored
