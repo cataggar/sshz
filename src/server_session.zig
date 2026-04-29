@@ -199,7 +199,9 @@ pub const Session = struct {
                 self.kex_hash_order = self.kex_hash_order.check(.Q_C);
                 self.kex_hasher.writeU32LenString(&self.q_c);
 
-                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generate();
+                var seed: [Protocol.kex_algo.seed_length]u8 = undefined;
+                self.rand.bytes(&seed);
+                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generateDeterministic(seed) catch unreachable;
                 try pkt.writeU32LenString(&self.ecdh_ephem_keypair.public_key);
                 TRACEDUMP(.Debug, "qs", .{}, &self.ecdh_ephem_keypair.public_key);
 
@@ -375,14 +377,13 @@ pub const Session = struct {
     }
 
     pub fn channelWriteComplete(self: *Self, nbytes: usize) MisshodError!void {
-        TRACEDUMP(.Debug, "channelWriteComplete nbytes={d} sessionState={any} ioState={any}", .{ nbytes, self.sessionState, self.ioSessionState }, self.channel_write_buf[0..nbytes]);
         if (nbytes > self.channel_write_buf.len) {
             return IoError.tooBig;
-        } else {
-            self.channel_write_buf_nbytes = nbytes; // will be picked up for send in next .ChannelData -> .ChannelDataTx
-            self.setSessionState(.ChannelData);
-            self.setIoSessionState(.Idle);
         }
+        TRACEDUMP(.Debug, "channelWriteComplete nbytes={d} sessionState={any} ioState={any}", .{ nbytes, self.sessionState, self.ioSessionState }, self.channel_write_buf[0..nbytes]);
+        self.channel_write_buf_nbytes = nbytes;
+        self.setSessionState(.ChannelData);
+        self.setIoSessionState(.Idle);
     }
 
     pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
@@ -712,38 +713,6 @@ pub const Session = struct {
                     self.setSessionState(.ChannelCloseWrite);
                     self.setIoSessionState(.Idle);
                 }
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
-                // RFC 4253 §11.2 - must be silently ignored
-                self.setIoSessionState(.ReadPktHdr);
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
-                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
-                const always_display = try rdr.readBoolean();
-                const message = try rdr.readU32LenString();
-                _ = try rdr.readU32LenString(); // language tag
-                if (always_display) {
-                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
-                } else {
-                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
-                }
-                self.setIoSessionState(.ReadPktHdr);
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
-                // RFC 4253 §11.2 - must be silently ignored
-                self.setIoSessionState(.ReadPktHdr);
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
-                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
-                const always_display = try rdr.readBoolean();
-                const message = try rdr.readU32LenString();
-                _ = try rdr.readU32LenString(); // language tag
-                if (always_display) {
-                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
-                } else {
-                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
-                }
-                self.setIoSessionState(.ReadPktHdr);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
                 // RFC 4253 §11.2 - must be silently ignored
