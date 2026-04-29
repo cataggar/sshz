@@ -416,7 +416,7 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                 }
             },
-            .Open => {
+            .OpenWrite, .Open => {
                 self.setIoSessionState(.ReadPktHdr);
             },
         }
