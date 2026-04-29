@@ -556,6 +556,15 @@ pub const Session = struct {
                 chan.write_buf_nbytes = 0;
                 chan.state = .Data;
             },
+            .EofWrite => {
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF));
+                try pkt.writeU32(chan.remote_id);
+                chan.eof_sent = true;
+                chan.state = .DataRx;
+                self.active_channel_id = null;
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+            },
             .CloseWrite => {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE));
@@ -582,6 +591,7 @@ pub const Session = struct {
 
     pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) MisshodError![]u8 {
         if (self.channel_table.findByLocalId(channel_id)) |chan| {
+            if (chan.eof_sent) return &.{};
             if (chan.write_buf_nbytes > 0) {
                 return &.{};
             } else {
@@ -593,6 +603,7 @@ pub const Session = struct {
 
     pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.eof_sent) return IoError.UnexpectedResponse;
         if (nbytes > chan.write_buf.len) {
             return IoError.tooBig;
         }
@@ -609,6 +620,7 @@ pub const Session = struct {
     // Full-duplex: build and send channel data packet directly without going through state machine
     pub fn directChannelWrite(self: *Self, channel_id: u32, nbytes: usize, misshod: *MisshodClient) MisshodError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.eof_sent) return IoError.UnexpectedResponse;
         if (nbytes > chan.write_buf.len) {
             return IoError.tooBig;
         }
@@ -626,6 +638,15 @@ pub const Session = struct {
         misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
         chan.peer_window -= @intCast(send_len);
         chan.write_buf_nbytes = 0;
+    }
+
+    pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.eof_sent) return;
+        chan.state = .EofWrite;
+        self.active_channel_id = channel_id;
+        self.setSessionState(.ChannelActive);
+        self.setIoSessionState(.Idle);
     }
 
     pub fn sendWindowChange(self: *Self, cols: u32, rows: u32, width_px: u32, height_px: u32) void {
@@ -895,6 +916,11 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 };
+                if (chan.eof_received) {
+                    TRACE(.Debug, "discarding data after EOF on channel {d}", .{channelnum});
+                    self.setIoSessionState(.ReadPktHdr);
+                    return;
+                }
                 if (chan.state != .DataRx) {
                     return IoError.UnexpectedResponse;
                 }
@@ -911,6 +937,11 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 };
+                if (chan.eof_received) {
+                    TRACE(.Debug, "discarding extended data after EOF on channel {d}", .{channelnum});
+                    self.setIoSessionState(.ReadPktHdr);
+                    return;
+                }
                 if (chan.state != .DataRx) {
                     return IoError.UnexpectedResponse;
                 }

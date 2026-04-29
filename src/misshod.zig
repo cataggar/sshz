@@ -682,6 +682,12 @@ pub fn MisshodImpl(role: Role) type {
             try self.advance();
         }
     }
+
+    pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
+        try self.session.sendChannelEof(channel_id);
+        self.iostate_wr = .Idle;
+        try self.advance();
+    }
 };
 }
 
