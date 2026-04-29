@@ -16,21 +16,24 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const exe = b.addExecutable(.{
-        .name = "mssh",
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    exe.addIncludePath(b.path("src/"));
 
     const misshod_dep = b.dependency("misshod", .{
         .target = target,
         .optimize = optimize,
     });
-    const misshod_mod = misshod_dep.module("misshod");
-    exe.root_module.addImport("misshod", misshod_mod);
+    exe_mod.addImport("misshod", misshod_dep.module("misshod"));
+
+    const exe = b.addExecutable(.{
+        .name = "mssh",
+        .root_module = exe_mod,
+    });
+    exe.addIncludePath(b.path("src/"));
 
     b.installArtifact(exe);
 

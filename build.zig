@@ -15,14 +15,19 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = b.addModule("misshod", .{
+    const mod = b.addModule("misshod", .{
         .root_source_file = b.path("src/misshod.zig"),
     });
+    _ = mod;
 
-    const lib_tests = b.addTest(.{
+    const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    const lib_tests = b.addTest(.{
+        .root_module = test_mod,
     });
 
     const run_lib_tests = b.addRunArtifact(lib_tests);

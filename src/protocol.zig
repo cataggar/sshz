@@ -22,7 +22,9 @@ pub const CommDir = enum {
 // https://datatracker.ietf.org/doc/html/rfc4250#section-4.1.2
 pub const MsgId = enum(u8) {
     SSH_MSG_DISCONNECT = 1,
+    SSH_MSG_IGNORE = 2,
     SSH_MSG_UNIMPLEMENTED = 3,
+    SSH_MSG_DEBUG = 4,
     SSH_MSG_SERVICE_REQUEST = 5,
     SSH_MSG_SERVICE_ACCEPT = 6,
     SSH_MSG_KEXINIT = 20,
@@ -264,3 +266,20 @@ pub fn wrapPkt(rand:*std.Random, encrypted:bool, keysuni:*KeyDataUni, buffer: *B
     }
 }
 
+test "MsgId enum values match SSH RFC" {
+    // RFC 4253 transport layer messages
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(MsgId.SSH_MSG_DISCONNECT));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(MsgId.SSH_MSG_IGNORE));
+    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(MsgId.SSH_MSG_UNIMPLEMENTED));
+    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(MsgId.SSH_MSG_DEBUG));
+
+    // RFC 4254 channel messages
+    try std.testing.expectEqual(@as(u8, 90), @intFromEnum(MsgId.SSH_MSG_CHANNEL_OPEN));
+    try std.testing.expectEqual(@as(u8, 94), @intFromEnum(MsgId.SSH_MSG_CHANNEL_DATA));
+    try std.testing.expectEqual(@as(u8, 96), @intFromEnum(MsgId.SSH_MSG_CHANNEL_EOF));
+}
+
+test "MaxPayload is reasonable" {
+    try std.testing.expect(MaxPayload > 0);
+    try std.testing.expect(MaxPayload < MaxSSHPacket);
+}
