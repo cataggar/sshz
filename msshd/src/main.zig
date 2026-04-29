@@ -57,11 +57,11 @@ pub fn main() !void {
                             std.debug.print("Connected!\n", .{});
                             try misshod.clearEvent(eventCode);
                         },
-                        .RxData => |rbuf| {
+                        .RxData => |rxdata| {
                             const stdout_writer = std.io.getStdOut().writer();
-                            try stdout_writer.print("{s}", .{rbuf});
+                            try stdout_writer.print("{s}", .{rxdata.data});
 
-                            _ = try pipeInFile.writer().print("You said '{s}'\r\n", .{rbuf});
+                            _ = try pipeInFile.writer().print("You said '{s}'\r\n", .{rxdata.data});
 
                             try misshod.clearEvent(eventCode);
                         },
@@ -96,6 +96,9 @@ pub fn main() !void {
                         .GetPubkeyForUser => |username| {
                             std.debug.print(".GetPubkeyForUser: {s}\n", .{username});
                             std.debug.assert(false);
+                        },
+                        .ChannelRequest, .WindowChange, .Signal, .RxExtendedData => {
+                            try misshod.clearEvent(eventCode);
                         },
                     }
                 },
@@ -151,11 +154,11 @@ pub fn main() !void {
                             continue :ioloop;
                         }
                         if (fds[1].revents & std.posix.POLL.IN > 0) { // data to be sent (from pipe)
-                            const buf = try misshod.getChannelWriteBuffer();
+                            const buf = try misshod.getChannelWriteBuffer(0);
                             if (buf.len > 0) {
                                 const count = pipeOutFile.reader().read(buf) catch 0;
                                 if (count > 0) {
-                                    try misshod.channelWriteComplete(count);
+                                    try misshod.channelWriteComplete(0, count);
                                     continue :ioloop;
                                 }
                             }
