@@ -38,6 +38,8 @@ pub const MsgId = enum(u8) {
     SSH_MSG_USERAUTH_PK_OK = 60, // also SSH_MSG_USERAUTH_INFO_REQUEST per RFC 4256
     SSH_MSG_USERAUTH_INFO_RESPONSE = 61,
     SSH_MSG_GLOBAL_REQUEST = 80,
+    SSH_MSG_REQUEST_SUCCESS = 81,
+    SSH_MSG_REQUEST_FAILURE = 82,
     SSH_MSG_CHANNEL_OPEN = 90,
     SSH_MSG_CHANNEL_OPEN_CONFIRMATION = 91,
     SSH_MSG_CHANNEL_OPEN_FAILURE = 92,
@@ -49,7 +51,6 @@ pub const MsgId = enum(u8) {
     SSH_MSG_CHANNEL_REQUEST = 98,
     SSH_MSG_CHANNEL_SUCCESS = 99,
 };
-
 
 // SSH packet header, appears before payload
 // https://datatracker.ietf.org/doc/html/rfc4253#section-6
@@ -138,9 +139,9 @@ pub const KeyDataBi = struct {
     s2c: KeyDataUni,
 
     pub fn init() Self {
-        return Self {
-            .c2s = .{.seq = 0},
-            .s2c = .{.seq = 0},
+        return Self{
+            .c2s = .{ .seq = 0 },
+            .s2c = .{ .seq = 0 },
         };
     }
 
@@ -154,7 +155,7 @@ pub const KeyDataBi = struct {
     }
 
     // generate session keys from shared secret
-    pub fn genKeys(self:* Self, H: [hash_algo.digest_length]u8, shared_secret_k:[kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
+    pub fn genKeys(self: *Self, H: [hash_algo.digest_length]u8, shared_secret_k: [kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
 
         // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
 
@@ -221,7 +222,7 @@ pub const KeyDataBi = struct {
     }
 };
 
-pub fn wrapPkt(rand:*std.Random, encrypted:bool, keysuni:*KeyDataUni, buffer: *BufferWriter, iobuf: []u8) MisshodError![]const u8 {
+pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer: *BufferWriter, iobuf: []u8) MisshodError![]const u8 {
     // https://datatracker.ietf.org/doc/html/rfc4253#section-6
     // pad such that whole packet (payload + hdr) is multiple of block_size
     const buffer_len = buffer.active().len;
@@ -288,6 +289,9 @@ test "MsgId enum values match SSH RFC" {
     try std.testing.expectEqual(@as(u8, 4), @intFromEnum(MsgId.SSH_MSG_DEBUG));
 
     // RFC 4254 channel messages
+    try std.testing.expectEqual(@as(u8, 80), @intFromEnum(MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try std.testing.expectEqual(@as(u8, 81), @intFromEnum(MsgId.SSH_MSG_REQUEST_SUCCESS));
+    try std.testing.expectEqual(@as(u8, 82), @intFromEnum(MsgId.SSH_MSG_REQUEST_FAILURE));
     try std.testing.expectEqual(@as(u8, 90), @intFromEnum(MsgId.SSH_MSG_CHANNEL_OPEN));
     try std.testing.expectEqual(@as(u8, 94), @intFromEnum(MsgId.SSH_MSG_CHANNEL_DATA));
     try std.testing.expectEqual(@as(u8, 96), @intFromEnum(MsgId.SSH_MSG_CHANNEL_EOF));
