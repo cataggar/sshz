@@ -703,6 +703,22 @@ pub const Session = struct {
                 }
                 self.setIoSessionState(.ReadPktHdr);
             },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
+                // RFC 4253 §11.2 - must be silently ignored
+                self.setIoSessionState(.ReadPktHdr);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
+                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
+                const always_display = try rdr.readBoolean();
+                const message = try rdr.readU32LenString();
+                _ = try rdr.readU32LenString(); // language tag
+                if (always_display) {
+                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
+                } else {
+                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
+                }
+                self.setIoSessionState(.ReadPktHdr);
+            },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
                 // TBD
                 self.setIoSessionState(.ReadPktHdr); // read again
