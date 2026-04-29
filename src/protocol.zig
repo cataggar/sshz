@@ -139,6 +139,15 @@ pub const KeyDataBi = struct {
         };
     }
 
+    pub fn clear(self: *Self) void {
+        std.crypto.secureZero(u8, &self.c2s.iv);
+        std.crypto.secureZero(u8, &self.c2s.key);
+        std.crypto.secureZero(u8, &self.c2s.mackey);
+        std.crypto.secureZero(u8, &self.s2c.iv);
+        std.crypto.secureZero(u8, &self.s2c.key);
+        std.crypto.secureZero(u8, &self.s2c.mackey);
+    }
+
     // generate session keys from shared secret
     pub fn genKeys(self:* Self, H: [hash_algo.digest_length]u8, shared_secret_k:[kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
 
@@ -282,4 +291,26 @@ test "MsgId enum values match SSH RFC" {
 test "MaxPayload is reasonable" {
     try std.testing.expect(MaxPayload > 0);
     try std.testing.expect(MaxPayload < MaxSSHPacket);
+}
+
+test "KeyDataBi.clear zeros all key material" {
+    var kd = KeyDataBi.init();
+    // fill with non-zero data
+    @memset(&kd.c2s.iv, 0xAA);
+    @memset(&kd.c2s.key, 0xBB);
+    @memset(&kd.c2s.mackey, 0xCC);
+    @memset(&kd.s2c.iv, 0xDD);
+    @memset(&kd.s2c.key, 0xEE);
+    @memset(&kd.s2c.mackey, 0xFF);
+
+    kd.clear();
+
+    const zero_iv: [MaxIVLen]u8 = .{0} ** MaxIVLen;
+    const zero_key: [MaxKeyLen]u8 = .{0} ** MaxKeyLen;
+    try std.testing.expectEqualSlices(u8, &zero_iv, &kd.c2s.iv);
+    try std.testing.expectEqualSlices(u8, &zero_key, &kd.c2s.key);
+    try std.testing.expectEqualSlices(u8, &zero_key, &kd.c2s.mackey);
+    try std.testing.expectEqualSlices(u8, &zero_iv, &kd.s2c.iv);
+    try std.testing.expectEqualSlices(u8, &zero_key, &kd.s2c.key);
+    try std.testing.expectEqualSlices(u8, &zero_key, &kd.s2c.mackey);
 }

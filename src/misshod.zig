@@ -136,9 +136,9 @@ pub fn MisshodImpl(role: Role) type {
         };
     }
 
-    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-        _ = self;
-        _ = allocator;
+    pub fn deinit(self: *Self) void {
+        self.session.deinit();
+        std.crypto.secureZero(u8, &self.iobuf);
     }
 
     // for session use
