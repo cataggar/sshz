@@ -624,6 +624,15 @@ pub const Session = struct {
                             .username = username,
                             .auth = null
                         } }, .Idle);
+                    } else if (std.mem.eql(u8, authtyp, "keyboard-interactive")) {
+                        // RFC 4256 §3.1
+                        _ = try rdr.readU32LenString(); // language tag
+                        const submethods = try rdr.readU32LenString();
+                        self.setSessionState(.CheckUserPasswordAuth);
+                        misshod.requestEvent(.{ .UserAuth = .{
+                            .username = username,
+                            .auth = .{ .KeyboardInteractive = submethods },
+                        } }, .Idle);
                     } else {
                         return IoError.UnimplementedService;
                     }
