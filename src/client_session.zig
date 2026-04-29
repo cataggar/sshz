@@ -44,6 +44,7 @@ pub const SessionState = enum {
     ChannelDataRx,
     ChannelDataTx,
     ChannelDataTxComplete,
+    ChannelWindowChangeWrite,
     ChannelCloseWrite,
     ChannelClosed,
 };
@@ -70,6 +71,7 @@ pub const Session = struct {
     channel_write_buf_nbytes: usize,
     channel_close_sent: bool,
     peer_window: u32,
+    pending_window_change: ?[4]u32,
 
     privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
@@ -93,6 +95,7 @@ pub const Session = struct {
             .channel_write_buf_nbytes = 0,
             .channel_close_sent = false,
             .peer_window = 0,
+            .pending_window_change = null,
         };
     }
 
@@ -425,7 +428,9 @@ pub const Session = struct {
                 self.setSessionState(.ChannelData);
             },
             .ChannelData => {
-                if (self.channel_write_buf_nbytes > 0) { // something to send
+                if (self.pending_window_change != null) {
+                    self.setSessionState(.ChannelWindowChangeWrite);
+                } else if (self.channel_write_buf_nbytes > 0) { // something to send
                     self.setSessionState(.ChannelDataTx);
                 } else { // wait for incoming
                     self.setSessionState(.ChannelDataRxAdjustWindow);
@@ -463,6 +468,22 @@ pub const Session = struct {
                 self.channel_write_buf_nbytes = 0;
                 self.setSessionState(.ChannelData);
             },
+            .ChannelWindowChangeWrite => {
+                // RFC 4254 §6.7 - send window-change channel request
+                const wc = self.pending_window_change.?;
+                self.pending_window_change = null;
+                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+                try pkt.writeU32(0); // channel
+                try pkt.writeU32LenString("window-change");
+                try pkt.writeBoolean(false); // want reply
+                try pkt.writeU32(wc[0]); // cols
+                try pkt.writeU32(wc[1]); // rows
+                try pkt.writeU32(wc[2]); // width_px
+                try pkt.writeU32(wc[3]); // height_px
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                self.setSessionState(.ChannelData);
+            },
             .ChannelCloseWrite => {
                 // RFC 4254 §5.3 - send CHANNEL_CLOSE back to peer
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
@@ -496,6 +517,16 @@ pub const Session = struct {
         if (self.sessionState == .ChannelDataRx) { // waiting to receive
             if (self.ioSessionState == .ReadPktHdr) { // nothing actually happening
                 self.setSessionState(.ChannelDataTx);
+                self.setIoSessionState(.Idle);
+            }
+        }
+    }
+
+    pub fn sendWindowChange(self: *Self, cols: u32, rows: u32, width_px: u32, height_px: u32) void {
+        self.pending_window_change = .{ cols, rows, width_px, height_px };
+        if (self.sessionState == .ChannelDataRx) {
+            if (self.ioSessionState == .ReadPktHdr) {
+                self.setSessionState(.ChannelWindowChangeWrite);
                 self.setIoSessionState(.Idle);
             }
         }
@@ -1093,4 +1124,19 @@ test "handlePacket: SSH_MSG_CHANNEL_EXTENDED_DATA surfaces stderr" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "sendWindowChange queues pending change" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    try std.testing.expect(session.pending_window_change == null);
+    session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expect(session.pending_window_change != null);
+    const wc = session.pending_window_change.?;
+    try std.testing.expectEqual(@as(u32, 120), wc[0]);
+    try std.testing.expectEqual(@as(u32, 40), wc[1]);
+    try std.testing.expectEqual(@as(u32, 960), wc[2]);
+    try std.testing.expectEqual(@as(u32, 640), wc[3]);
 }

@@ -82,6 +82,13 @@ pub const UserCredentials = struct {
     auth: ?UserCredentialsPasswordOrPubkey, // null for "none" auth
 };
 
+pub const WindowSize = struct {
+    cols: u32,
+    rows: u32,
+    width_px: u32,
+    height_px: u32,
+};
+
 pub const MisshodServerEventCodes = union(enum) {
     EndSession: EndSessionReason,
     UserAuth: UserCredentials,
@@ -89,6 +96,8 @@ pub const MisshodServerEventCodes = union(enum) {
     Connected,
     RxData: []const u8,
     RxExtendedData: ExtendedData,
+    WindowChange: WindowSize,
+    Signal: []const u8,
 };
 
 pub fn MisshodEvent(role:Role) type {
@@ -632,4 +641,30 @@ test "ExtendedData struct" {
     const ext: ExtendedData = .{ .data_type = 1, .data = "stderr output" };
     try std.testing.expectEqual(@as(u32, 1), ext.data_type);
     try std.testing.expectEqualStrings("stderr output", ext.data);
+}
+
+test "WindowSize struct" {
+    const ws: WindowSize = .{ .cols = 120, .rows = 40, .width_px = 960, .height_px = 640 };
+    try std.testing.expectEqual(@as(u32, 120), ws.cols);
+    try std.testing.expectEqual(@as(u32, 40), ws.rows);
+}
+
+test "MisshodServerEventCodes WindowChange variant" {
+    const evt: MisshodServerEventCodes = .{ .WindowChange = .{ .cols = 80, .rows = 24, .width_px = 640, .height_px = 480 } };
+    switch (evt) {
+        .WindowChange => |ws| {
+            try std.testing.expectEqual(@as(u32, 80), ws.cols);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "MisshodServerEventCodes Signal variant" {
+    const evt: MisshodServerEventCodes = .{ .Signal = "INT" };
+    switch (evt) {
+        .Signal => |sig| {
+            try std.testing.expectEqualStrings("INT", sig);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

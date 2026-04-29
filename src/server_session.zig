@@ -667,7 +667,25 @@ pub const Session = struct {
                     _ = widthpx;
                     _ = heightpx;
                 } else if (std.mem.eql(u8, typ, "shell")) {
-                    // FIXME, any special shell behaviour here
+                    // shell request — no additional data
+                } else if (std.mem.eql(u8, typ, "window-change")) {
+                    // RFC 4254 §6.7
+                    const cols = try rdr.readU32();
+                    const rows = try rdr.readU32();
+                    const widthpx = try rdr.readU32();
+                    const heightpx = try rdr.readU32();
+                    misshod.requestEvent(.{ .WindowChange = .{
+                        .cols = cols,
+                        .rows = rows,
+                        .width_px = widthpx,
+                        .height_px = heightpx,
+                    } }, .Idle);
+                    return;
+                } else if (std.mem.eql(u8, typ, "signal")) {
+                    // RFC 4254 §6.9
+                    const signal_name = try rdr.readU32LenString();
+                    misshod.requestEvent(.{ .Signal = signal_name }, .Idle);
+                    return;
                 } else {
                     TRACE(.Debug, "channel req '{s}'", .{typ});
                     if (wantreply) {    // can't do this
