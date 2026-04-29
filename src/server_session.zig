@@ -453,25 +453,27 @@ pub const Session = struct {
                 const cookie = try rdr.readBytes(16);
                 TRACEDUMP(.Debug, "cookie", .{}, cookie);
 
-                const listnames = [_][]const u8{
-                    "Protocol.kex_algorithms",
-                    "server_host_key_algorithms",
-                    "encryption_algorithms_client_to_server",
-                    "encryption_algorithms_server_to_client",
-                    "Protocol.mac_algorithms_client_to_server",
-                    "Protocol.mac_algorithms_server_to_client",
-                    "compression_algorithms_client_to_server",
-                    "compression_algorithms_server_to_client",
-                    "languages_client_to_server",
-                    "languages_server_to_client",
+                // RFC 4253 §7.1 - validate peer supports our algorithms
+                const required_algos = [_]struct { name: []const u8, required: []const u8 }{
+                    .{ .name = "kex_algorithms", .required = Protocol.kex_algo_name },
+                    .{ .name = "server_host_key_algorithms", .required = Protocol.srv_hostkey_algo_name },
+                    .{ .name = "encryption_algorithms_client_to_server", .required = Protocol.enc_algo_name },
+                    .{ .name = "encryption_algorithms_server_to_client", .required = Protocol.enc_algo_name },
+                    .{ .name = "mac_algorithms_client_to_server", .required = Protocol.mac_algo_name },
+                    .{ .name = "mac_algorithms_server_to_client", .required = Protocol.mac_algo_name },
                 };
 
-                for (listnames) |listname| {
-                    TRACE(.Debug, "{s}: ", .{listname});
-                    var iter = util.NameListTokenizer.init(try rdr.readU32LenString());
-                    while (iter.next()) |name| {
-                        TRACE(.Debug, "  '{s}' ", .{name});
+                for (required_algos) |algo| {
+                    const namelist = try rdr.readU32LenString();
+                    if (!nameListContains(namelist, algo.required)) {
+                        TRACE(.Info, "No mutual algorithm for {s}: peer offers '{s}', we need '{s}'", .{ algo.name, namelist, algo.required });
+                        return IoError.AlgorithmNegotiationFailed;
                     }
+                }
+
+                // skip remaining lists (compression, languages)
+                for (0..4) |_| {
+                    _ = try rdr.readU32LenString();
                 }
 
                 const first_kex_packet_follows = try rdr.readBoolean();
@@ -809,3 +811,11 @@ pub const Session = struct {
     }
 
 };
+
+fn nameListContains(namelist: []const u8, target: []const u8) bool {
+    var iter = util.NameListTokenizer.init(namelist);
+    while (iter.next()) |name| {
+        if (std.mem.eql(u8, name, target)) return true;
+    }
+    return false;
+}

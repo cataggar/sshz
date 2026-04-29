@@ -23,6 +23,7 @@ pub const IoError = error{
     UnexpectedResponse,
     tooBig,
     UnimplementedService,
+    AlgorithmNegotiationFailed,
 };
 
 pub const DisconnectReason = struct {
