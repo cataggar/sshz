@@ -75,6 +75,7 @@ pub const Session = struct {
     peer_window: u32,
     pending_window_change: ?[4]u32,
     kbd_interactive_response: ?[]u8, // allocated
+    is_rekeying: bool,
 
     privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
@@ -100,6 +101,7 @@ pub const Session = struct {
             .peer_window = 0,
             .pending_window_change = null,
             .kbd_interactive_response = null,
+            .is_rekeying = false,
         };
     }
 
@@ -195,8 +197,14 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .CheckHostKey => {
-                misshod.requestEvent(.{ .CheckHostKey = self.hostkey_ks }, .Idle);
-                self.setSessionState(.CheckHostKeyCompleted);
+                if (self.is_rekeying) {
+                    // Skip host key check during re-key, already trusted
+                    self.setSessionState(.NewKeysRead);
+                    self.setIoSessionState(.ReadPktHdr);
+                } else {
+                    misshod.requestEvent(.{ .CheckHostKey = self.hostkey_ks }, .Idle);
+                    self.setSessionState(.CheckHostKeyCompleted);
+                }
             },
             .CheckHostKeyCompleted => {
                 self.setSessionState(.NewKeysRead);
@@ -211,8 +219,13 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
-                self.setSessionState(.AuthServReq);
-                self.encrypted = true; // have read and written SSH_MSG_NEWKEYS, encrypted from now on
+                if (self.is_rekeying) {
+                    self.is_rekeying = false;
+                    self.setSessionState(.ChannelData);
+                } else {
+                    self.setSessionState(.AuthServReq);
+                }
+                self.encrypted = true;
             },
             .AuthServReq => {
                 // https://datatracker.ietf.org/doc/html/rfc4253
@@ -619,6 +632,26 @@ pub const Session = struct {
             @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT) => {
                 TRACE(.Debug, "{any}", .{@as(Protocol.MsgId, @enumFromInt(msgid))});
 
+                const is_rekey = self.sessionState != .KexInitRead;
+                if (is_rekey) {
+                    if (self.sessionState != .ChannelData and
+                        self.sessionState != .ChannelDataRx and
+                        self.sessionState != .ChannelDataRxAdjustWindow)
+                    {
+                        self.setIoSessionState(.ReadPktHdr);
+                        return;
+                    }
+                    // RFC 4253 §9 - peer-initiated re-keying
+                    TRACE(.Info, "Re-keying initiated by peer", .{});
+                    self.kex_hasher = Hasher(Protocol.hash_algo).init();
+                    self.kex_hash_order = .Init;
+                    self.kex_hash_order = self.kex_hash_order.check(.V_C);
+                    self.kex_hasher.writeU32LenString(Protocol.version);
+                    self.kex_hash_order = self.kex_hash_order.check(.V_S);
+                    self.kex_hasher.writeU32LenString(Protocol.version);
+                    self.is_rekeying = true;
+                }
+
                 self.kex_hash_order = self.kex_hash_order.check(.I_S);
                 self.kex_hasher.writeU32LenString(rdr.payload[(rdr.off - 1)..]); // from before the msgid
 
@@ -653,11 +686,10 @@ pub const Session = struct {
                 TRACE(.Debug, "first_kex_packet_follows = {any}\n", .{first_kex_packet_follows});
                 _ = try rdr.readU32(); // reserved, ignore
 
-                if (self.sessionState == .KexInitRead) {
+                if (self.sessionState == .KexInitRead or is_rekey) {
                     self.setSessionState(.EcdhInitWrite);
                     self.setIoSessionState(.Idle);
                 } else {
-                    // go read another packet
                     self.setIoSessionState(.ReadPktHdr);
                 }
             },
@@ -1265,4 +1297,11 @@ test "nameListContains rejects missing algorithm" {
     try std.testing.expect(!nameListContains("aes128-ctr,aes256-cbc", "aes256-ctr"));
     try std.testing.expect(!nameListContains("", "aes256-ctr"));
     try std.testing.expect(!nameListContains("aes256-ct", "aes256-ctr"));
+}
+
+test "is_rekeying starts false" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+    try std.testing.expect(!session.is_rekeying);
 }
