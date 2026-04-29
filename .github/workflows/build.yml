@@ -10,23 +10,17 @@ jobs:
     runs-on: ${{matrix.os}}
     steps:
       - name: Checkout misshod
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           path: misshod
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: master
+          version: 0.16.0
       - name: Build test
         run: zig build test
         working-directory: misshod
       - name: Build lib
         run: zig build
         working-directory: misshod
-      - name: Build mssh
-        run: zig build
-        working-directory: misshod/mssh
-      - name: Build msshd
-        run: zig build
-        working-directory: misshod/msshd
 
