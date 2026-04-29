@@ -58,7 +58,7 @@ pub const Session = struct {
     channel_write_buf: [64]u8 = undefined, // FIXME size
     channel_write_buf_nbytes: usize,
 
-    privkey_ascii: ?[]u8, // allocated  // FIXME deinit properly and clear
+    privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
     auth_passphrase: ?[]u8, //allocated
 
@@ -89,6 +89,28 @@ pub const Session = struct {
         try decodePrivKey(hostkey_ascii, null, &s.privkey_blob, &s.pubkey_blob);
 
         return s;
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.clearAndFreeOptional(&self.privkey_ascii);
+        self.clearAndFreeOptional(&self.privkey_passphrase);
+        self.clearAndFreeOptional(&self.auth_passphrase);
+        std.crypto.secureZero(u8, &self.shared_secret_k);
+        std.crypto.secureZero(u8, &self.session_id);
+        std.crypto.secureZero(u8, &self.privkey_blob);
+        std.crypto.secureZero(u8, &self.pubkey_blob);
+        std.crypto.secureZero(u8, &self.auth_pubkey_attempted);
+        std.crypto.secureZero(u8, &self.q_c);
+        std.crypto.secureZero(u8, &self.channel_write_buf);
+        self.keydata.clear();
+    }
+
+    fn clearAndFreeOptional(self: *Self, field: *?[]u8) void {
+        if (field.*) |slice| {
+            std.crypto.secureZero(u8, slice);
+            self.allocator.free(slice);
+            field.* = null;
+        }
     }
 
     pub fn setIoSessionState(self: *Self, newState: Protocol.IoSessionState) void {
@@ -349,6 +371,7 @@ pub const Session = struct {
 
     pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
         if (self.privkey_ascii) |old| {
+            std.crypto.secureZero(u8, old);
             self.allocator.free(old);
             self.privkey_ascii = null;
         }
@@ -358,6 +381,7 @@ pub const Session = struct {
 
     pub fn setPrivateKeyPassphrase(self: *Self, data: []const u8) MisshodError!void {
         if (self.privkey_passphrase) |old| {
+            std.crypto.secureZero(u8, old);
             self.allocator.free(old);
             self.privkey_passphrase = null;
         }
@@ -367,6 +391,7 @@ pub const Session = struct {
 
     pub fn setAuthPassphrase(self: *Self, data: []const u8) MisshodError!void {
         if (self.auth_passphrase) |old| {
+            std.crypto.secureZero(u8, old);
             self.allocator.free(old);
             self.auth_passphrase = null;
         }
