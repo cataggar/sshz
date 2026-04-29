@@ -647,13 +647,11 @@ pub const Session = struct {
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_BANNER) => {
-                TRACE(.Debug, "Protocol.MsgId.SSH_MSG_USERAUTH_BANNER", .{});
+                // RFC 4252 §5.4 - banner message before auth completes
                 const banner = try rdr.readU32LenString();
-                TRACE(.Info, "Server banner '{s}'", .{util.chomp(banner)});
-                const lang = try rdr.readU32LenString();
-                TRACE(.Debug, "Server banner language '{s}'", .{lang});
-                // do another read
-                self.setIoSessionState(.ReadPktHdr);
+                TRACE(.Debug, "Server banner '{s}'", .{util.chomp(banner)});
+                _ = try rdr.readU32LenString(); // language tag
+                misshod.requestEvent(.{ .Banner = banner }, .ReadPktHdr);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS) => {
                 // don't care what state we were in, we've been let in

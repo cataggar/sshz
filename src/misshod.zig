@@ -63,6 +63,7 @@ pub const MisshodClientEventCodes = union(enum) {
     EndSession: EndSessionReason,
     Connected,
     RxData: []const u8,
+    Banner: []const u8,
 };
 
 pub const UserCredentialsPasswordOrPubkey = union(enum) {
@@ -605,6 +606,16 @@ test "EndSessionReason tagged union" {
         .ServerDisconnect => |r| {
             try std.testing.expectEqual(@as(u32, 11), r.code);
             try std.testing.expectEqualStrings("test disconnect", r.description);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "MisshodClientEventCodes Banner variant" {
+    const banner: MisshodClientEventCodes = .{ .Banner = "Welcome to the server" };
+    switch (banner) {
+        .Banner => |text| {
+            try std.testing.expectEqualStrings("Welcome to the server", text);
         },
         else => return error.TestUnexpectedResult,
     }
