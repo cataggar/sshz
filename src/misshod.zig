@@ -63,7 +63,13 @@ pub const MisshodClientEventCodes = union(enum) {
     EndSession: EndSessionReason,
     Connected,
     RxData: []const u8,
+    RxExtendedData: ExtendedData,
     Banner: []const u8,
+};
+
+pub const ExtendedData = struct {
+    data_type: u32,
+    data: []const u8,
 };
 
 pub const UserCredentialsPasswordOrPubkey = union(enum) {
@@ -82,6 +88,7 @@ pub const MisshodServerEventCodes = union(enum) {
     GetPubkeyForUser: []const u8,
     Connected,
     RxData: []const u8,
+    RxExtendedData: ExtendedData,
 };
 
 pub fn MisshodEvent(role:Role) type {
@@ -619,4 +626,10 @@ test "MisshodClientEventCodes Banner variant" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "ExtendedData struct" {
+    const ext: ExtendedData = .{ .data_type = 1, .data = "stderr output" };
+    try std.testing.expectEqual(@as(u32, 1), ext.data_type);
+    try std.testing.expectEqualStrings("stderr output", ext.data);
 }

@@ -702,6 +702,15 @@ pub const Session = struct {
                 misshod.requestEvent(.{ .RxData = s }, .Idle);
                 self.setSessionState(.ChannelData);
             },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
+                // RFC 4254 §5.2 - extended data (e.g. stderr)
+                _ = try rdr.readU32(); // channel
+                const data_type = try rdr.readU32();
+                const s = try rdr.readU32LenString();
+                TRACE(.Debug, "extended data type={d} len={d}", .{ data_type, s.len });
+                misshod.requestEvent(.{ .RxExtendedData = .{ .data_type = data_type, .data = s } }, .Idle);
+                self.setSessionState(.ChannelData);
+            },
             @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
                 // RFC 4253 §11.1
                 const reason_code = try rdr.readU32();
@@ -1054,4 +1063,34 @@ test "handlePacket: CHANNEL_WINDOW_ADJUST increases peer window" {
 
     try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
     try std.testing.expectEqual(@as(u32, 6000), m.session.peer_window);
+}
+
+test "handlePacket: SSH_MSG_CHANNEL_EXTENDED_DATA surfaces stderr" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA));
+    try pw.writeU32(0); // channel
+    try pw.writeU32(1); // data_type_code = SSH_EXTENDED_DATA_STDERR
+    try pw.writeU32LenString("error: something failed\n");
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .RxExtendedData => |ext| {
+                try std.testing.expectEqual(@as(u32, 1), ext.data_type);
+                try std.testing.expectEqualStrings("error: something failed\n", ext.data);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
