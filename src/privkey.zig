@@ -150,7 +150,7 @@ pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, pri
     @memcpy(privkey_blob, key_blob_prv);
 }
 
-const testkey_valid = "-----BEGIN OPENSSH PRIVATE KEY-----\n" ++
+pub const testkey_valid = "-----BEGIN OPENSSH PRIVATE KEY-----\n" ++
     "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\n" ++
     "QyNTUxOQAAACDog6jr6QPaMp+fpV6mmzHL3y8JZUWJ17oDr2AVcPd09QAAAJiIu1EaiLtR\n" ++
     "GgAAAAtzc2gtZWQyNTUxOQAAACDog6jr6QPaMp+fpV6mmzHL3y8JZUWJ17oDr2AVcPd09Q\n" ++
