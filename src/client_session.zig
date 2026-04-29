@@ -57,7 +57,7 @@ pub const Session = struct {
 
     ecdh_ephem_keypair: Protocol.kex_algo.KeyPair = undefined,
     // In form U32LenString("ssh-ed25519"), U32LenString(secret)
-    hostkey_ks: ?[]u8 = undefined, // K_S, slice of hostkey_ks_buf, allocated
+    hostkey_ks: ?[]u8 = null, // K_S, allocated
     shared_secret_k: [Protocol.kex_algo.shared_length]u8 = undefined, // K
     kex_hasher: Hasher(Protocol.hash_algo) = undefined, // for building H
     kex_hash_order: Protocol.KexHashOrder = .Init,
@@ -172,7 +172,9 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT));
 
-                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generate();
+                var seed: [Protocol.kex_algo.seed_length]u8 = undefined;
+                self.rand.bytes(&seed);
+                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generateDeterministic(seed) catch unreachable;
                 var q_c = self.ecdh_ephem_keypair.public_key;
                 try pkt.writeU32LenString(&q_c);
 
@@ -477,12 +479,11 @@ pub const Session = struct {
     }
 
     pub fn channelWriteComplete(self: *Self, nbytes: usize) MisshodError!void {
-        TRACEDUMP(.Debug, "channelWriteComplete nbytes={d} sessionState={any} ioState={any}", .{ nbytes, self.sessionState, self.ioSessionState }, self.channel_write_buf[0..nbytes]);
         if (nbytes > self.channel_write_buf.len) {
             return IoError.tooBig;
-        } else {
-            self.channel_write_buf_nbytes = nbytes; // will be picked up for send in next .ChannelData -> .ChannelDataTx
         }
+        TRACEDUMP(.Debug, "channelWriteComplete nbytes={d} sessionState={any} ioState={any}", .{ nbytes, self.sessionState, self.ioSessionState }, self.channel_write_buf[0..nbytes]);
+        self.channel_write_buf_nbytes = nbytes;
 
         if (self.sessionState == .ChannelDataRx) { // waiting to receive
             if (self.ioSessionState == .ReadPktHdr) { // nothing actually happening
@@ -490,8 +491,6 @@ pub const Session = struct {
                 self.setIoSessionState(.Idle);
             }
         }
-        // FIXME, if read is idling, cancel it - need to assume main's poll() is going to trip due to character write too though, FIXME
-
     }
 
     pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
@@ -734,38 +733,6 @@ pub const Session = struct {
                 }
                 self.setIoSessionState(.ReadPktHdr);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
-                // RFC 4253 §11.2 - must be silently ignored
-                self.setIoSessionState(.ReadPktHdr);
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
-                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
-                const always_display = try rdr.readBoolean();
-                const message = try rdr.readU32LenString();
-                _ = try rdr.readU32LenString(); // language tag
-                if (always_display) {
-                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
-                } else {
-                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
-                }
-                self.setIoSessionState(.ReadPktHdr);
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
-                // RFC 4253 §11.2 - must be silently ignored
-                self.setIoSessionState(.ReadPktHdr);
-            },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
-                // RFC 4253 §11.3 - may be logged, must not cause protocol failure
-                const always_display = try rdr.readBoolean();
-                const message = try rdr.readU32LenString();
-                _ = try rdr.readU32LenString(); // language tag
-                if (always_display) {
-                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
-                } else {
-                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
-                }
-                self.setIoSessionState(.ReadPktHdr);
-            },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
                 // TBD
                 self.setIoSessionState(.ReadPktHdr); // read again
@@ -779,3 +746,252 @@ pub const Session = struct {
     }
 
 };
+
+
+// Helper: build an unencrypted SSH packet in the provided buffer.
+// Returns the total packet length (header + payload + padding).
+fn buildUnencryptedPacket(buf: []u8, payload: []const u8) usize {
+    const padding_length: u8 = 8;
+    const packet_length: u32 = @intCast(payload.len + padding_length + 1);
+    // Build PktHdr the same way wrapPkt does
+    var hdr: Protocol.PktHdr = .{
+        .packet_length = packet_length,
+        .padding_length = padding_length,
+    };
+    if (native_endian != .big) {
+        std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
+    }
+    @memcpy(buf[0..Protocol.sizeof_PktHdr], util.asPackedBytes(Protocol.PktHdr, &hdr));
+    @memcpy(buf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload.len], payload);
+    @memset(buf[Protocol.sizeof_PktHdr + payload.len .. Protocol.sizeof_PktHdr + payload.len + padding_length], 0);
+    return Protocol.sizeof_PktHdr + payload.len + padding_length;
+}
+
+test "handlePacket: SSH_MSG_IGNORE is silently consumed" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_buf: [1]u8 = .{@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE)};
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, &payload_buf);
+    m.session.encrypted = false;
+    m.session.setIoSessionState(.ReadPktHdr);
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+    try std.testing.expectEqual(Protocol.IoSessionState.ReadPktHdr, m.session.ioSessionState);
+}
+
+test "handlePacket: SSH_MSG_DEBUG with always_display=true" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG));
+    try pw.writeBoolean(true);
+    try pw.writeU32LenString("test debug message");
+    try pw.writeU32LenString("en");
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+    m.session.setIoSessionState(.ReadPktHdr);
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+    try std.testing.expectEqual(Protocol.IoSessionState.ReadPktHdr, m.session.ioSessionState);
+}
+
+test "handlePacket: SSH_MSG_DEBUG with always_display=false" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG));
+    try pw.writeBoolean(false);
+    try pw.writeU32LenString("quiet debug");
+    try pw.writeU32LenString("");
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+    m.session.setIoSessionState(.ReadPktHdr);
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+    try std.testing.expectEqual(Protocol.IoSessionState.ReadPktHdr, m.session.ioSessionState);
+}
+
+test "handlePacket: SSH_MSG_DISCONNECT surfaces reason code" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT));
+    try pw.writeU32(11); // SSH_DISCONNECT_BY_APPLICATION
+    try pw.writeU32LenString("shutting down");
+    try pw.writeU32LenString("");
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .EndSession => |reason| switch (reason) {
+                .ServerDisconnect => |r| {
+                    try std.testing.expectEqual(@as(u32, 11), r.code);
+                    try std.testing.expectEqualStrings("shutting down", r.description);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handlePacket: SSH_MSG_CHANNEL_CLOSE when not yet sent triggers close reply" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [16]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE));
+    try pw.writeU32(0);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+    m.session.channel_close_sent = false;
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+    try std.testing.expectEqual(SessionState.ChannelCloseWrite, m.session.sessionState);
+}
+
+test "handlePacket: SSH_MSG_CHANNEL_CLOSE when already sent emits disconnect" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [16]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE));
+    try pw.writeU32(0);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+    m.session.channel_close_sent = true;
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .EndSession => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handlePacket: SSH_MSG_USERAUTH_BANNER surfaces banner event" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_BANNER));
+    try pw.writeU32LenString("Welcome to the server!\r\n");
+    try pw.writeU32LenString("en");
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .Banner => |text| {
+                try std.testing.expectEqualStrings("Welcome to the server!\r\n", text);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "client session deinit zeros sensitive fields" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+
+    try session.setPrivateKey("fake-key-data-for-testing");
+    try session.setPrivateKeyPassphrase("my-secret-passphrase");
+    try session.setAuthPassphrase("my-auth-password");
+    @memset(&session.shared_secret_k, 0xAA);
+    @memset(&session.session_id, 0xBB);
+    @memset(&session.privkey_blob, 0xCC);
+    @memset(&session.pubkey_blob, 0xDD);
+
+    session.deinit();
+
+    try std.testing.expect(session.privkey_ascii == null);
+    try std.testing.expect(session.privkey_passphrase == null);
+    try std.testing.expect(session.auth_passphrase == null);
+    for (session.shared_secret_k) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (session.session_id) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (session.privkey_blob) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    for (session.pubkey_blob) |b| try std.testing.expectEqual(@as(u8, 0), b);
+}
+
+test "setPrivateKey replaces previous key" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    try session.setPrivateKey("first-key");
+    try session.setPrivateKey("second-key");
+    try std.testing.expectEqualStrings("second-key", session.privkey_ascii.?);
+}
+
+test "client channel_close_sent starts false" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+    try std.testing.expect(!session.channel_close_sent);
+}
+
+test "client channel write buffer is MaxChannelDataLen" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    const buf = try session.getChannelWriteBuffer();
+    try std.testing.expectEqual(Protocol.MaxChannelDataLen, buf.len);
+}
+
+test "channelWriteComplete rejects oversized writes" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    const result = session.channelWriteComplete(Protocol.MaxChannelDataLen + 1);
+    try std.testing.expectError(IoError.tooBig, result);
+}
+
+test "channelWriteComplete accepts max-size write" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    session.setSessionState(.ChannelDataRx);
+    session.setIoSessionState(.ReadPktHdr);
+
+    try session.channelWriteComplete(Protocol.MaxChannelDataLen);
+    try std.testing.expectEqual(@as(usize, Protocol.MaxChannelDataLen), session.channel_write_buf_nbytes);
+}
