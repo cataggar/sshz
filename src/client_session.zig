@@ -34,6 +34,8 @@ pub const SessionState = enum {
     PubkeyAuthReq,
     AuthRsp,
     PasswordAuthReq,
+    KeyboardInteractiveAuthReq,
+    KeyboardInteractiveInfoRsp,
     ChannelOpenReq,
     ChannelOpenRsp,
     ChannelPtyReq,
@@ -72,6 +74,7 @@ pub const Session = struct {
     channel_close_sent: bool,
     peer_window: u32,
     pending_window_change: ?[4]u32,
+    kbd_interactive_response: ?[]u8, // allocated
 
     privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
@@ -96,6 +99,7 @@ pub const Session = struct {
             .channel_close_sent = false,
             .peer_window = 0,
             .pending_window_change = null,
+            .kbd_interactive_response = null,
         };
     }
 
@@ -103,6 +107,7 @@ pub const Session = struct {
         self.clearAndFreeOptional(&self.privkey_ascii);
         self.clearAndFreeOptional(&self.privkey_passphrase);
         self.clearAndFreeOptional(&self.auth_passphrase);
+        self.clearAndFreeOptional(&self.kbd_interactive_response);
         if (self.hostkey_ks) |ks| {
             std.crypto.secureZero(u8, ks);
             self.allocator.free(ks);
@@ -337,6 +342,32 @@ pub const Session = struct {
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.AuthRsp);
             },
+            .KeyboardInteractiveAuthReq => {
+                // RFC 4256 §3.1 - send keyboard-interactive auth request
+                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+                try pkt.writeU32LenString(self.username);
+                try pkt.writeU32LenString("ssh-connection");
+                try pkt.writeU32LenString("keyboard-interactive");
+                try pkt.writeU32LenString(""); // language tag
+                try pkt.writeU32LenString(""); // submethods
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                self.setSessionState(.AuthRsp);
+            },
+            .KeyboardInteractiveInfoRsp => {
+                // RFC 4256 §3.4 - send response to info request
+                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_INFO_RESPONSE));
+                try pkt.writeU32(1); // num-responses
+                if (self.kbd_interactive_response) |resp| {
+                    try pkt.writeU32LenString(resp);
+                } else {
+                    try pkt.writeU32LenString("");
+                }
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                self.clearAndFreeOptional(&self.kbd_interactive_response);
+                self.setSessionState(.AuthRsp);
+            },
             .AuthRsp => { // for password or pubkey
                 self.setIoSessionState(.ReadPktHdr);
             },
@@ -532,6 +563,11 @@ pub const Session = struct {
         }
     }
 
+    pub fn setKeyboardInteractiveResponse(self: *Self, response: []const u8) MisshodError!void {
+        self.clearAndFreeOptional(&self.kbd_interactive_response);
+        self.kbd_interactive_response = try self.allocator.dupe(u8, response);
+    }
+
     pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
         if (self.privkey_ascii) |old| {
             std.crypto.secureZero(u8, old);
@@ -714,6 +750,28 @@ pub const Session = struct {
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE) => {
                 misshod.requestEvent(.{ .EndSession = .AuthFailure }, .Idle);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK) => {
+                // RFC 4256 §3.3 - SSH_MSG_USERAUTH_INFO_REQUEST (same msg id as PK_OK)
+                const name = try rdr.readU32LenString();
+                const instruction = try rdr.readU32LenString();
+                _ = try rdr.readU32LenString(); // language tag
+                const num_prompts = try rdr.readU32();
+                if (num_prompts > 0) {
+                    const prompt = try rdr.readU32LenString();
+                    const echo = try rdr.readBoolean();
+                    misshod.requestEvent(.{ .KeyboardInteractive = .{
+                        .name = name,
+                        .instruction = instruction,
+                        .prompt = prompt,
+                        .echo = echo,
+                    } }, .Idle);
+                    self.setSessionState(.KeyboardInteractiveInfoRsp);
+                } else {
+                    // Zero prompts — send empty response
+                    self.setSessionState(.KeyboardInteractiveInfoRsp);
+                    self.setIoSessionState(.Idle);
+                }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-5.1
@@ -1139,4 +1197,50 @@ test "sendWindowChange queues pending change" {
     try std.testing.expectEqual(@as(u32, 40), wc[1]);
     try std.testing.expectEqual(@as(u32, 960), wc[2]);
     try std.testing.expectEqual(@as(u32, 640), wc[3]);
+}
+
+test "handlePacket: SSH_MSG_USERAUTH_INFO_REQUEST surfaces keyboard-interactive prompt" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [256]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK)); // msg 60 = INFO_REQUEST
+    try pw.writeU32LenString("Authentication"); // name
+    try pw.writeU32LenString("Please enter your password"); // instruction
+    try pw.writeU32LenString(""); // language tag
+    try pw.writeU32(1); // num-prompts
+    try pw.writeU32LenString("Password: "); // prompt
+    try pw.writeBoolean(false); // echo
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf, pw.payload);
+    m.session.encrypted = false;
+
+    try m.session.handlePacket(m.iobuf[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .KeyboardInteractive => |ki| {
+                try std.testing.expectEqualStrings("Authentication", ki.name);
+                try std.testing.expectEqualStrings("Please enter your password", ki.instruction);
+                try std.testing.expectEqualStrings("Password: ", ki.prompt);
+                try std.testing.expect(!ki.echo);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(SessionState.KeyboardInteractiveInfoRsp, m.session.sessionState);
+}
+
+test "setKeyboardInteractiveResponse stores response" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    try session.setKeyboardInteractiveResponse("my-password");
+    try std.testing.expect(session.kbd_interactive_response != null);
+    try std.testing.expectEqualStrings("my-password", session.kbd_interactive_response.?);
 }

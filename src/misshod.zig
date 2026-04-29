@@ -55,6 +55,13 @@ fn eventCodeType(role:Role) type {
     };
 }
 
+pub const KeyboardInteractivePrompt = struct {
+    name: []const u8,
+    instruction: []const u8,
+    prompt: []const u8,
+    echo: bool,
+};
+
 pub const MisshodClientEventCodes = union(enum) {
     CheckHostKey: ?[]const u8,
     GetPrivateKey,
@@ -65,6 +72,7 @@ pub const MisshodClientEventCodes = union(enum) {
     RxData: []const u8,
     RxExtendedData: ExtendedData,
     Banner: []const u8,
+    KeyboardInteractive: KeyboardInteractivePrompt,
 };
 
 pub const ExtendedData = struct {
@@ -73,8 +81,9 @@ pub const ExtendedData = struct {
 };
 
 pub const UserCredentialsPasswordOrPubkey = union(enum) {
-    Password: []const u8,   // "password" auth
-    Pubkey: []const u8, // "publickey" auth
+    Password: []const u8,
+    Pubkey: []const u8,
+    KeyboardInteractive: []const u8, // submethods
 };
 
 pub const UserCredentials = struct {
@@ -708,6 +717,25 @@ test "ChannelRequestType Shell variant" {
     const req: ChannelRequestType = .Shell;
     switch (req) {
         .Shell => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "KeyboardInteractivePrompt struct" {
+    const prompt: KeyboardInteractivePrompt = .{
+        .name = "Login",
+        .instruction = "Enter credentials",
+        .prompt = "Password: ",
+        .echo = false,
+    };
+    try std.testing.expectEqualStrings("Password: ", prompt.prompt);
+    try std.testing.expect(!prompt.echo);
+}
+
+test "UserCredentialsPasswordOrPubkey KeyboardInteractive variant" {
+    const auth: UserCredentialsPasswordOrPubkey = .{ .KeyboardInteractive = "" };
+    switch (auth) {
+        .KeyboardInteractive => {},
         else => return error.TestUnexpectedResult,
     }
 }
