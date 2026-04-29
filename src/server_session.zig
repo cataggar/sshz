@@ -696,6 +696,18 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
             },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
+                if (self.sessionState == .ChannelDataRx) {
+                    _ = try rdr.readU32(); // channel
+                    const data_type = try rdr.readU32();
+                    const s = try rdr.readU32LenString();
+                    TRACE(.Debug, "extended data type={d} len={d}", .{ data_type, s.len });
+                    misshod.requestEvent(.{ .RxExtendedData = .{ .data_type = data_type, .data = s } }, .Idle);
+                    self.setSessionState(.ChannelData);
+                } else {
+                    return IoError.UnexpectedResponse;
+                }
+            },
             @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
                 // RFC 4253 §11.1
                 const reason_code = try rdr.readU32();
