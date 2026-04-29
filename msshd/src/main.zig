@@ -99,14 +99,22 @@ pub fn main() !void {
                         },
                     }
                 },
-                .ReadyToConsume, .ReadyToProduce => |len| {
-                    var pollevts: i16 = 0;
+                .ReadyToConsume, .ReadyToProduce, .ReadyToConsumeAndProduce => {
+                    const consume_len: usize = switch (ev) {
+                        .ReadyToConsume => |n| n,
+                        .ReadyToConsumeAndProduce => |s| s.consume,
+                        else => 0,
+                    };
+                    const produce_len: usize = switch (ev) {
+                        .ReadyToProduce => |n| n,
+                        .ReadyToConsumeAndProduce => |s| s.produce,
+                        else => 0,
+                    };
+                    _ = produce_len;
 
-                    if (ev == .ReadyToConsume) {
-                        pollevts |= std.posix.POLL.IN;
-                    } else {
-                        pollevts |= std.posix.POLL.OUT;
-                    }
+                    var pollevts: i16 = 0;
+                    if (consume_len > 0) pollevts |= std.posix.POLL.IN;
+                    if (ev == .ReadyToProduce or ev == .ReadyToConsumeAndProduce) pollevts |= std.posix.POLL.OUT;
 
                     var fds = [_]std.posix.pollfd{
                         .{
@@ -123,15 +131,13 @@ pub fn main() !void {
 
                     const ready = std.posix.poll(&fds, 1000) catch 0;
                     if (ready > 0) {
-                        if (fds[0].revents & std.posix.POLL.IN > 0) { // socket is readable
-                            var bytes_to_read = len;
+                        if (fds[0].revents & std.posix.POLL.IN > 0 and consume_len > 0) { // socket is readable
+                            var bytes_to_read = consume_len;
                             if (bytes_to_read > iobuf.len) {
                                 bytes_to_read = iobuf.len;
                             }
                             const nbytes = try stream.read(iobuf[0..bytes_to_read]);
                             if (nbytes > 0) {
-                                // misshod may not get as much as it asked for, but it can req more later
-                                //std.debug.print("Can consume {d}\n", .{len});
                                 try misshod.write(iobuf[0..nbytes]);
                                 continue :ioloop;
                             } else {
@@ -139,10 +145,8 @@ pub fn main() !void {
                             }
                         }
                         if (fds[0].revents & std.posix.POLL.OUT > 0) { // socket is writeable
-                            const towrite = try misshod.peek(4); // get data it wants to send up to a limit
+                            const towrite = try misshod.peek(4);
                             const bytes_written = try stream.write(towrite);
-                            //std.debug.print("bytes_written = {d} towrite={d}\n", .{bytes_written, towrite.len});
-                            // socket may not have accepted all of the bytes
                             try misshod.consumed(bytes_written);
                             continue :ioloop;
                         }
@@ -156,8 +160,6 @@ pub fn main() !void {
                                 }
                             }
                         }
-                    } else {
-                        //std.debug.print("timeout\n", .{});
                     }
                 },
             }
