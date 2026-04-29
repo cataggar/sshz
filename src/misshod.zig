@@ -740,3 +740,97 @@ test "UserCredentialsPasswordOrPubkey KeyboardInteractive variant" {
         else => return error.TestUnexpectedResult,
     }
 }
+
+test "client-server full handshake round-trip" {
+    const privkey = @import("privkey.zig");
+
+    var cprng = std.Random.DefaultPrng.init(1);
+    var sprng = std.Random.DefaultPrng.init(2);
+
+    var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    var server = try MisshodServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer server.deinit();
+
+    var c2s_buf: [16384]u8 = undefined;
+    var s2c_buf: [16384]u8 = undefined;
+    var c2s_len: usize = 0;
+    var s2c_len: usize = 0;
+
+    var connected_client = false;
+
+    const Endpoint = enum { client_ep, server_ep };
+    const endpoints = [_]Endpoint{ .client_ep, .server_ep };
+
+    var steps: usize = 0;
+    while (steps < 500) : (steps += 1) {
+        if (connected_client) break;
+
+        for (endpoints) |ep| {
+            const is_client = ep == .client_ep;
+
+            if (is_client) {
+                const cev = client.getNextEvent() catch continue;
+                switch (cev) {
+                    .ReadyToProduce => {
+                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
+                        c2s_len += data.len;
+                        client.consumed(data.len) catch {};
+                    },
+                    .ReadyToConsume => |n| {
+                        if (s2c_len > 0) {
+                            const feed = @min(n, s2c_len);
+                            client.write(s2c_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &s2c_buf, s2c_buf[feed..s2c_len]);
+                            s2c_len -= feed;
+                        }
+                    },
+                    .Event => |code| switch (code) {
+                        .CheckHostKey => { client.clearEvent(.{ .CheckHostKey = null }) catch {}; },
+                        .GetPrivateKey => { client.clearEvent(.GetPrivateKey) catch {}; },
+                        .GetAuthPassphrase => {
+                            client.session.setAuthPassphrase("testpass") catch {};
+                            client.clearEvent(.GetAuthPassphrase) catch {};
+                        },
+                        .Connected => {
+                            connected_client = true;
+                            client.clearEvent(.Connected) catch {};
+                        },
+                        .EndSession => { connected_client = false; break; },
+                        else => {},
+                    },
+                }
+            } else {
+                const sev = server.getNextEvent() catch continue;
+                switch (sev) {
+                    .ReadyToProduce => {
+                        const data = server.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(s2c_buf[s2c_len .. s2c_len + data.len], data);
+                        s2c_len += data.len;
+                        server.consumed(data.len) catch {};
+                    },
+                    .ReadyToConsume => |n| {
+                        if (c2s_len > 0) {
+                            const feed = @min(n, c2s_len);
+                            server.write(c2s_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
+                            c2s_len -= feed;
+                        }
+                    },
+                    .Event => |code| switch (code) {
+                        .UserAuth => {
+                            server.grantAccess(true) catch {};
+                            server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
+                        },
+                        .Connected => { server.clearEvent(.Connected) catch {}; },
+                        .ChannelRequest => { server.clearEvent(.{ .ChannelRequest = .Shell }) catch {}; },
+                        else => {},
+                    },
+                }
+            }
+        }
+    }
+
+    try std.testing.expect(connected_client);
+}
