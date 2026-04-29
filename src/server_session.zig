@@ -667,7 +667,25 @@ pub const Session = struct {
                     _ = widthpx;
                     _ = heightpx;
                 } else if (std.mem.eql(u8, typ, "shell")) {
-                    // shell request — no additional data
+                    // RFC 4254 §6.5 — interactive shell
+                    misshod.requestEvent(.{ .ChannelRequest = .Shell }, .Idle);
+                    if (!wantreply) return;
+                } else if (std.mem.eql(u8, typ, "exec")) {
+                    // RFC 4254 §6.5 — single command execution
+                    const command = try rdr.readU32LenString();
+                    misshod.requestEvent(.{ .ChannelRequest = .{ .Exec = command } }, .Idle);
+                    if (!wantreply) return;
+                } else if (std.mem.eql(u8, typ, "subsystem")) {
+                    // RFC 4254 §6.5 — named subsystem (e.g. sftp)
+                    const subsystem = try rdr.readU32LenString();
+                    misshod.requestEvent(.{ .ChannelRequest = .{ .Subsystem = subsystem } }, .Idle);
+                    if (!wantreply) return;
+                } else if (std.mem.eql(u8, typ, "env")) {
+                    // RFC 4254 §6.4 — set environment variable
+                    const name = try rdr.readU32LenString();
+                    const value = try rdr.readU32LenString();
+                    misshod.requestEvent(.{ .ChannelRequest = .{ .Env = .{ .name = name, .value = value } } }, .Idle);
+                    if (!wantreply) return;
                 } else if (std.mem.eql(u8, typ, "window-change")) {
                     // RFC 4254 §6.7
                     const cols = try rdr.readU32();
