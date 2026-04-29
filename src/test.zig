@@ -7,4 +7,5 @@ comptime {
     _ = @import("hasher.zig");
     _ = @import("aesctr.zig");
     _ = @import("protocol.zig");
+    _ = @import("misshod.zig");
 }

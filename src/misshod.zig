@@ -25,8 +25,14 @@ pub const IoError = error{
     UnimplementedService,
 };
 
-pub const EndSessionReason = enum {
+pub const DisconnectReason = struct {
+    code: u32,
+    description: []const u8,
+};
+
+pub const EndSessionReason = union(enum) {
     Disconnect,
+    ServerDisconnect: DisconnectReason,
     AuthFailure,
 };
 
@@ -575,4 +581,31 @@ pub fn MisshodImpl(role: Role) type {
         try self.advance();
     }
 };
+}
+
+test "EndSessionReason tagged union" {
+    const reason_disconnect: EndSessionReason = .Disconnect;
+    const reason_auth: EndSessionReason = .AuthFailure;
+    const reason_server: EndSessionReason = .{ .ServerDisconnect = .{
+        .code = 11,
+        .description = "test disconnect",
+    } };
+
+    switch (reason_disconnect) {
+        .Disconnect => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (reason_auth) {
+        .AuthFailure => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    switch (reason_server) {
+        .ServerDisconnect => |r| {
+            try std.testing.expectEqual(@as(u32, 11), r.code);
+            try std.testing.expectEqualStrings("test disconnect", r.description);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

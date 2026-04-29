@@ -673,8 +673,19 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT), @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
-                misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle); // FIXME reason code
+            @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
+                // RFC 4253 §11.1
+                const reason_code = try rdr.readU32();
+                const description = try rdr.readU32LenString();
+                _ = try rdr.readU32LenString(); // language tag
+                TRACE(.Info, "SSH_MSG_DISCONNECT reason={d} '{s}'", .{ reason_code, description });
+                misshod.requestEvent(.{ .EndSession = .{ .ServerDisconnect = .{
+                    .code = reason_code,
+                    .description = description,
+                } } }, .Idle);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
+                misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
                 // RFC 4253 §11.2 - must be silently ignored
