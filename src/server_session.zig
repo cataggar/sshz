@@ -154,7 +154,7 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .KexInitWrite => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
                 var cookie: [16]u8 = undefined;
                 self.rand.bytes(&cookie);
@@ -178,14 +178,14 @@ pub const Session = struct {
                 self.kex_hash_order = self.kex_hash_order.check(.I_S);
                 self.kex_hasher.writeU32LenString(pkt.active());
 
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.EcdhInitRead);
             },
             .EcdhInitRead => {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .EcdhReplyWrite => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
 
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
 
@@ -241,15 +241,15 @@ pub const Session = struct {
                 // generate keys
                 try self.keydata.genKeys(kexhash, self.shared_secret_k, self.session_id);
 
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
 
                 self.setSessionState(.NewKeysWrite);
             },
             .NewKeysWrite => {
                 // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.NewKeysRead);
 
             },
@@ -260,31 +260,31 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .AuthRspServReqSuccess => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_SERVICE_ACCEPT));
                 try pkt.writeU32LenString("ssh-userauth");
                 self.setSessionState(.AuthRead);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .CheckUserPasswordAuth => {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .UserPasswordAuthDenied => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE));
                 try pkt.writeU32LenString("password,publickey");
                 try pkt.writeBoolean(false);    // partial success
                 self.setSessionState(.AuthRead);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .UserAuthAccepted => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS));
                 self.setSessionState(.Authenticated);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .AuthPkAllowed => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK));
                 try pkt.writeU32LenString(Protocol.srv_hostkey_algo_name);
 
@@ -295,28 +295,28 @@ pub const Session = struct {
 
                 try pkt.writeU32LenString(typed_pubkey_buf.payload);
                 self.setSessionState(.AuthRead);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .Authenticated => {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelOpenConfirmWrite => {
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
                 try pkt.writeU32(self.chan);
                 try pkt.writeU32(self.chan);
                 try pkt.writeU32(Protocol.MaxPayload); // init window size
                 try pkt.writeU32(Protocol.MaxPayload); // max packet size
                 self.setSessionState(.ChannelConnected);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .ChannelRspWrite => {
                 //https://datatracker.ietf.org/doc/html/rfc4254#section-5.4
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS));
                 try pkt.writeU32(self.chan);
                 self.setSessionState(.ChannelData);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .ChannelConnected => {
                 misshod.requestEvent(.Connected, .Idle);
@@ -333,11 +333,11 @@ pub const Session = struct {
             },
             .ChannelDataRxAdjustWindow => {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-5.2
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
                 try pkt.writeU32(0); // channel
                 try pkt.writeU32(Protocol.MaxPayload); // bytes to add
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.ChannelDataTx);
             },
             .ChannelDataRx => {
@@ -351,11 +351,11 @@ pub const Session = struct {
                     self.setSessionState(.ChannelDataRx);
                     return;
                 }
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
                 try pkt.writeU32(self.chan);
                 try pkt.writeU32LenString(self.channel_write_buf[0..send_len]);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.peer_window -= @intCast(send_len);
                 self.setSessionState(.ChannelDataTxComplete);
             },
@@ -365,12 +365,12 @@ pub const Session = struct {
             },
             .ChannelCloseWrite => {
                 // RFC 4254 §5.3 - send CHANNEL_CLOSE back to peer
-                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE));
                 try pkt.writeU32(self.chan);
                 self.channel_close_sent = true;
                 self.setSessionState(.ChannelClosed);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .ChannelClosed => {
                 misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
@@ -394,6 +394,26 @@ pub const Session = struct {
         self.channel_write_buf_nbytes = nbytes;
         self.setSessionState(.ChannelData);
         self.setIoSessionState(.Idle);
+    }
+
+    // Full-duplex: build and send channel data packet directly without going through state machine
+    pub fn directChannelWrite(self: *Self, nbytes: usize, misshod: *MisshodServer) MisshodError!void {
+        if (nbytes > self.channel_write_buf.len) {
+            return IoError.tooBig;
+        }
+        self.channel_write_buf_nbytes = nbytes;
+        const outkeys = &self.keydata.s2c;
+        const send_len = @min(self.channel_write_buf_nbytes, self.peer_window);
+        if (send_len == 0) {
+            return;
+        }
+        var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+        try pkt.writeU32(self.chan);
+        try pkt.writeU32LenString(self.channel_write_buf[0..send_len]);
+        misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+        self.peer_window -= @intCast(send_len);
+        self.channel_write_buf_nbytes = 0;
     }
 
     pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
@@ -436,7 +456,7 @@ pub const Session = struct {
     }
 
     pub fn handlePacket(self: *Self, buf: []const u8, misshod: *MisshodServer) MisshodError!void {
-        var rdr = try misshod.getRecvBuffer(misshod.iobuf[0..buf.len], &self.keydata.c2s);
+        var rdr = try misshod.getRecvBuffer(misshod.iobuf_rd[0..buf.len], &self.keydata.c2s);
 
         const msgid = try rdr.readU8();
 

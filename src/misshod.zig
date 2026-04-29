@@ -132,6 +132,7 @@ pub fn MisshodEvent(role:Role) type {
         Event: eventCodeType(role),
         ReadyToConsume: usize,
         ReadyToProduce: usize,
+        ReadyToConsumeAndProduce: struct { consume: usize, produce: usize },
     };
 }
 
@@ -170,34 +171,42 @@ pub fn MisshodImpl(role: Role) type {
     const Self = @This();
 
     session: sessionType(role),
-    iostate: IoState(role),
+    iostate_rd: IoState(role),
+    iostate_wr: IoState(role),
 
-    // io strategy, only ever reading or writing, always trying to get a fixed number of bytes
-    iobuf: [Protocol.MaxSSHPacket]u8 = undefined, // single shared buf, half duplex
-    iobuf_nbytes: usize,
-    iobuf_rdwroff: usize,
+    // full-duplex: separate read and write buffers
+    iobuf_rd: [Protocol.MaxSSHPacket]u8 = undefined,
+    iobuf_wr: [Protocol.MaxSSHPacket]u8 = undefined,
+    rd_nbytes: usize,
+    rd_off: usize,
+    wr_nbytes: usize,
+    wr_off: usize,
 
     pub fn init(rand: std.Random, username: []const u8, allocator: std.mem.Allocator) !Self {
         return Self{
             .session = try sessionType(role).init(rand, username, allocator),
-            .iobuf_nbytes = 0, // number of bytes in iobuf
-            .iobuf_rdwroff = 0, // rd offset into iobuf
-            .iostate = .Idle,
+            .rd_nbytes = 0,
+            .rd_off = 0,
+            .wr_nbytes = 0,
+            .wr_off = 0,
+            .iostate_rd = .Idle,
+            .iostate_wr = .Idle,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.session.deinit();
-        std.crypto.secureZero(u8, &self.iobuf);
+        std.crypto.secureZero(u8, &self.iobuf_rd);
+        std.crypto.secureZero(u8, &self.iobuf_wr);
     }
 
     // for session use
     pub fn requestWrite(self: *Self, wbuf: []const u8, next_state: Protocol.IoSessionState) void {
-        std.debug.assert(self.iostate == .Idle);
-        std.debug.assert(&wbuf[0] == &self.iobuf[0]);
-        self.iobuf_nbytes = wbuf.len;
-        self.iobuf_rdwroff = 0; // all writes start from start of buf
-        self.iostate = .{ .Active = .{
+        std.debug.assert(self.iostate_wr == .Idle);
+        std.debug.assert(&wbuf[0] == &self.iobuf_wr[0]);
+        self.wr_nbytes = wbuf.len;
+        self.wr_off = 0;
+        self.iostate_wr = .{ .Active = .{
             .action = .{ .Producing = wbuf.len },
             .next_state = next_state,
         } };
@@ -205,20 +214,17 @@ pub fn MisshodImpl(role: Role) type {
 
     // for session use
     pub fn requestRead(self: *Self, offset: usize, nbytes: usize, next_state: Protocol.IoSessionState) void {
-        self.iobuf_nbytes = 0;
-        self.iobuf_rdwroff = offset;
-        self.iostate = .{ .Active = .{
+        self.rd_nbytes = 0;
+        self.rd_off = offset;
+        self.iostate_rd = .{ .Active = .{
             .action = .{ .Consuming = nbytes },
             .next_state = next_state,
         } };
     }
 
     // for session use
-    // FIXME add event code
     pub fn requestEvent(self: *Self, code: eventCodeType(role), next_state: Protocol.IoSessionState) void {
-        self.iobuf_nbytes = 0; // unused
-        self.iobuf_rdwroff = 0; // unused
-        self.iostate = .{ .Active = .{
+        self.iostate_wr = .{ .Active = .{
             .action = .{ .Eventing = code },
             .next_state = next_state,
         } };
@@ -233,16 +239,16 @@ pub fn MisshodImpl(role: Role) type {
 
     pub fn clearEvent(self: *Self, clearEventCode: eventCodeType(role)) MisshodError!void {
         TRACE(.Debug, "clearEvent clearEventCode={any}", .{clearEventCode});
-        TRACE(.Debug, "clearEvent iostate={any}", .{self.iostate});
+        TRACE(.Debug, "clearEvent iostate_wr={any}", .{self.iostate_wr});
 
-        switch (self.iostate) {
+        switch (self.iostate_wr) {
             .Active => |iotype| {
                 switch (iotype.action) {
                     .Eventing => |eventCode| {
                         if (@intFromEnum(eventCode) == @intFromEnum(clearEventCode)) {
                             // event succesfully cleared
                             self.session.setIoSessionState(iotype.next_state);
-                            self.iostate = .Idle;
+                            self.iostate_wr = .Idle;
                             try self.advance();
                             return;
                         }
@@ -258,7 +264,7 @@ pub fn MisshodImpl(role: Role) type {
 
     pub fn getNextEvent(self: *Self) MisshodError!MisshodEvent(role) {
         // if eventing, send an event
-        switch (self.iostate) {
+        switch (self.iostate_wr) {
             .Active => |iotype| {
                 switch (iotype.action) {
                     .Eventing => |eventCode| {
@@ -270,77 +276,79 @@ pub fn MisshodImpl(role: Role) type {
             else => {},
         }
 
-        // else either .ReadyToConsume ^ .ReadyToProduce
+        // check both read and write readiness
         var can_consume_nbytes: usize = 0;
         var can_produce_nbytes: usize = 0;
 
         try self.getIoReq(&can_consume_nbytes, &can_produce_nbytes);
 
-        std.debug.assert(!(can_consume_nbytes > 0 and can_produce_nbytes > 0));
         std.debug.assert(can_consume_nbytes > 0 or can_produce_nbytes > 0);
 
-        if (can_consume_nbytes > 0) {
+        if (can_consume_nbytes > 0 and can_produce_nbytes > 0) {
+            return MisshodEvent(role){ .ReadyToConsumeAndProduce = .{ .consume = can_consume_nbytes, .produce = can_produce_nbytes } };
+        } else if (can_consume_nbytes > 0) {
             return MisshodEvent(role){ .ReadyToConsume = can_consume_nbytes };
         } else {
             return MisshodEvent(role){ .ReadyToProduce = can_produce_nbytes };
         }
-
-        unreachable;
     }
 
     fn getIoReq(self: *Self, can_consume: *usize, can_produce: *usize) MisshodError!void {
         try self.advance();
 
-        switch (self.iostate) {
-            .Idle => {
-                TRACE(.Debug, "getIoReq Idle", .{});
-                can_consume.* = 0;
-                can_produce.* = 0;
-            },
+        // check read side
+        can_consume.* = 0;
+        switch (self.iostate_rd) {
             .Active => |iotype| {
                 switch (iotype.action) {
                     .Consuming => |target_size| {
-                        TRACE(.Debug, "getIoReq Consuming target_size={d} iobuf.len={d} iobuf.nbytes={d}", .{ target_size, self.iobuf.len, self.iobuf_nbytes });
-                        // reading from caller into iobuf
-                        if (target_size > self.iobuf.len - self.iobuf_nbytes) {
-                            can_consume.* = self.iobuf.len - self.iobuf_nbytes;
+                        TRACE(.Debug, "getIoReq Consuming target_size={d} iobuf_rd.len={d} rd_nbytes={d}", .{ target_size, self.iobuf_rd.len, self.rd_nbytes });
+                        if (target_size > self.iobuf_rd.len - self.rd_nbytes) {
+                            can_consume.* = self.iobuf_rd.len - self.rd_nbytes;
                         } else {
-                            can_consume.* = target_size - self.iobuf_nbytes;
+                            can_consume.* = target_size - self.rd_nbytes;
                         }
-                        can_produce.* = 0;
                     },
-                    .Producing => |block_size| {
-                        TRACE(.Debug, "getIoReq Producing {d} iobuf_nbytes={d}", .{ block_size, self.iobuf_nbytes });
-                        // being read by caller from iobuf
-                        can_produce.* = self.iobuf_nbytes; // number of bytes in buffer
-                        can_consume.* = 0;
-                    },
-                    .Eventing => {
-                        can_produce.* = 0;
-                        can_consume.* = 0;
-                    },
+                    else => {},
                 }
             },
+            else => {},
+        }
+
+        // check write side
+        can_produce.* = 0;
+        switch (self.iostate_wr) {
+            .Active => |iotype| {
+                switch (iotype.action) {
+                    .Producing => |block_size| {
+                        _ = block_size;
+                        TRACE(.Debug, "getIoReq Producing wr_nbytes={d}", .{self.wr_nbytes});
+                        can_produce.* = self.wr_nbytes;
+                    },
+                    else => {},
+                }
+            },
+            else => {},
         }
     }
 
     pub fn write(self: *Self, wbuf: []const u8) MisshodError!void {
-        TRACE(.Debug, "misshod.write len={d} .iobuf_nbytes={d}", .{ wbuf.len, self.iobuf_nbytes });
-        switch (self.iostate) {
+        TRACE(.Debug, "misshod.write len={d} .rd_nbytes={d}", .{ wbuf.len, self.rd_nbytes });
+        switch (self.iostate_rd) {
             .Active => |iotype| {
                 switch (iotype.action) {
                     .Consuming => |target_size| {
-                        if (wbuf.len > target_size - self.iobuf_nbytes) {
+                        if (wbuf.len > target_size - self.rd_nbytes) {
                             return IoError.cannotAcceptWrite;
                         }
 
-                        @memcpy(self.iobuf[self.iobuf_nbytes + self.iobuf_rdwroff .. self.iobuf_nbytes + wbuf.len + self.iobuf_rdwroff], wbuf);
-                        self.iobuf_nbytes += wbuf.len;
+                        @memcpy(self.iobuf_rd[self.rd_nbytes + self.rd_off .. self.rd_nbytes + wbuf.len + self.rd_off], wbuf);
+                        self.rd_nbytes += wbuf.len;
 
-                        if (self.iobuf_nbytes == target_size) {
+                        if (self.rd_nbytes == target_size) {
                             // entire block has been written by caller
                             self.session.setIoSessionState(iotype.next_state);
-                            self.iostate = .Idle;
+                            self.iostate_rd = .Idle;
                             try self.advance();
                         }
                     },
@@ -352,9 +360,9 @@ pub fn MisshodImpl(role: Role) type {
     }
 
     pub fn peek(self: *Self, nbytes: usize) MisshodError![]const u8 {
-        TRACE(.Debug, "peek nbytes={d} .iobuf_rdwroff={d} .iobuf_nbytes={d}", .{ nbytes, self.iobuf_rdwroff, self.iobuf_nbytes });
+        TRACE(.Debug, "peek nbytes={d} .wr_off={d} .wr_nbytes={d}", .{ nbytes, self.wr_off, self.wr_nbytes });
         // sanity check
-        switch (self.iostate) {
+        switch (self.iostate_wr) {
             .Active => |iotype| {
                 switch (iotype.action) {
                     .Producing => {}, // ok
@@ -364,22 +372,22 @@ pub fn MisshodImpl(role: Role) type {
             else => return IoError.notProducing,
         }
 
-        const bytes_remaining = self.iobuf_nbytes - self.iobuf_rdwroff;
+        const bytes_remaining = self.wr_nbytes - self.wr_off;
 
         if (bytes_remaining < nbytes) {
-            return self.iobuf[self.iobuf_rdwroff .. self.iobuf_rdwroff + bytes_remaining];
+            return self.iobuf_wr[self.wr_off .. self.wr_off + bytes_remaining];
         } else {
-            return self.iobuf[self.iobuf_rdwroff..self.iobuf_nbytes];
+            return self.iobuf_wr[self.wr_off..self.wr_nbytes];
         }
     }
 
     pub fn consumed(self: *Self, nbytes: usize) MisshodError!void {
-        TRACE(.Debug, "consumed nbytes={d} iobuf_rdwroff={d} .iobuf_nbytes={d}", .{ nbytes, self.iobuf_rdwroff, self.iobuf_nbytes });
+        TRACE(.Debug, "consumed nbytes={d} wr_off={d} .wr_nbytes={d}", .{ nbytes, self.wr_off, self.wr_nbytes });
 
-        const bytes_remaining = self.iobuf_nbytes - self.iobuf_rdwroff;
+        const bytes_remaining = self.wr_nbytes - self.wr_off;
 
         // sanity check
-        switch (self.iostate) {
+        switch (self.iostate_wr) {
             .Active => |iotype| {
                 switch (iotype.action) {
                     .Producing => {
@@ -393,14 +401,14 @@ pub fn MisshodImpl(role: Role) type {
             else => return IoError.notProducing,
         }
 
-        self.iobuf_rdwroff += nbytes;
+        self.wr_off += nbytes;
 
-        if (self.iobuf_rdwroff == self.iobuf_nbytes) {
+        if (self.wr_off == self.wr_nbytes) {
             // entire block has been consumed by caller
-            switch (self.iostate) {
+            switch (self.iostate_wr) {
                 .Active => |iotype| {
                     self.session.setIoSessionState(iotype.next_state);
-                    self.iostate = .Idle;
+                    self.iostate_wr = .Idle;
                     try self.advance();
                 },
                 else => unreachable,
@@ -463,7 +471,6 @@ pub fn MisshodImpl(role: Role) type {
 
 
     fn advanceIoSession(self:*Self, inkeys:*Protocol.KeyDataUni) MisshodError!void {
-        std.debug.assert(self.iostate == .Idle); // we only get called once IO completes
         switch (self.session.ioSessionState) {
             .Idle => {
                 TRACE(.Debug, "ioSessionState Idle", .{});
@@ -476,7 +483,7 @@ pub fn MisshodImpl(role: Role) type {
                 }
             },
             .VersionWrite => {
-                const sl = self.session.writeProtocolVersion(&self.iobuf);
+                const sl = self.session.writeProtocolVersion(&self.iobuf_wr);
                 switch(role) {
                     .Client => self.requestWrite(sl, .VersionReadLine),
                     .Server => self.requestWrite(sl, .Idle),
@@ -484,10 +491,10 @@ pub fn MisshodImpl(role: Role) type {
             },
             .VersionReadLine => {
                 // read first char
-                self.requestRead(0, 1, .{ .VersionReadLineChar = self.iobuf[0..1] });
+                self.requestRead(0, 1, .{ .VersionReadLineChar = self.iobuf_rd[0..1] });
             },
             .VersionReadLineChar => |buf| {
-                if (buf.len + 1 > self.iobuf.len) {
+                if (buf.len + 1 > self.iobuf_rd.len) {
                     return IoError.noEOLFound;
                 } else {
                     if (buf.len >= 2) {
@@ -497,7 +504,7 @@ pub fn MisshodImpl(role: Role) type {
                         }
                     }
                     // read next char
-                    self.requestRead(buf.len, 1, .{ .VersionReadLineChar = self.iobuf[0 .. buf.len + 1] });
+                    self.requestRead(buf.len, 1, .{ .VersionReadLineChar = self.iobuf_rd[0 .. buf.len + 1] });
                 }
             },
             .VersionReadLineCompletion => |buf| {
@@ -514,9 +521,9 @@ pub fn MisshodImpl(role: Role) type {
             },
             .ReadPktHdr => {
                 if (self.session.encrypted) {
-                    self.requestRead(0, Protocol.AesCtrT.block_size, .{ .ReadPktBody = self.iobuf[0..Protocol.AesCtrT.block_size] });
+                    self.requestRead(0, Protocol.AesCtrT.block_size, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.AesCtrT.block_size] });
                 } else {
-                    self.requestRead(0, Protocol.sizeof_PktHdr, .{ .ReadPktBody = self.iobuf[0..Protocol.sizeof_PktHdr] });
+                    self.requestRead(0, Protocol.sizeof_PktHdr, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.sizeof_PktHdr] });
                 }
             },
             .ReadPktBody => |buf| {
@@ -526,9 +533,9 @@ pub fn MisshodImpl(role: Role) type {
                     var firstblock_encbuf: [Protocol.AesCtrT.block_size]u8 = undefined;
                     @memcpy(&firstblock_encbuf, buf);
 
-                    // decrypt directly into iobuf
-                    inkeys.aesctr.encrypt(&firstblock_encbuf, self.iobuf[0..Protocol.AesCtrT.block_size]);
-                    TRACEDUMP(.Debug, "firstblock_dec(in payload)", .{}, self.iobuf[0..Protocol.AesCtrT.block_size]);
+                    // decrypt directly into iobuf_rd
+                    inkeys.aesctr.encrypt(&firstblock_encbuf, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
+                    TRACEDUMP(.Debug, "firstblock_dec(in payload)", .{}, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
 
                     // read Protocol.PktHdr from first block
                     const pkthdr_size = Protocol.sizeof_PktHdr;
@@ -557,7 +564,7 @@ pub fn MisshodImpl(role: Role) type {
                     }
                     TRACE(.Debug, "About to read {d}\n", .{remaining_pkt_bytes + Protocol.mac_algo.key_length});
                     //
-                    self.requestRead(buf.len, (remaining_pkt_bytes + Protocol.mac_algo.key_length), .{ .ReadPktCompletion = self.iobuf[0 .. buf.len + remaining_pkt_bytes + Protocol.mac_algo.key_length] }); // on completion, how much we have
+                    self.requestRead(buf.len, (remaining_pkt_bytes + Protocol.mac_algo.key_length), .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + remaining_pkt_bytes + Protocol.mac_algo.key_length] }); // on completion, how much we have
 
                     inkeys.seq +%= 1;
                 } else {
@@ -573,7 +580,7 @@ pub fn MisshodImpl(role: Role) type {
                     const payload_len = hdr.packet_length - hdr.padding_length - 1;
                     std.debug.assert(payload_len <= Protocol.MaxPayload);
 
-                    self.requestRead(buf.len, payload_len + hdr.padding_length, .{ .ReadPktCompletion = self.iobuf[0 .. buf.len + payload_len + hdr.padding_length] });
+                    self.requestRead(buf.len, payload_len + hdr.padding_length, .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + payload_len + hdr.padding_length] });
                     inkeys.seq +%= 1;
                 }
             },
@@ -585,12 +592,37 @@ pub fn MisshodImpl(role: Role) type {
     }
 
 
+    fn canProcessIoSessionState(self: *Self) bool {
+        return switch (self.session.ioSessionState) {
+            // Idle needs both sides free — session will decide what to do
+            .Idle => self.iostate_rd == .Idle and self.iostate_wr == .Idle,
+            .Init => true,
+            // Read-requiring states only need read side idle
+            .VersionReadLine, .VersionReadLineChar => self.iostate_rd == .Idle,
+            .ReadPktHdr, .ReadPktBody => self.iostate_rd == .Idle,
+            // Write-requiring states need write side idle
+            .VersionWrite => self.iostate_wr == .Idle,
+            // Processing states
+            .VersionReadLineCompletion => true, // just sets next ioSessionState
+            .ReadPktCompletion => self.iostate_wr == .Idle, // handlePacket may event/write
+        };
+    }
+
     pub fn advance(self: *Self) MisshodError!void {
-        while (self.iostate == .Idle) { // only ever in Idle at init time or after event, until everything gets flowing
-            switch(role) {
-                .Client => try self.advanceIoSession(&self.session.keydata.s2c),
-                .Server => try self.advanceIoSession(&self.session.keydata.c2s),
-            }
+        const inkeys = switch(role) {
+            .Client => &self.session.keydata.s2c,
+            .Server => &self.session.keydata.c2s,
+        };
+        while (self.canProcessIoSessionState()) {
+            const prev_io_state = self.session.ioSessionState;
+            const prev_rd = self.iostate_rd;
+            const prev_wr = self.iostate_wr;
+            try self.advanceIoSession(inkeys);
+            // Break if no progress was made to prevent infinite loops
+            const same_io = std.meta.eql(prev_io_state, self.session.ioSessionState);
+            const same_rd = std.meta.eql(prev_rd, self.iostate_rd);
+            const same_wr = std.meta.eql(prev_wr, self.iostate_wr);
+            if (same_io and same_rd and same_wr) break;
         }
     }
 
@@ -616,13 +648,21 @@ pub fn MisshodImpl(role: Role) type {
     }
 
     pub fn channelWriteComplete(self: *Self, nbytes: usize) MisshodError!void {
-        // assumes that getChannelWriteBuffer() is called then channelWriteComplete()
-        self.iostate = .Idle;
-        try self.advance();
+        if (self.iostate_wr == .Idle and self.iostate_rd != .Idle) {
+            // Full-duplex: read is active, write is idle
+            // Build channel data packet directly without disturbing the read side
+            try self.session.directChannelWrite(nbytes, self);
+        } else {
+            // Sequential fallback (e.g. during handshake or when both idle)
+            self.iostate_rd = .Idle;
+            self.iostate_wr = .Idle;
+            try self.advance();
 
-        try self.session.channelWriteComplete(nbytes);
-        self.iostate = .Idle;
-        try self.advance();
+            try self.session.channelWriteComplete(nbytes);
+            self.iostate_rd = .Idle;
+            self.iostate_wr = .Idle;
+            try self.advance();
+        }
     }
 };
 }
@@ -795,6 +835,18 @@ test "client-server full handshake round-trip" {
                             s2c_len -= feed;
                         }
                     },
+                    .ReadyToConsumeAndProduce => |s| {
+                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
+                        c2s_len += data.len;
+                        client.consumed(data.len) catch {};
+                        if (s2c_len > 0) {
+                            const feed = @min(s.consume, s2c_len);
+                            client.write(s2c_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &s2c_buf, s2c_buf[feed..s2c_len]);
+                            s2c_len -= feed;
+                        }
+                    },
                     .Event => |code| switch (code) {
                         .CheckHostKey => { client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {}; },
                         .GetPrivateKey => { client.clearEvent(.GetPrivateKey) catch {}; },
@@ -822,6 +874,18 @@ test "client-server full handshake round-trip" {
                     .ReadyToConsume => |n| {
                         if (c2s_len > 0) {
                             const feed = @min(n, c2s_len);
+                            server.write(c2s_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
+                            c2s_len -= feed;
+                        }
+                    },
+                    .ReadyToConsumeAndProduce => |s| {
+                        const data = server.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(s2c_buf[s2c_len .. s2c_len + data.len], data);
+                        s2c_len += data.len;
+                        server.consumed(data.len) catch {};
+                        if (c2s_len > 0) {
+                            const feed = @min(s.consume, c2s_len);
                             server.write(c2s_buf[0..feed]) catch {};
                             std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
                             c2s_len -= feed;
