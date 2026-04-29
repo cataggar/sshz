@@ -2,9 +2,11 @@ const std = @import("std");
 const util = @import("util.zig");
 const TRACE = util.trace;
 const TRACEDUMP = util.tracedump;
-const MisshodServer = @import("misshod.zig").MisshodServer;
-const MisshodError = @import("misshod.zig").MisshodError;
-const IoError = @import("misshod.zig").IoError;
+const Misshod = @import("misshod.zig");
+const MisshodServer = Misshod.MisshodServer;
+const MisshodError = Misshod.MisshodError;
+const IoError = Misshod.IoError;
+const SshOpenFailureReason = Misshod.SshOpenFailureReason;
 const native_endian = @import("builtin").target.cpu.arch.endian();
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
@@ -17,6 +19,8 @@ const Protocol = @import("protocol.zig");
 const Channel = @import("channel.zig").Channel;
 const ChannelTable = @import("channel.zig").ChannelTable;
 const ChannelState = @import("channel.zig").ChannelState;
+const ChannelType = @import("channel.zig").ChannelType;
+const TcpipOpen = @import("channel.zig").TcpipOpen;
 
 pub const SessionState = enum {
     Init,
@@ -59,14 +63,14 @@ pub const Session = struct {
     privkey_passphrase: ?[]u8, //allocated
     auth_passphrase: ?[]u8, //allocated
 
-    auth_pubkey_attempted:[Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined, // U32LenString with algo name + pubkey
-    q_c:[Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined,
+    auth_pubkey_attempted: [Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined, // U32LenString with algo name + pubkey
+    q_c: [Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined,
 
     privkey_blob: [Protocol.srv_hostkey_algo.SecretKey.encoded_length]u8 = undefined,
     pubkey_blob: [Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined,
 
     pub fn init(rand: std.Random, hostkey_ascii: []const u8, allocator: std.mem.Allocator) !Self {
-        var s = Self {
+        var s = Self{
             .ioSessionState = .Init,
             .sessionState = .Init,
             .rand = rand,
@@ -119,7 +123,7 @@ pub const Session = struct {
         self.sessionState = newState;
     }
 
-    pub fn grantAccess(self: *Self, allow:bool) MisshodError!void {
+    pub fn grantAccess(self: *Self, allow: bool) MisshodError!void {
         if (self.sessionState != .CheckUserPasswordAuth) {
             return IoError.UnexpectedResponse;
         } else {
@@ -239,7 +243,6 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.NewKeysRead);
-
             },
             .NewKeysRead => {
                 self.setIoSessionState(.ReadPktHdr);
@@ -261,7 +264,7 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE));
                 try pkt.writeU32LenString("password,publickey");
-                try pkt.writeBoolean(false);    // partial success
+                try pkt.writeBoolean(false); // partial success
                 self.setSessionState(.AuthRead);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
@@ -316,15 +319,15 @@ pub const Session = struct {
                 try pkt.writeU32(chan.local_id);
                 try pkt.writeU32(Protocol.MaxPayload);
                 try pkt.writeU32(Protocol.MaxPayload);
-                chan.state = .Connected;
+                chan.state = if (chan.channel_type == .Session) .Connected else .Data;
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .OpenFailureWrite => {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
                 try pkt.writeU32(chan.remote_id);
-                try pkt.writeU32(4); // SSH_OPEN_RESOURCE_SHORTAGE
-                try pkt.writeU32LenString("too many channels");
+                try pkt.writeU32(chan.open_failure_reason_code);
+                try pkt.writeU32LenString(chan.open_failure_description);
                 try pkt.writeU32LenString("");
                 self.channel_table.freeChannel(chan.local_id);
                 self.active_channel_id = null;
@@ -420,6 +423,26 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
         }
+    }
+
+    pub fn acceptChannelOpen(self: *Self, channel_id: u32) MisshodError!void {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.state != .Open) return IoError.UnexpectedResponse;
+        chan.state = .ConfirmWrite;
+        self.active_channel_id = channel_id;
+        self.setSessionState(.ChannelActive);
+        self.setIoSessionState(.Idle);
+    }
+
+    pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) MisshodError!void {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.state != .Open) return IoError.UnexpectedResponse;
+        chan.open_failure_reason_code = reason_code;
+        chan.open_failure_description = description;
+        chan.state = .OpenFailureWrite;
+        self.active_channel_id = channel_id;
+        self.setSessionState(.ChannelActive);
+        self.setIoSessionState(.Idle);
     }
 
     pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) MisshodError![]u8 {
@@ -518,6 +541,93 @@ pub const Session = struct {
         return vers;
     }
 
+    fn sendChannelOpenFailure(
+        self: *Self,
+        misshod: *MisshodServer,
+        recipient: u32,
+        reason_code: u32,
+        description: []const u8,
+    ) MisshodError!void {
+        var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+        try pkt.writeU32(recipient);
+        try pkt.writeU32(reason_code);
+        try pkt.writeU32LenString(description);
+        try pkt.writeU32LenString("");
+        misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.s2c, &pkt, &misshod.iobuf_wr), .Idle);
+    }
+
+    fn readTcpipOpen(rdr: *BufferReader) MisshodError!TcpipOpen {
+        return .{
+            .host = try rdr.readU32LenString(),
+            .port = try rdr.readU32(),
+            .originator_host = try rdr.readU32LenString(),
+            .originator_port = try rdr.readU32(),
+        };
+    }
+
+    fn requestChannelOpenEvent(self: *Self, misshod: *MisshodServer, chan: *Channel) void {
+        _ = self;
+        const request: Misshod.ChannelOpenRequestType = switch (chan.channel_type) {
+            .Session => .Session,
+            .DirectTcpip => .{ .DirectTcpip = .{
+                .host = chan.tcpip_open.host,
+                .port = chan.tcpip_open.port,
+                .originator_host = chan.tcpip_open.originator_host,
+                .originator_port = chan.tcpip_open.originator_port,
+            } },
+            .ForwardedTcpip => .{ .ForwardedTcpip = .{
+                .connected_host = chan.tcpip_open.host,
+                .connected_port = chan.tcpip_open.port,
+                .originator_host = chan.tcpip_open.originator_host,
+                .originator_port = chan.tcpip_open.originator_port,
+            } },
+        };
+        misshod.requestEvent(.{ .ChannelOpenRequest = .{ .channel = chan.local_id, .request = request } }, .Idle);
+    }
+
+    fn handleChannelOpenPacket(self: *Self, rdr: *BufferReader, misshod: *MisshodServer) MisshodError!void {
+        // https://datatracker.ietf.org/doc/html/rfc4254#section-5.1
+        const chantype = try rdr.readU32LenString();
+        const remote_id = try rdr.readU32();
+        const peer_window = try rdr.readU32();
+        const max_packet_size = try rdr.readU32();
+        const channel_type = ChannelType.fromName(chantype) orelse {
+            try self.sendChannelOpenFailure(
+                misshod,
+                remote_id,
+                SshOpenFailureReason.UnknownChannelType,
+                "unknown channel type",
+            );
+            return;
+        };
+        const tcpip_open = if (channel_type.hasTcpipOpenPayload()) try readTcpipOpen(rdr) else TcpipOpen{};
+
+        const chan = self.channel_table.allocChannel(remote_id, peer_window, max_packet_size) orelse {
+            try self.sendChannelOpenFailure(
+                misshod,
+                remote_id,
+                SshOpenFailureReason.ResourceShortage,
+                "too many channels",
+            );
+            return;
+        };
+        chan.channel_type = channel_type;
+        chan.tcpip_open = tcpip_open;
+
+        if (channel_type == .Session) {
+            chan.state = .ConfirmWrite;
+            self.active_channel_id = chan.local_id;
+            self.setSessionState(.ChannelActive);
+            self.setIoSessionState(.Idle);
+        } else {
+            chan.state = .Open;
+            self.active_channel_id = null;
+            self.setSessionState(.ChannelActive);
+            self.requestChannelOpenEvent(misshod, chan);
+        }
+    }
+
     pub fn handlePacket(self: *Self, buf: []const u8, misshod: *MisshodServer) MisshodError!void {
         var rdr = try misshod.getRecvBuffer(misshod.iobuf_rd[0..buf.len], &self.keydata.c2s);
 
@@ -532,8 +642,7 @@ pub const Session = struct {
 
                 const is_rekey = self.sessionState != .KexInitRead;
                 if (is_rekey) {
-                    if (self.sessionState != .ChannelActive)
-                    {
+                    if (self.sessionState != .ChannelActive) {
                         self.setIoSessionState(.ReadPktHdr);
                         return;
                     }
@@ -632,7 +741,7 @@ pub const Session = struct {
                         return IoError.UnimplementedService;
                     }
                 } else {
-                    return IoError.UnexpectedResponse;  // why is client asking now?
+                    return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => {
@@ -643,7 +752,7 @@ pub const Session = struct {
                     const svcname = try rdr.readU32LenString();
                     const authtyp = try rdr.readU32LenString();
 
-                    TRACE(.Debug, "username={s} svcname={s} authtyp={s}", .{username, svcname, authtyp});
+                    TRACE(.Debug, "username={s} svcname={s} authtyp={s}", .{ username, svcname, authtyp });
                     if (!std.mem.eql(u8, svcname, "ssh-connection")) {
                         return IoError.UnimplementedService;
                     }
@@ -657,14 +766,14 @@ pub const Session = struct {
                         self.setSessionState(.CheckUserPasswordAuth);
                         misshod.requestEvent(.{ .UserAuth = .{
                             .username = username,
-                            .auth = .{.Password = password},
+                            .auth = .{ .Password = password },
                         } }, .Idle);
                     } else if (std.mem.eql(u8, authtyp, "publickey")) {
                         const forreal = try rdr.readBoolean();
                         const algoname = try rdr.readU32LenString();
                         const typed_pubkey = try rdr.readU32LenString();
 
-                        TRACE(.Debug, "forreal={any} algoname={s} typed_pubkey len={d}", .{forreal, algoname, typed_pubkey.len});
+                        TRACE(.Debug, "forreal={any} algoname={s} typed_pubkey len={d}", .{ forreal, algoname, typed_pubkey.len });
 
                         // extract raw pubkey
                         var nb = util.NamedBlob.init(typed_pubkey);
@@ -724,15 +833,12 @@ pub const Session = struct {
                             self.setSessionState(.CheckUserPasswordAuth);
                             misshod.requestEvent(.{ .UserAuth = .{
                                 .username = username,
-                                .auth = .{.Pubkey = typed_pubkey},
+                                .auth = .{ .Pubkey = typed_pubkey },
                             } }, .Idle);
                         }
                     } else if (std.mem.eql(u8, authtyp, "none")) {
                         self.setSessionState(.CheckUserPasswordAuth);
-                        misshod.requestEvent(.{ .UserAuth = .{
-                            .username = username,
-                            .auth = null
-                        } }, .Idle);
+                        misshod.requestEvent(.{ .UserAuth = .{ .username = username, .auth = null } }, .Idle);
                     } else if (std.mem.eql(u8, authtyp, "keyboard-interactive")) {
                         // RFC 4256 §3.1
                         _ = try rdr.readU32LenString(); // language tag
@@ -746,37 +852,11 @@ pub const Session = struct {
                         return IoError.UnimplementedService;
                     }
                 } else {
-                    return IoError.UnexpectedResponse;  // why is client asking now?
+                    return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN) => {
-                // https://datatracker.ietf.org/doc/html/rfc4254#section-5.1
-                const chantype = try rdr.readU32LenString();
-                const remote_id = try rdr.readU32();
-                const peer_window = try rdr.readU32();
-                const max_packet_size = try rdr.readU32();
-
-                if (!std.mem.eql(u8, chantype, "session")) {
-                    return IoError.UnimplementedService;
-                }
-
-                if (self.channel_table.allocChannel(remote_id, peer_window, max_packet_size)) |chan| {
-                    chan.state = .ConfirmWrite;
-                    self.active_channel_id = chan.local_id;
-                } else {
-                    var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
-                    try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
-                    try pkt.writeU32(remote_id);
-                    try pkt.writeU32(4);
-                    try pkt.writeU32LenString("too many channels");
-                    try pkt.writeU32LenString("");
-                    const outkeys = &self.keydata.s2c;
-                    misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
-                    return;
-                }
-
-                self.setSessionState(.ChannelActive);
-                self.setIoSessionState(.Idle);
+                try self.handleChannelOpenPacket(&rdr, misshod);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST) => {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
@@ -840,7 +920,7 @@ pub const Session = struct {
                     return;
                 } else {
                     TRACE(.Debug, "channel req '{s}'", .{typ});
-                    if (wantreply) {    // can't do this
+                    if (wantreply) { // can't do this
                         return IoError.UnimplementedService;
                     }
                 }
@@ -974,7 +1054,6 @@ pub const Session = struct {
             },
         }
     }
-
 };
 
 fn nameListContains(namelist: []const u8, target: []const u8) bool {
@@ -983,4 +1062,151 @@ fn nameListContains(namelist: []const u8, target: []const u8) bool {
         if (std.mem.eql(u8, name, target)) return true;
     }
     return false;
+}
+
+fn buildUnencryptedPacket(buf: []u8, payload: []const u8) usize {
+    const padding_length: u8 = 8;
+    const packet_length: u32 = @intCast(payload.len + padding_length + 1);
+    var hdr: Protocol.PktHdr = .{
+        .packet_length = packet_length,
+        .padding_length = padding_length,
+    };
+    if (native_endian != .big) {
+        std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
+    }
+    @memcpy(buf[0..Protocol.sizeof_PktHdr], util.asPackedBytes(Protocol.PktHdr, &hdr));
+    @memcpy(buf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload.len], payload);
+    @memset(buf[Protocol.sizeof_PktHdr + payload.len .. Protocol.sizeof_PktHdr + payload.len + padding_length], 0);
+    return Protocol.sizeof_PktHdr + payload.len + padding_length;
+}
+
+fn unencryptedPayload(packet: []const u8) []const u8 {
+    var hdr: Protocol.PktHdr = std.mem.bytesAsValue(Protocol.PktHdr, packet[0..Protocol.sizeof_PktHdr]).*;
+    if (native_endian != .big) {
+        std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
+    }
+    const payload_len = hdr.packet_length - hdr.padding_length - 1;
+    return packet[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
+}
+
+test "handlePacket: direct-tcpip open emits request and accept confirms" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [160]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU32LenString("direct-tcpip");
+    try pw.writeU32(77); // sender channel
+    try pw.writeU32(32768); // initial window size
+    try pw.writeU32(4096); // max packet size
+    try pw.writeU32LenString("example.com");
+    try pw.writeU32(443);
+    try pw.writeU32LenString("127.0.0.1");
+    try pw.writeU32(55555);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    const channel_id = switch (evt) {
+        .Event => |code| switch (code) {
+            .ChannelOpenRequest => |request| blk: {
+                switch (request.request) {
+                    .DirectTcpip => |tcp| {
+                        try std.testing.expectEqualStrings("example.com", tcp.host);
+                        try std.testing.expectEqual(@as(u32, 443), tcp.port);
+                        try std.testing.expectEqualStrings("127.0.0.1", tcp.originator_host);
+                        try std.testing.expectEqual(@as(u32, 55555), tcp.originator_port);
+                    },
+                    else => return error.TestUnexpectedResult,
+                }
+                break :blk request.channel;
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+
+    const chan = m.session.channel_table.findByLocalId(channel_id).?;
+    try std.testing.expectEqual(ChannelType.DirectTcpip, chan.channel_type);
+    try std.testing.expectEqual(ChannelState.Open, chan.state);
+
+    try m.acceptChannelOpen(channel_id);
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 77), try rdr.readU32());
+    try std.testing.expectEqual(channel_id, try rdr.readU32());
+}
+
+test "rejectChannelOpen writes caller-provided failure" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [160]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU32LenString("direct-tcpip");
+    try pw.writeU32(88); // sender channel
+    try pw.writeU32(32768);
+    try pw.writeU32(4096);
+    try pw.writeU32LenString("example.com");
+    try pw.writeU32(443);
+    try pw.writeU32LenString("127.0.0.1");
+    try pw.writeU32(55555);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    const channel_id = switch (evt) {
+        .Event => |code| switch (code) {
+            .ChannelOpenRequest => |request| request.channel,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+
+    try m.rejectChannelOpen(channel_id, SshOpenFailureReason.ConnectFailed, "connect failed");
+    try std.testing.expect(m.session.channel_table.findByLocalId(channel_id) == null);
+
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 88), try rdr.readU32());
+    try std.testing.expectEqual(SshOpenFailureReason.ConnectFailed, try rdr.readU32());
+    try std.testing.expectEqualStrings("connect failed", try rdr.readU32LenString());
+}
+
+test "handlePacket: unknown channel type writes open failure" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [64]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU32LenString("x11");
+    try pw.writeU32(99); // sender channel
+    try pw.writeU32(32768);
+    try pw.writeU32(4096);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 99), try rdr.readU32());
+    try std.testing.expectEqual(SshOpenFailureReason.UnknownChannelType, try rdr.readU32());
+    try std.testing.expectEqualStrings("unknown channel type", try rdr.readU32LenString());
 }

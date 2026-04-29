@@ -8,6 +8,41 @@ pub const ClientChannelOpenMode = enum {
     RawSession,
 };
 
+pub const ChannelType = enum {
+    Session,
+    DirectTcpip,
+    ForwardedTcpip,
+
+    pub fn name(self: ChannelType) []const u8 {
+        return switch (self) {
+            .Session => "session",
+            .DirectTcpip => "direct-tcpip",
+            .ForwardedTcpip => "forwarded-tcpip",
+        };
+    }
+
+    pub fn fromName(channel_name: []const u8) ?ChannelType {
+        if (std.mem.eql(u8, channel_name, "session")) return .Session;
+        if (std.mem.eql(u8, channel_name, "direct-tcpip")) return .DirectTcpip;
+        if (std.mem.eql(u8, channel_name, "forwarded-tcpip")) return .ForwardedTcpip;
+        return null;
+    }
+
+    pub fn hasTcpipOpenPayload(self: ChannelType) bool {
+        return switch (self) {
+            .Session => false,
+            .DirectTcpip, .ForwardedTcpip => true,
+        };
+    }
+};
+
+pub const TcpipOpen = struct {
+    host: []const u8 = "",
+    port: u32 = 0,
+    originator_host: []const u8 = "",
+    originator_port: u32 = 0,
+};
+
 pub const ChannelState = enum {
     OpenWrite,
     Open,
@@ -39,6 +74,10 @@ pub const Channel = struct {
     close_sent: bool,
     close_received: bool,
     client_open_mode: ClientChannelOpenMode,
+    channel_type: ChannelType,
+    tcpip_open: TcpipOpen,
+    open_failure_reason_code: u32,
+    open_failure_description: []const u8,
     state: ChannelState,
 
     pub fn init(local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
@@ -54,6 +93,10 @@ pub const Channel = struct {
             .close_sent = false,
             .close_received = false,
             .client_open_mode = .RawSession,
+            .channel_type = .Session,
+            .tcpip_open = .{},
+            .open_failure_reason_code = 4,
+            .open_failure_description = "too many channels",
             .state = .Open,
         };
     }
@@ -237,7 +280,24 @@ test "Channel init sets default values" {
     try std.testing.expect(!ch.close_sent);
     try std.testing.expect(!ch.close_received);
     try std.testing.expectEqual(ClientChannelOpenMode.RawSession, ch.client_open_mode);
+    try std.testing.expectEqual(ChannelType.Session, ch.channel_type);
+    try std.testing.expectEqualStrings("", ch.tcpip_open.host);
+    try std.testing.expectEqual(@as(u32, 0), ch.tcpip_open.port);
+    try std.testing.expectEqualStrings("", ch.tcpip_open.originator_host);
+    try std.testing.expectEqual(@as(u32, 0), ch.tcpip_open.originator_port);
+    try std.testing.expectEqual(@as(u32, 4), ch.open_failure_reason_code);
+    try std.testing.expectEqualStrings("too many channels", ch.open_failure_description);
     try std.testing.expectEqual(ChannelState.Open, ch.state);
+}
+
+test "ChannelType maps SSH names" {
+    try std.testing.expectEqual(ChannelType.Session, ChannelType.fromName("session").?);
+    try std.testing.expectEqual(ChannelType.DirectTcpip, ChannelType.fromName("direct-tcpip").?);
+    try std.testing.expectEqual(ChannelType.ForwardedTcpip, ChannelType.fromName("forwarded-tcpip").?);
+    try std.testing.expect(ChannelType.fromName("x11") == null);
+    try std.testing.expectEqualStrings("direct-tcpip", ChannelType.DirectTcpip.name());
+    try std.testing.expect(ChannelType.DirectTcpip.hasTcpipOpenPayload());
+    try std.testing.expect(!ChannelType.Session.hasTcpipOpenPayload());
 }
 
 test "closing one channel does not affect another" {

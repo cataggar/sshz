@@ -83,16 +83,49 @@ pub const MisshodClientEventCodes = union(enum) {
     Connected,
     ChannelOpened: u32,
     ChannelOpenFailure: ChannelOpenFailure,
+    ChannelOpenRequest: ChannelOpenRequestEvent,
     RxData: []const u8,
     RxExtendedData: ExtendedData,
     Banner: []const u8,
     KeyboardInteractive: KeyboardInteractivePrompt,
 };
 
+pub const SshOpenFailureReason = struct {
+    pub const AdministrativelyProhibited: u32 = 1;
+    pub const ConnectFailed: u32 = 2;
+    pub const UnknownChannelType: u32 = 3;
+    pub const ResourceShortage: u32 = 4;
+};
+
 pub const ChannelOpenFailure = struct {
     channel: u32,
     reason_code: u32,
     description: []const u8,
+};
+
+pub const DirectTcpipOpen = struct {
+    host: []const u8,
+    port: u32,
+    originator_host: []const u8,
+    originator_port: u32,
+};
+
+pub const ForwardedTcpipOpen = struct {
+    connected_host: []const u8,
+    connected_port: u32,
+    originator_host: []const u8,
+    originator_port: u32,
+};
+
+pub const ChannelOpenRequestType = union(enum) {
+    Session,
+    DirectTcpip: DirectTcpipOpen,
+    ForwardedTcpip: ForwardedTcpipOpen,
+};
+
+pub const ChannelOpenRequestEvent = struct {
+    channel: u32,
+    request: ChannelOpenRequestType,
 };
 
 pub const ExtendedData = struct {
@@ -157,6 +190,7 @@ pub const MisshodServerEventCodes = union(enum) {
     WindowChange: WindowSize,
     Signal: ChannelSignal,
     ChannelRequest: ChannelRequestEvent,
+    ChannelOpenRequest: ChannelOpenRequestEvent,
 };
 
 pub fn MisshodEvent(role: Role) type {
@@ -692,6 +726,55 @@ pub fn MisshodImpl(role: Role) type {
                 .Client => try self.session.openSessionChannel(self),
                 .Server => IoError.UnimplementedService,
             };
+        }
+
+        pub fn openDirectTcpipChannel(
+            self: *Self,
+            host: []const u8,
+            port: u32,
+            originator_host: []const u8,
+            originator_port: u32,
+        ) MisshodError!u32 {
+            return switch (role) {
+                .Client => try self.session.openDirectTcpipChannel(
+                    self,
+                    host,
+                    port,
+                    originator_host,
+                    originator_port,
+                ),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        fn clearPendingChannelOpenRequest(self: *Self, channel_id: u32) MisshodError!void {
+            switch (self.iostate_wr) {
+                .Idle => return,
+                .Active => |iotype| switch (iotype.action) {
+                    .Eventing => |eventCode| switch (eventCode) {
+                        .ChannelOpenRequest => |request| {
+                            if (request.channel != channel_id) return IoError.badClearEvent;
+                            self.session.setIoSessionState(iotype.next_state);
+                            self.iostate_wr = .Idle;
+                            return;
+                        },
+                        else => return IoError.badClearEvent,
+                    },
+                    else => return IoError.cannotAcceptWrite,
+                },
+            }
+        }
+
+        pub fn acceptChannelOpen(self: *Self, channel_id: u32) MisshodError!void {
+            try self.clearPendingChannelOpenRequest(channel_id);
+            try self.session.acceptChannelOpen(channel_id);
+            try self.advance();
+        }
+
+        pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) MisshodError!void {
+            try self.clearPendingChannelOpenRequest(channel_id);
+            try self.session.rejectChannelOpen(channel_id, reason_code, description);
+            try self.advance();
         }
 
         pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
