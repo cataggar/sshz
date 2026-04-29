@@ -60,6 +60,7 @@ pub const Session = struct {
     channel_write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     channel_write_buf_nbytes: usize,
     channel_close_sent: bool,
+    peer_window: u32,
 
     privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
@@ -88,6 +89,7 @@ pub const Session = struct {
             .auth_passphrase = null,
             .channel_write_buf_nbytes = 0,
             .channel_close_sent = false,
+            .peer_window = 0,
         };
 
         try decodePrivKey(hostkey_ascii, null, &s.privkey_blob, &s.pubkey_blob);
@@ -301,8 +303,8 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
                 try pkt.writeU32(self.chan);
                 try pkt.writeU32(self.chan);
-                try pkt.writeU32(256);  // init window size, FIXME
-                try pkt.writeU32(256);  // max window size
+                try pkt.writeU32(Protocol.MaxPayload); // init window size
+                try pkt.writeU32(Protocol.MaxPayload); // max packet size
                 self.setSessionState(.ChannelConnected);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
             },
@@ -340,13 +342,19 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelDataTx => {
-                // request tx, FIXME need to honour window adjustments from the other side
+                // RFC 4254 §5.2 - must not send more data than peer's window allows
+                const send_len = @min(self.channel_write_buf_nbytes, self.peer_window);
+                if (send_len == 0) {
+                    // No window available, wait for WINDOW_ADJUST
+                    self.setSessionState(.ChannelDataRx);
+                    return;
+                }
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
-                // https://datatracker.ietf.org/doc/html/rfc4250#section-3.3
-                try pkt.writeU32(0);    // FIXME chan?
-                try pkt.writeU32LenString(self.channel_write_buf[0..self.channel_write_buf_nbytes]);
+                try pkt.writeU32(self.chan);
+                try pkt.writeU32LenString(self.channel_write_buf[0..send_len]);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                self.peer_window -= @intCast(send_len);
                 self.setSessionState(.ChannelDataTxComplete);
             },
             .ChannelDataTxComplete => {
@@ -628,10 +636,8 @@ pub const Session = struct {
 
                 const chantype = try rdr.readU32LenString();
                 self.chan = try rdr.readU32();
-                const initwinsz = try rdr.readU32();
-                const maxwinsz = try rdr.readU32();
-                _ = initwinsz;  // FIXME
-                _ = maxwinsz;
+                self.peer_window = try rdr.readU32(); // initial window size from peer
+                _ = try rdr.readU32(); // max packet size
 
                 if (!std.mem.eql(u8, chantype, "session")) {
                     return IoError.UnimplementedService;
@@ -731,8 +737,11 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
-                // TBD
-                self.setIoSessionState(.ReadPktHdr); // read again
+                // RFC 4254 §5.2 - peer is granting more window
+                _ = try rdr.readU32(); // channel
+                const bytes_to_add = try rdr.readU32();
+                self.peer_window +|= bytes_to_add; // saturating add
+                self.setIoSessionState(.ReadPktHdr);
             },
             else => {
                 // unhandled packet type
