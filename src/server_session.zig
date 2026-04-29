@@ -40,6 +40,18 @@ pub const SessionState = enum {
     ChannelActive,
 };
 
+const PendingGlobalRequestKind = enum {
+    TcpipForward,
+    CancelTcpipForward,
+};
+
+const PendingGlobalRequest = struct {
+    kind: PendingGlobalRequestKind,
+    want_reply: bool,
+    bind_address: []const u8,
+    bind_port: u32,
+};
+
 pub const Session = struct {
     const Self = @This();
 
@@ -57,6 +69,8 @@ pub const Session = struct {
     encrypted: bool,
     channel_table: ChannelTable,
     active_channel_id: ?u32,
+    pending_global_request: ?PendingGlobalRequest,
+    pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
     is_rekeying: bool,
 
     privkey_ascii: ?[]u8, // allocated
@@ -83,6 +97,7 @@ pub const Session = struct {
             .auth_passphrase = null,
             .channel_table = ChannelTable{},
             .active_channel_id = null,
+            .pending_global_request = null,
             .is_rekeying = false,
         };
 
@@ -312,6 +327,23 @@ pub const Session = struct {
         self.active_channel_id = chan.local_id;
 
         switch (chan.state) {
+            .OpenWrite => {
+                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+                try pkt.writeU32LenString(chan.channel_type.name());
+                try pkt.writeU32(chan.local_id);
+                try pkt.writeU32(Protocol.MaxPayload);
+                try pkt.writeU32(Protocol.MaxPayload);
+                if (chan.channel_type.hasTcpipOpenPayload()) {
+                    try pkt.writeU32LenString(chan.tcpip_open.host);
+                    try pkt.writeU32(chan.tcpip_open.port);
+                    try pkt.writeU32LenString(chan.tcpip_open.originator_host);
+                    try pkt.writeU32(chan.tcpip_open.originator_port);
+                }
+                chan.state = .Open;
+                self.active_channel_id = null;
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .ReadPktHdr);
+            },
             .ConfirmWrite => {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
@@ -419,7 +451,7 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                 }
             },
-            .OpenWrite, .Open => {
+            .Open => {
                 self.setIoSessionState(.ReadPktHdr);
             },
         }
@@ -443,6 +475,37 @@ pub const Session = struct {
         self.active_channel_id = channel_id;
         self.setSessionState(.ChannelActive);
         self.setIoSessionState(.Idle);
+    }
+
+    pub fn openForwardedTcpipChannel(
+        self: *Self,
+        misshod: *MisshodServer,
+        connected_host: []const u8,
+        connected_port: u32,
+        originator_host: []const u8,
+        originator_port: u32,
+    ) MisshodError!u32 {
+        if (misshod.iostate_wr != .Idle or self.active_channel_id != null) {
+            return IoError.cannotAcceptWrite;
+        }
+        if (self.sessionState != .Authenticated and self.sessionState != .ChannelActive) {
+            return IoError.NotReady;
+        }
+
+        const chan = self.channel_table.allocChannel(0, 0, 0) orelse return IoError.tooManyChannels;
+        chan.channel_type = .ForwardedTcpip;
+        chan.tcpip_open = .{
+            .host = connected_host,
+            .port = connected_port,
+            .originator_host = originator_host,
+            .originator_port = originator_port,
+        };
+        chan.state = .OpenWrite;
+        self.active_channel_id = chan.local_id;
+        self.setSessionState(.ChannelActive);
+        self.setIoSessionState(.Idle);
+        try self.advanceChannel(misshod, &self.keydata.s2c);
+        return chan.local_id;
     }
 
     pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) MisshodError![]u8 {
@@ -557,6 +620,78 @@ pub const Session = struct {
         misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.s2c, &pkt, &misshod.iobuf_wr), .Idle);
     }
 
+    fn sendGlobalRequestSuccess(
+        self: *Self,
+        misshod: *MisshodServer,
+        include_bound_port: bool,
+        bound_port: u32,
+    ) MisshodError!void {
+        if (misshod.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
+
+        var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS));
+        if (include_bound_port) {
+            try pkt.writeU32(bound_port);
+        }
+        misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.s2c, &pkt, &misshod.iobuf_wr), .ReadPktHdr);
+    }
+
+    fn sendGlobalRequestFailure(self: *Self, misshod: *MisshodServer) MisshodError!void {
+        if (misshod.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
+
+        var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE));
+        misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.s2c, &pkt, &misshod.iobuf_wr), .ReadPktHdr);
+    }
+
+    pub fn acceptTcpipForward(self: *Self, misshod: *MisshodServer, bound_port: u32) MisshodError!void {
+        const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
+        if (pending.kind != .TcpipForward) return IoError.UnexpectedResponse;
+        self.pending_global_request = null;
+
+        if (!pending.want_reply) {
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
+        try self.sendGlobalRequestSuccess(misshod, pending.bind_port == 0, bound_port);
+    }
+
+    pub fn rejectTcpipForward(self: *Self, misshod: *MisshodServer) MisshodError!void {
+        const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
+        if (pending.kind != .TcpipForward) return IoError.UnexpectedResponse;
+        self.pending_global_request = null;
+
+        if (!pending.want_reply) {
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
+        try self.sendGlobalRequestFailure(misshod);
+    }
+
+    pub fn acceptCancelTcpipForward(self: *Self, misshod: *MisshodServer) MisshodError!void {
+        const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
+        if (pending.kind != .CancelTcpipForward) return IoError.UnexpectedResponse;
+        self.pending_global_request = null;
+
+        if (!pending.want_reply) {
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
+        try self.sendGlobalRequestSuccess(misshod, false, 0);
+    }
+
+    pub fn rejectCancelTcpipForward(self: *Self, misshod: *MisshodServer) MisshodError!void {
+        const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
+        if (pending.kind != .CancelTcpipForward) return IoError.UnexpectedResponse;
+        self.pending_global_request = null;
+
+        if (!pending.want_reply) {
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
+        try self.sendGlobalRequestFailure(misshod);
+    }
+
     fn readTcpipOpen(rdr: *BufferReader) MisshodError!TcpipOpen {
         return .{
             .host = try rdr.readU32LenString(),
@@ -625,6 +760,96 @@ pub const Session = struct {
             self.active_channel_id = null;
             self.setSessionState(.ChannelActive);
             self.requestChannelOpenEvent(misshod, chan);
+        }
+    }
+
+    fn handleGlobalRequestPacket(self: *Self, rdr: *BufferReader, misshod: *MisshodServer) MisshodError!void {
+        const request_name = try rdr.readU32LenString();
+        const want_reply = try rdr.readBoolean();
+
+        if (std.mem.eql(u8, request_name, "tcpip-forward") or std.mem.eql(u8, request_name, "cancel-tcpip-forward")) {
+            if (self.pending_global_request != null) {
+                if (want_reply) {
+                    try self.sendGlobalRequestFailure(misshod);
+                } else {
+                    self.setIoSessionState(.ReadPktHdr);
+                }
+                return;
+            }
+
+            const bind_address = try rdr.readU32LenString();
+            const bind_port = try rdr.readU32();
+            if (bind_address.len > self.pending_global_request_bind_address.len) {
+                return IoError.tooBig;
+            }
+            @memcpy(self.pending_global_request_bind_address[0..bind_address.len], bind_address);
+            const stored_bind_address = self.pending_global_request_bind_address[0..bind_address.len];
+
+            const kind: PendingGlobalRequestKind = if (std.mem.eql(u8, request_name, "tcpip-forward"))
+                .TcpipForward
+            else
+                .CancelTcpipForward;
+
+            self.pending_global_request = .{
+                .kind = kind,
+                .want_reply = want_reply,
+                .bind_address = stored_bind_address,
+                .bind_port = bind_port,
+            };
+            const event = Misshod.TcpipForwardRequest{
+                .bind_address = stored_bind_address,
+                .bind_port = bind_port,
+            };
+            switch (kind) {
+                .TcpipForward => misshod.requestEvent(.{ .TcpipForward = event }, .Idle),
+                .CancelTcpipForward => misshod.requestEvent(.{ .CancelTcpipForward = event }, .Idle),
+            }
+            return;
+        }
+
+        if (want_reply) {
+            try self.sendGlobalRequestFailure(misshod);
+        } else {
+            self.setIoSessionState(.ReadPktHdr);
+        }
+    }
+
+    fn handleChannelOpenConfirmationPacket(self: *Self, rdr: *BufferReader, misshod: *MisshodServer) MisshodError!void {
+        const recipient = try rdr.readU32();
+        const sender = try rdr.readU32();
+        const peer_window = try rdr.readU32();
+        const max_packet_size = try rdr.readU32();
+        if (self.channel_table.findByLocalId(recipient)) |chan| {
+            chan.remote_id = sender;
+            chan.peer_window = peer_window;
+            chan.remote_max_packet_size = max_packet_size;
+            chan.state = .Data;
+            self.active_channel_id = chan.local_id;
+            self.setSessionState(.ChannelActive);
+            misshod.requestEvent(.{ .ChannelOpened = chan.local_id }, .Idle);
+        } else {
+            self.setIoSessionState(.ReadPktHdr);
+        }
+    }
+
+    fn handleChannelOpenFailurePacket(self: *Self, rdr: *BufferReader, misshod: *MisshodServer) MisshodError!void {
+        const recipient = try rdr.readU32();
+        const reason_code = try rdr.readU32();
+        const description = try rdr.readU32LenString();
+        _ = try rdr.readU32LenString(); // language tag
+
+        if (self.channel_table.findByLocalId(recipient)) |chan| {
+            const local_id = chan.local_id;
+            self.channel_table.freeChannel(local_id);
+            self.active_channel_id = null;
+            self.setSessionState(.ChannelActive);
+            misshod.requestEvent(.{ .ChannelOpenFailure = .{
+                .channel = local_id,
+                .reason_code = reason_code,
+                .description = description,
+            } }, .Idle);
+        } else {
+            self.setIoSessionState(.ReadPktHdr);
         }
     }
 
@@ -855,8 +1080,17 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST) => {
+                try self.handleGlobalRequestPacket(&rdr, misshod);
+            },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN) => {
                 try self.handleChannelOpenPacket(&rdr, misshod);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
+                try self.handleChannelOpenConfirmationPacket(&rdr, misshod);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE) => {
+                try self.handleChannelOpenFailurePacket(&rdr, misshod);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST) => {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
@@ -1209,4 +1443,125 @@ test "handlePacket: unknown channel type writes open failure" {
     try std.testing.expectEqual(@as(u32, 99), try rdr.readU32());
     try std.testing.expectEqual(SshOpenFailureReason.UnknownChannelType, try rdr.readU32());
     try std.testing.expectEqualStrings("unknown channel type", try rdr.readU32LenString());
+}
+
+test "handlePacket: tcpip-forward emits event and accept writes allocated port" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [96]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU32LenString("tcpip-forward");
+    try pw.writeBoolean(true);
+    try pw.writeU32LenString("127.0.0.1");
+    try pw.writeU32(0);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+    @memset(&m.iobuf_rd, 0xaa);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .TcpipForward => |forward| {
+                try std.testing.expectEqualStrings("127.0.0.1", forward.bind_address);
+                try std.testing.expectEqual(@as(u32, 0), forward.bind_port);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try m.acceptTcpipForward(2222);
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 2222), try rdr.readU32());
+}
+
+test "handlePacket: cancel-tcpip-forward emits event and reject writes failure" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [96]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU32LenString("cancel-tcpip-forward");
+    try pw.writeBoolean(true);
+    try pw.writeU32LenString("127.0.0.1");
+    try pw.writeU32(2200);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .CancelTcpipForward => |cancel| {
+                try std.testing.expectEqualStrings("127.0.0.1", cancel.bind_address);
+                try std.testing.expectEqual(@as(u32, 2200), cancel.bind_port);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try m.rejectCancelTcpipForward();
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
+}
+
+test "handlePacket: unknown global request with reply writes failure" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [64]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU32LenString("unknown-request");
+    try pw.writeBoolean(true);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
+}
+
+test "openForwardedTcpipChannel writes forwarded-tcpip open payload" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    m.session.encrypted = false;
+    m.session.setSessionState(.Authenticated);
+
+    const channel_id = try m.openForwardedTcpipChannel("127.0.0.1", 2200, "203.0.113.10", 44444);
+    const chan = m.session.channel_table.findByLocalId(channel_id).?;
+    try std.testing.expectEqual(ChannelType.ForwardedTcpip, chan.channel_type);
+
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try rdr.readU8());
+    try std.testing.expectEqualStrings("forwarded-tcpip", try rdr.readU32LenString());
+    try std.testing.expectEqual(channel_id, try rdr.readU32());
+    try std.testing.expectEqual(Protocol.MaxPayload, try rdr.readU32());
+    try std.testing.expectEqual(Protocol.MaxPayload, try rdr.readU32());
+    try std.testing.expectEqualStrings("127.0.0.1", try rdr.readU32LenString());
+    try std.testing.expectEqual(@as(u32, 2200), try rdr.readU32());
+    try std.testing.expectEqualStrings("203.0.113.10", try rdr.readU32LenString());
+    try std.testing.expectEqual(@as(u32, 44444), try rdr.readU32());
 }

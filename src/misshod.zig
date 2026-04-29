@@ -84,6 +84,10 @@ pub const MisshodClientEventCodes = union(enum) {
     ChannelOpened: u32,
     ChannelOpenFailure: ChannelOpenFailure,
     ChannelOpenRequest: ChannelOpenRequestEvent,
+    TcpipForwardSuccess: TcpipForwardSuccess,
+    TcpipForwardFailure: TcpipForwardFailure,
+    CancelTcpipForwardSuccess: TcpipForwardRequest,
+    CancelTcpipForwardFailure: TcpipForwardRequest,
     RxData: []const u8,
     RxExtendedData: ExtendedData,
     Banner: []const u8,
@@ -101,6 +105,22 @@ pub const ChannelOpenFailure = struct {
     channel: u32,
     reason_code: u32,
     description: []const u8,
+};
+
+pub const TcpipForwardRequest = struct {
+    bind_address: []const u8,
+    bind_port: u32,
+};
+
+pub const TcpipForwardSuccess = struct {
+    bind_address: []const u8,
+    requested_port: u32,
+    bound_port: u32,
+};
+
+pub const TcpipForwardFailure = struct {
+    bind_address: []const u8,
+    bind_port: u32,
 };
 
 pub const DirectTcpipOpen = struct {
@@ -185,12 +205,16 @@ pub const MisshodServerEventCodes = union(enum) {
     UserAuth: UserCredentials,
     GetPubkeyForUser: []const u8,
     Connected: u32,
+    ChannelOpened: u32,
+    ChannelOpenFailure: ChannelOpenFailure,
     RxData: ChannelData,
     RxExtendedData: ChannelExtendedData,
     WindowChange: WindowSize,
     Signal: ChannelSignal,
     ChannelRequest: ChannelRequestEvent,
     ChannelOpenRequest: ChannelOpenRequestEvent,
+    TcpipForward: TcpipForwardRequest,
+    CancelTcpipForward: TcpipForwardRequest,
 };
 
 pub fn MisshodEvent(role: Role) type {
@@ -310,6 +334,12 @@ pub fn MisshodImpl(role: Role) type {
                     switch (iotype.action) {
                         .Eventing => |eventCode| {
                             if (@intFromEnum(eventCode) == @intFromEnum(clearEventCode)) {
+                                if (comptime role == .Server) {
+                                    switch (eventCode) {
+                                        .TcpipForward, .CancelTcpipForward => return IoError.badClearEvent,
+                                        else => {},
+                                    }
+                                }
                                 // event succesfully cleared
                                 self.session.setIoSessionState(iotype.next_state);
                                 self.iostate_wr = .Idle;
@@ -747,6 +777,49 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
+        pub fn openLocalForwardChannel(
+            self: *Self,
+            host: []const u8,
+            port: u32,
+            originator_host: []const u8,
+            originator_port: u32,
+        ) MisshodError!u32 {
+            return try self.openDirectTcpipChannel(host, port, originator_host, originator_port);
+        }
+
+        pub fn requestRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) MisshodError!void {
+            return switch (role) {
+                .Client => try self.session.requestRemoteForward(self, bind_address, bind_port),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        pub fn cancelRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) MisshodError!void {
+            return switch (role) {
+                .Client => try self.session.cancelRemoteForward(self, bind_address, bind_port),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        pub fn openForwardedTcpipChannel(
+            self: *Self,
+            connected_host: []const u8,
+            connected_port: u32,
+            originator_host: []const u8,
+            originator_port: u32,
+        ) MisshodError!u32 {
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => try self.session.openForwardedTcpipChannel(
+                    self,
+                    connected_host,
+                    connected_port,
+                    originator_host,
+                    originator_port,
+                ),
+            };
+        }
+
         fn clearPendingChannelOpenRequest(self: *Self, channel_id: u32) MisshodError!void {
             switch (self.iostate_wr) {
                 .Idle => return,
@@ -763,6 +836,92 @@ pub fn MisshodImpl(role: Role) type {
                     else => return IoError.cannotAcceptWrite,
                 },
             }
+        }
+
+        fn clearPendingTcpipForwardEvent(self: *Self) MisshodError!void {
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => {
+                    switch (self.iostate_wr) {
+                        .Idle => return IoError.badClearEvent,
+                        .Active => |iotype| switch (iotype.action) {
+                            .Eventing => |eventCode| switch (eventCode) {
+                                .TcpipForward => {
+                                    self.session.setIoSessionState(iotype.next_state);
+                                    self.iostate_wr = .Idle;
+                                },
+                                else => return IoError.badClearEvent,
+                            },
+                            else => return IoError.cannotAcceptWrite,
+                        },
+                    }
+                },
+            };
+        }
+
+        fn clearPendingCancelTcpipForwardEvent(self: *Self) MisshodError!void {
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => {
+                    switch (self.iostate_wr) {
+                        .Idle => return IoError.badClearEvent,
+                        .Active => |iotype| switch (iotype.action) {
+                            .Eventing => |eventCode| switch (eventCode) {
+                                .CancelTcpipForward => {
+                                    self.session.setIoSessionState(iotype.next_state);
+                                    self.iostate_wr = .Idle;
+                                },
+                                else => return IoError.badClearEvent,
+                            },
+                            else => return IoError.cannotAcceptWrite,
+                        },
+                    }
+                },
+            };
+        }
+
+        pub fn acceptTcpipForward(self: *Self, bound_port: u32) MisshodError!void {
+            try self.clearPendingTcpipForwardEvent();
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => {
+                    try self.session.acceptTcpipForward(self, bound_port);
+                    try self.advance();
+                },
+            };
+        }
+
+        pub fn rejectTcpipForward(self: *Self) MisshodError!void {
+            try self.clearPendingTcpipForwardEvent();
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => {
+                    try self.session.rejectTcpipForward(self);
+                    try self.advance();
+                },
+            };
+        }
+
+        pub fn acceptCancelTcpipForward(self: *Self) MisshodError!void {
+            try self.clearPendingCancelTcpipForwardEvent();
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => {
+                    try self.session.acceptCancelTcpipForward(self);
+                    try self.advance();
+                },
+            };
+        }
+
+        pub fn rejectCancelTcpipForward(self: *Self) MisshodError!void {
+            try self.clearPendingCancelTcpipForwardEvent();
+            return switch (role) {
+                .Client => IoError.UnimplementedService,
+                .Server => {
+                    try self.session.rejectCancelTcpipForward(self);
+                    try self.advance();
+                },
+            };
         }
 
         pub fn acceptChannelOpen(self: *Self, channel_id: u32) MisshodError!void {
