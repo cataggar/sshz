@@ -12,6 +12,7 @@ pub const ChannelState = enum {
     DataRx,
     DataTx,
     DataTxComplete,
+    EofWrite,
     CloseWrite,
     Closed,
     OpenFailureWrite,
@@ -137,7 +138,7 @@ pub const ChannelTable = struct {
 
     fn isRunnable(state: ChannelState) bool {
         return switch (state) {
-            .ConfirmWrite, .RspWrite, .CloseWrite, .OpenFailureWrite => true,
+            .ConfirmWrite, .RspWrite, .CloseWrite, .OpenFailureWrite, .EofWrite => true,
             .Connected => true,
             .Data => true,
             .DataTx, .DataTxComplete => true,
@@ -385,4 +386,19 @@ test "windowAdjustAmount replenishes to MaxPayload" {
     // After applying the adjust, window should be MaxPayload
     ch.local_window += adjust;
     try std.testing.expectEqual(Protocol.MaxPayload, ch.local_window);
+}
+
+test "EofWrite is a runnable state" {
+    var table = ChannelTable{};
+    const ch = table.allocChannel(10, 32768, 32768).?;
+    ch.state = .EofWrite;
+    const runnable = table.findNextRunnable();
+    try std.testing.expect(runnable != null);
+    try std.testing.expectEqual(@as(u32, 0), runnable.?.local_id);
+}
+
+test "eof_sent and eof_received start false" {
+    const ch = Channel.init(0, 1, 32768, 32768);
+    try std.testing.expect(!ch.eof_sent);
+    try std.testing.expect(!ch.eof_received);
 }
