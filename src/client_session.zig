@@ -202,7 +202,18 @@ pub const Session = struct {
                     self.setSessionState(.NewKeysRead);
                     self.setIoSessionState(.ReadPktHdr);
                 } else {
-                    misshod.requestEvent(.{ .CheckHostKey = self.hostkey_ks }, .Idle);
+                    misshod.requestEvent(.{ .CheckHostKey = .{
+                        .raw_key = self.hostkey_ks,
+                        .fingerprint = blk: {
+                            var fp: [Protocol.hash_algo.digest_length]u8 = undefined;
+                            if (self.hostkey_ks) |ks| {
+                                Protocol.hash_algo.hash(ks, &fp, .{});
+                            } else {
+                                @memset(&fp, 0);
+                            }
+                            break :blk fp;
+                        },
+                    } }, .Idle);
                     self.setSessionState(.CheckHostKeyCompleted);
                 }
             },

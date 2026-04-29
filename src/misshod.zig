@@ -63,8 +63,17 @@ pub const KeyboardInteractivePrompt = struct {
     echo: bool,
 };
 
+pub const HostKeyInfo = struct {
+    raw_key: ?[]const u8,
+    fingerprint: [Protocol.hash_algo.digest_length]u8,
+
+    pub fn fingerprintStr(self: *const HostKeyInfo, buf: *[44]u8) []const u8 {
+        return std.base64.standard.Encoder.encode(buf, &self.fingerprint);
+    }
+};
+
 pub const MisshodClientEventCodes = union(enum) {
-    CheckHostKey: ?[]const u8,
+    CheckHostKey: HostKeyInfo,
     GetPrivateKey,
     GetKeyPassphrase,
     GetAuthPassphrase,
@@ -787,7 +796,7 @@ test "client-server full handshake round-trip" {
                         }
                     },
                     .Event => |code| switch (code) {
-                        .CheckHostKey => { client.clearEvent(.{ .CheckHostKey = null }) catch {}; },
+                        .CheckHostKey => { client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {}; },
                         .GetPrivateKey => { client.clearEvent(.GetPrivateKey) catch {}; },
                         .GetAuthPassphrase => {
                             client.session.setAuthPassphrase("testpass") catch {};
@@ -833,4 +842,31 @@ test "client-server full handshake round-trip" {
     }
 
     try std.testing.expect(connected_client);
+}
+
+test "HostKeyInfo fingerprint computation" {
+    const Misshod = @import("misshod.zig");
+    const key_data = "test-host-key-data";
+    var fp: [Protocol.hash_algo.digest_length]u8 = undefined;
+    Protocol.hash_algo.hash(key_data, &fp, .{});
+
+    const info: Misshod.HostKeyInfo = .{
+        .raw_key = key_data,
+        .fingerprint = fp,
+    };
+
+    var buf: [44]u8 = undefined;
+    const fp_str = info.fingerprintStr(&buf);
+    // SHA-256 of "test-host-key-data" base64-encoded should be 44 chars
+    try std.testing.expectEqual(@as(usize, 44), fp_str.len);
+    try std.testing.expect(fp_str[0] != 0); // not empty
+}
+
+test "HostKeyInfo fingerprint is deterministic" {
+    const key = "same-key";
+    var fp1: [Protocol.hash_algo.digest_length]u8 = undefined;
+    var fp2: [Protocol.hash_algo.digest_length]u8 = undefined;
+    Protocol.hash_algo.hash(key, &fp1, .{});
+    Protocol.hash_algo.hash(key, &fp2, .{});
+    try std.testing.expectEqualSlices(u8, &fp1, &fp2);
 }
