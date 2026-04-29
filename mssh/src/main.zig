@@ -224,11 +224,11 @@ pub fn main() !void {
                                 continue :outer;
                             }
                             if (fds[1].revents & std.posix.POLL.IN > 0) { // keyboard data in
-                                const buf = try misshod.getChannelWriteBuffer();
+                                const buf = try misshod.getChannelWriteBuffer(0);
                                 if (buf.len > 0) {
                                     const count = stdin_reader.read(buf) catch 0;
                                     if (count > 0) {
-                                        try misshod.channelWriteComplete(count);
+                                        try misshod.channelWriteComplete(0, count);
                                         continue :outer;
                                     }
                                 }

@@ -102,13 +102,6 @@ pub const UserCredentials = struct {
     auth: ?UserCredentialsPasswordOrPubkey, // null for "none" auth
 };
 
-pub const WindowSize = struct {
-    cols: u32,
-    rows: u32,
-    width_px: u32,
-    height_px: u32,
-};
-
 pub const ChannelRequestType = union(enum) {
     Shell,
     Exec: []const u8,
@@ -116,16 +109,45 @@ pub const ChannelRequestType = union(enum) {
     Env: struct { name: []const u8, value: []const u8 },
 };
 
+pub const ChannelRequestEvent = struct {
+    channel: u32,
+    request: ChannelRequestType,
+};
+
+pub const WindowSize = struct {
+    channel: u32,
+    cols: u32,
+    rows: u32,
+    width_px: u32,
+    height_px: u32,
+};
+
+pub const ChannelSignal = struct {
+    channel: u32,
+    name: []const u8,
+};
+
+pub const ChannelData = struct {
+    channel: u32,
+    data: []const u8,
+};
+
+pub const ChannelExtendedData = struct {
+    channel: u32,
+    data_type: u32,
+    data: []const u8,
+};
+
 pub const MisshodServerEventCodes = union(enum) {
     EndSession: EndSessionReason,
     UserAuth: UserCredentials,
     GetPubkeyForUser: []const u8,
-    Connected,
-    RxData: []const u8,
-    RxExtendedData: ExtendedData,
+    Connected: u32,
+    RxData: ChannelData,
+    RxExtendedData: ChannelExtendedData,
     WindowChange: WindowSize,
-    Signal: []const u8,
-    ChannelRequest: ChannelRequestType,
+    Signal: ChannelSignal,
+    ChannelRequest: ChannelRequestEvent,
 };
 
 pub fn MisshodEvent(role:Role) type {
@@ -643,23 +665,18 @@ pub fn MisshodImpl(role: Role) type {
         return self.session.isActive();
     }
 
-    pub fn getChannelWriteBuffer(self: *Self) MisshodError![]u8 {
-        // only returns a nonzero sized buffer if iosessionstate == .Idle
-        return self.session.getChannelWriteBuffer();
+    pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) MisshodError![]u8 {
+        return self.session.getChannelWriteBuffer(channel_id);
     }
 
-    pub fn channelWriteComplete(self: *Self, nbytes: usize) MisshodError!void {
+    pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
         if (self.iostate_wr == .Idle and self.iostate_rd != .Idle) {
-            // Full-duplex: read is active, write is idle
-            // Build channel data packet directly without disturbing the read side
-            try self.session.directChannelWrite(nbytes, self);
+            try self.session.directChannelWrite(channel_id, nbytes, self);
         } else {
-            // Sequential fallback (e.g. during handshake or when both idle)
             self.iostate_rd = .Idle;
             self.iostate_wr = .Idle;
             try self.advance();
-
-            try self.session.channelWriteComplete(nbytes);
+            try self.session.channelWriteComplete(channel_id, nbytes);
             self.iostate_rd = .Idle;
             self.iostate_wr = .Idle;
             try self.advance();
@@ -712,13 +729,13 @@ test "ExtendedData struct" {
 }
 
 test "WindowSize struct" {
-    const ws: WindowSize = .{ .cols = 120, .rows = 40, .width_px = 960, .height_px = 640 };
+    const ws: WindowSize = .{ .channel = 0, .cols = 120, .rows = 40, .width_px = 960, .height_px = 640 };
     try std.testing.expectEqual(@as(u32, 120), ws.cols);
     try std.testing.expectEqual(@as(u32, 40), ws.rows);
 }
 
 test "MisshodServerEventCodes WindowChange variant" {
-    const evt: MisshodServerEventCodes = .{ .WindowChange = .{ .cols = 80, .rows = 24, .width_px = 640, .height_px = 480 } };
+    const evt: MisshodServerEventCodes = .{ .WindowChange = .{ .channel = 0, .cols = 80, .rows = 24, .width_px = 640, .height_px = 480 } };
     switch (evt) {
         .WindowChange => |ws| {
             try std.testing.expectEqual(@as(u32, 80), ws.cols);
@@ -728,10 +745,10 @@ test "MisshodServerEventCodes WindowChange variant" {
 }
 
 test "MisshodServerEventCodes Signal variant" {
-    const evt: MisshodServerEventCodes = .{ .Signal = "INT" };
+    const evt: MisshodServerEventCodes = .{ .Signal = .{ .channel = 0, .name = "INT" } };
     switch (evt) {
         .Signal => |sig| {
-            try std.testing.expectEqualStrings("INT", sig);
+            try std.testing.expectEqualStrings("INT", sig.name);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -897,8 +914,8 @@ test "client-server full handshake round-trip" {
                             server.grantAccess(true) catch {};
                             server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
                         },
-                        .Connected => { server.clearEvent(.Connected) catch {}; },
-                        .ChannelRequest => { server.clearEvent(.{ .ChannelRequest = .Shell }) catch {}; },
+                        .Connected => { server.clearEvent(.{ .Connected = 0 }) catch {}; },
+                        .ChannelRequest => { server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }) catch {}; },
                         else => {},
                     },
                 }
@@ -1383,20 +1400,20 @@ test "full handshake round-trip then channel data exchange" {
                         },
                         .Connected => {
                             connected_server = true;
-                            server.clearEvent(.Connected) catch {};
+                            server.clearEvent(.{ .Connected = 0 }) catch {};
                         },
-                        .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .Shell }) catch {},
+                        .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }) catch {},
                         else => { server.clearEvent(code) catch {}; },
                     },
                 }
 
                 // After server connects and event loop is clear, send channel data
                 if (connected_server and !server_sent_data and server.iostate_wr == .Idle) {
-                    const buf = server.getChannelWriteBuffer() catch continue;
+                    const buf = server.getChannelWriteBuffer(0) catch continue;
                     if (buf.len > 0) {
                         const msg = "hello from server";
                         @memcpy(buf[0..msg.len], msg);
-                        server.channelWriteComplete(msg.len) catch continue;
+                        server.channelWriteComplete(0, msg.len) catch continue;
                         server_sent_data = true;
                     }
                 }
@@ -1449,11 +1466,11 @@ test "client channelWriteComplete uses direct write when read is active" {
                     .ReadyToConsume => |n| {
                         // After connecting, try to send channel data while reading
                         if (connected_client and !sent_channel_data) {
-                            const buf = client.getChannelWriteBuffer() catch continue;
+                            const buf = client.getChannelWriteBuffer(0) catch continue;
                             if (buf.len > 0) {
                                 const msg = "keyboard-input";
                                 @memcpy(buf[0..msg.len], msg);
-                                client.channelWriteComplete(msg.len) catch {};
+                                client.channelWriteComplete(0, msg.len) catch {};
                                 sent_channel_data = true;
                             }
                         }
@@ -1514,8 +1531,8 @@ test "client channelWriteComplete uses direct write when read is active" {
                             server.grantAccess(true) catch {};
                             server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
                         },
-                        .Connected => server.clearEvent(.Connected) catch {},
-                        .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .Shell }) catch {},
+                        .Connected => server.clearEvent(.{ .Connected = 0 }) catch {},
+                        .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }) catch {},
                         else => { server.clearEvent(code) catch {}; },
                     },
                 }

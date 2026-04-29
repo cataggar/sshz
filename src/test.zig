@@ -8,4 +8,5 @@ comptime {
     _ = @import("aesctr.zig");
     _ = @import("protocol.zig");
     _ = @import("misshod.zig");
+    _ = @import("channel.zig");
 }
