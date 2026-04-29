@@ -3,7 +3,13 @@ const Protocol = @import("protocol.zig");
 
 pub const MaxChannels = 4;
 
+pub const ClientChannelOpenMode = enum {
+    AutoShell,
+    RawSession,
+};
+
 pub const ChannelState = enum {
+    OpenWrite,
     Open,
     ConfirmWrite,
     RspWrite,
@@ -32,6 +38,7 @@ pub const Channel = struct {
     eof_received: bool,
     close_sent: bool,
     close_received: bool,
+    client_open_mode: ClientChannelOpenMode,
     state: ChannelState,
 
     pub fn init(local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
@@ -46,6 +53,7 @@ pub const Channel = struct {
             .eof_received = false,
             .close_sent = false,
             .close_received = false,
+            .client_open_mode = .RawSession,
             .state = .Open,
         };
     }
@@ -138,7 +146,7 @@ pub const ChannelTable = struct {
 
     fn isRunnable(state: ChannelState) bool {
         return switch (state) {
-            .ConfirmWrite, .RspWrite, .CloseWrite, .OpenFailureWrite, .EofWrite => true,
+            .OpenWrite, .ConfirmWrite, .RspWrite, .CloseWrite, .OpenFailureWrite, .EofWrite => true,
             .Connected => true,
             .Data => true,
             .DataTx, .DataTxComplete => true,
@@ -228,6 +236,7 @@ test "Channel init sets default values" {
     try std.testing.expect(!ch.eof_received);
     try std.testing.expect(!ch.close_sent);
     try std.testing.expect(!ch.close_received);
+    try std.testing.expectEqual(ClientChannelOpenMode.RawSession, ch.client_open_mode);
     try std.testing.expectEqual(ChannelState.Open, ch.state);
 }
 
@@ -347,6 +356,15 @@ test "findNextRunnable returns null when no channels runnable" {
     const ch1 = table.allocChannel(20, 32768, 32768).?;
     ch1.state = .DataRx;
     try std.testing.expect(table.findNextRunnable() == null);
+}
+
+test "OpenWrite channel state is runnable" {
+    var table = ChannelTable{};
+    const ch = table.allocChannel(10, 32768, 32768).?;
+    ch.state = .OpenWrite;
+
+    const runnable = table.findNextRunnable().?;
+    try std.testing.expectEqual(ch.local_id, runnable.local_id);
 }
 
 test "consumeLocalWindow decrements local_window" {
