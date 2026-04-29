@@ -89,6 +89,13 @@ pub const WindowSize = struct {
     height_px: u32,
 };
 
+pub const ChannelRequestType = union(enum) {
+    Shell,
+    Exec: []const u8,
+    Subsystem: []const u8,
+    Env: struct { name: []const u8, value: []const u8 },
+};
+
 pub const MisshodServerEventCodes = union(enum) {
     EndSession: EndSessionReason,
     UserAuth: UserCredentials,
@@ -98,6 +105,7 @@ pub const MisshodServerEventCodes = union(enum) {
     RxExtendedData: ExtendedData,
     WindowChange: WindowSize,
     Signal: []const u8,
+    ChannelRequest: ChannelRequestType,
 };
 
 pub fn MisshodEvent(role:Role) type {
@@ -665,6 +673,41 @@ test "MisshodServerEventCodes Signal variant" {
         .Signal => |sig| {
             try std.testing.expectEqualStrings("INT", sig);
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ChannelRequestType Exec variant" {
+    const req: ChannelRequestType = .{ .Exec = "ls -la" };
+    switch (req) {
+        .Exec => |cmd| try std.testing.expectEqualStrings("ls -la", cmd),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ChannelRequestType Subsystem variant" {
+    const req: ChannelRequestType = .{ .Subsystem = "sftp" };
+    switch (req) {
+        .Subsystem => |name| try std.testing.expectEqualStrings("sftp", name),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ChannelRequestType Env variant" {
+    const req: ChannelRequestType = .{ .Env = .{ .name = "LANG", .value = "en_US.UTF-8" } };
+    switch (req) {
+        .Env => |env| {
+            try std.testing.expectEqualStrings("LANG", env.name);
+            try std.testing.expectEqualStrings("en_US.UTF-8", env.value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ChannelRequestType Shell variant" {
+    const req: ChannelRequestType = .Shell;
+    switch (req) {
+        .Shell => {},
         else => return error.TestUnexpectedResult,
     }
 }
