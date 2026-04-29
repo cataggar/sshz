@@ -511,7 +511,18 @@ pub const Session = struct {
                     try pkt.writeU32(wc[3]); // height_px
                     misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 } else if (chan.write_buf_nbytes > 0) {
-                    chan.state = .DataRxAdjustWindow;
+                    chan.state = .DataTx;
+                } else if (chan.needsWindowAdjust()) {
+                    // RFC 4254 §5.2 — replenish receive window
+                    var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+                    try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
+                    try pkt.writeU32(chan.remote_id);
+                    const adjust = chan.windowAdjustAmount();
+                    try pkt.writeU32(adjust);
+                    chan.local_window += adjust;
+                    misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                    chan.state = .DataRx;
+                    self.active_channel_id = null;
                 } else {
                     chan.state = .DataRx;
                     self.active_channel_id = null;
@@ -519,14 +530,6 @@ pub const Session = struct {
                 if (self.channel_table.findNextRunnable()) |_| {} else {
                     self.setIoSessionState(.ReadPktHdr);
                 }
-            },
-            .DataRxAdjustWindow => {
-                var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
-                try pkt.writeU32(chan.remote_id);
-                try pkt.writeU32(Protocol.MaxPayload);
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
-                chan.state = .DataTx;
             },
             .DataRx => {
                 self.active_channel_id = null;
@@ -896,6 +899,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
                 const s = try rdr.readU32LenString();
+                chan.consumeLocalWindow(@intCast(s.len));
                 misshod.requestEvent(.{ .RxData = s }, .Idle);
                 chan.state = .Data;
                 self.active_channel_id = chan.local_id;
@@ -912,6 +916,7 @@ pub const Session = struct {
                 }
                 const data_type = try rdr.readU32();
                 const s = try rdr.readU32LenString();
+                chan.consumeLocalWindow(@intCast(s.len));
                 misshod.requestEvent(.{ .RxExtendedData = .{ .data_type = data_type, .data = s } }, .Idle);
                 chan.state = .Data;
                 self.active_channel_id = chan.local_id;
