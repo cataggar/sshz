@@ -33,7 +33,6 @@ pub fn build(b: *std.Build) void {
         .name = "mssh",
         .root_module = exe_mod,
     });
-    exe.addIncludePath(b.path("src/"));
 
     b.installArtifact(exe);
 

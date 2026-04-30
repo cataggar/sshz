@@ -5,6 +5,7 @@ pub const MaxChannels = 4;
 
 pub const ChannelState = enum {
     Open,
+    OpenSent,
     ConfirmWrite,
     RspWrite,
     Connected,
@@ -18,9 +19,15 @@ pub const ChannelState = enum {
     OpenFailureWrite,
 };
 
+pub const ChannelKind = enum {
+    Session,
+    AgentForward,
+};
+
 pub const Channel = struct {
     const Self = @This();
 
+    kind: ChannelKind,
     local_id: u32,
     remote_id: u32,
     peer_window: u32,
@@ -35,7 +42,12 @@ pub const Channel = struct {
     state: ChannelState,
 
     pub fn init(local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
+        return Self.initKind(.Session, local_id, remote_id, peer_window, remote_max_packet_size);
+    }
+
+    pub fn initKind(kind: ChannelKind, local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
         return Self{
+            .kind = kind,
             .local_id = local_id,
             .remote_id = remote_id,
             .peer_window = peer_window,
@@ -78,10 +90,14 @@ pub const ChannelTable = struct {
     last_serviced_slot: usize = 0,
 
     pub fn allocChannel(self: *Self, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
+        return self.allocChannelKind(.Session, remote_id, peer_window, remote_max_packet_size);
+    }
+
+    pub fn allocChannelKind(self: *Self, kind: ChannelKind, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
         const local_id = self.next_local_id;
         for (&self.channels) |*slot| {
             if (slot.* == null) {
-                slot.* = Channel.init(local_id, remote_id, peer_window, remote_max_packet_size);
+                slot.* = Channel.initKind(kind, local_id, remote_id, peer_window, remote_max_packet_size);
                 self.next_local_id +%= 1;
                 return &(slot.*.?);
             }
@@ -142,7 +158,7 @@ pub const ChannelTable = struct {
             .Connected => true,
             .Data => true,
             .DataTx, .DataTxComplete => true,
-            .DataRx, .Open, .Closed => false,
+            .DataRx, .Open, .OpenSent, .Closed => false,
         };
     }
 
@@ -218,6 +234,7 @@ test "allocChannel returns null when table is full" {
 
 test "Channel init sets default values" {
     const ch = Channel.init(0, 42, 65535, 32768);
+    try std.testing.expectEqual(ChannelKind.Session, ch.kind);
     try std.testing.expectEqual(@as(u32, 0), ch.local_id);
     try std.testing.expectEqual(@as(u32, 42), ch.remote_id);
     try std.testing.expectEqual(@as(u32, 65535), ch.peer_window);
@@ -229,6 +246,13 @@ test "Channel init sets default values" {
     try std.testing.expect(!ch.close_sent);
     try std.testing.expect(!ch.close_received);
     try std.testing.expectEqual(ChannelState.Open, ch.state);
+}
+
+test "allocChannelKind preserves channel kind" {
+    var table = ChannelTable{};
+    const ch = table.allocChannelKind(.AgentForward, 10, 32768, 32768).?;
+    try std.testing.expectEqual(ChannelKind.AgentForward, ch.kind);
+    try std.testing.expectEqual(@as(u32, 0), ch.local_id);
 }
 
 test "closing one channel does not affect another" {

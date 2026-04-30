@@ -6,11 +6,12 @@ const ClientSession = @import("client_session.zig").Session;
 const ServerSession = @import("server_session.zig").Session;
 const BufferError = @import("buffer.zig").BufferError;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
+const Key = @import("key.zig");
 const Protocol = @import("protocol.zig");
 const native_endian = @import("builtin").target.cpu.arch.endian();
 const BufferReader = @import("buffer.zig").BufferReader;
 
-pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError || PrivKeyError;
+pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError || PrivKeyError || Key.KeyError;
 
 pub const IoError = error{
     cannotAcceptWrite,
@@ -82,6 +83,9 @@ pub const MisshodClientEventCodes = union(enum) {
     Connected,
     RxData: []const u8,
     RxExtendedData: ExtendedData,
+    AgentChannelOpen: u32,
+    AgentData: ChannelData,
+    AgentChannelClosed: u32,
     Banner: []const u8,
     KeyboardInteractive: KeyboardInteractivePrompt,
 };
@@ -93,8 +97,13 @@ pub const ExtendedData = struct {
 
 pub const UserCredentialsPasswordOrPubkey = union(enum) {
     Password: []const u8,
-    Pubkey: []const u8,
+    Pubkey: PublicKeyIdentity,
     KeyboardInteractive: []const u8, // submethods
+};
+
+pub const PublicKeyIdentity = struct {
+    algorithm: []const u8,
+    blob: []const u8,
 };
 
 pub const UserCredentials = struct {
@@ -107,6 +116,7 @@ pub const ChannelRequestType = union(enum) {
     Exec: []const u8,
     Subsystem: []const u8,
     Env: struct { name: []const u8, value: []const u8 },
+    AgentForward,
 };
 
 pub const ChannelRequestEvent = struct {
@@ -143,6 +153,8 @@ pub const MisshodServerEventCodes = union(enum) {
     UserAuth: UserCredentials,
     GetPubkeyForUser: []const u8,
     Connected: u32,
+    AgentChannelOpen: u32,
+    AgentChannelClosed: u32,
     RxData: ChannelData,
     RxExtendedData: ChannelExtendedData,
     WindowChange: WindowSize,
@@ -688,6 +700,26 @@ pub fn MisshodImpl(role: Role) type {
         self.iostate_wr = .Idle;
         try self.advance();
     }
+
+    pub fn enableAgentForwarding(self: *Self) MisshodError!void {
+        switch (role) {
+            .Client => return try self.session.enableAgentForwarding(),
+            .Server => return IoError.UnimplementedService,
+        }
+    }
+
+    pub fn openAgentChannel(self: *Self) MisshodError!u32 {
+        switch (role) {
+            .Client => return IoError.UnimplementedService,
+            .Server => {
+                self.iostate_rd = .Idle;
+                self.iostate_wr = .Idle;
+                const channel_id = try self.session.openAgentChannel();
+                try self.advance();
+                return channel_id;
+            },
+        }
+    }
 };
 }
 
@@ -724,6 +756,29 @@ test "MisshodClientEventCodes Banner variant" {
         .Banner => |text| {
             try std.testing.expectEqualStrings("Welcome to the server", text);
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "MisshodClientEventCodes agent forwarding variants" {
+    const open_evt: MisshodClientEventCodes = .{ .AgentChannelOpen = 3 };
+    switch (open_evt) {
+        .AgentChannelOpen => |channel| try std.testing.expectEqual(@as(u32, 3), channel),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const data_evt: MisshodClientEventCodes = .{ .AgentData = .{ .channel = 3, .data = "agent-data" } };
+    switch (data_evt) {
+        .AgentData => |data| {
+            try std.testing.expectEqual(@as(u32, 3), data.channel);
+            try std.testing.expectEqualStrings("agent-data", data.data);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const closed_evt: MisshodClientEventCodes = .{ .AgentChannelClosed = 3 };
+    switch (closed_evt) {
+        .AgentChannelClosed => |channel| try std.testing.expectEqual(@as(u32, 3), channel),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -791,6 +846,14 @@ test "ChannelRequestType Shell variant" {
     const req: ChannelRequestType = .Shell;
     switch (req) {
         .Shell => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "ChannelRequestType AgentForward variant" {
+    const req: ChannelRequestType = .AgentForward;
+    switch (req) {
+        .AgentForward => {},
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1548,4 +1611,145 @@ test "client channelWriteComplete uses direct write when read is active" {
 
     try std.testing.expect(connected_client);
     try std.testing.expect(sent_channel_data);
+}
+
+fn driveHandshakeForKeys(hostkey_ascii: []const u8, client_key_ascii: ?[]const u8, expected_pubkey_algorithm: ?[]const u8) !void {
+    var cprng = std.Random.DefaultPrng.init(1000);
+    var sprng = std.Random.DefaultPrng.init(2000);
+
+    var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    var server = try MisshodServer.init(sprng.random(), hostkey_ascii, std.testing.allocator);
+    defer server.deinit();
+
+    var c2s_buf: [65536]u8 = undefined;
+    var s2c_buf: [65536]u8 = undefined;
+    var c2s_len: usize = 0;
+    var s2c_len: usize = 0;
+    var connected_client = false;
+    var saw_expected_pubkey = expected_pubkey_algorithm == null;
+
+    const Endpoint = enum { client_ep, server_ep };
+    const endpoints = [_]Endpoint{ .client_ep, .server_ep };
+
+    var steps: usize = 0;
+    while (steps < 2000) : (steps += 1) {
+        if (connected_client and saw_expected_pubkey) break;
+
+        for (endpoints) |ep| {
+            if (ep == .client_ep) {
+                const cev = client.getNextEvent() catch continue;
+                switch (cev) {
+                    .ReadyToProduce => {
+                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
+                        c2s_len += data.len;
+                        client.consumed(data.len) catch {};
+                    },
+                    .ReadyToConsume => |n| {
+                        if (s2c_len > 0) {
+                            const feed = @min(n, s2c_len);
+                            client.write(s2c_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &s2c_buf, s2c_buf[feed..s2c_len]);
+                            s2c_len -= feed;
+                        }
+                    },
+                    .ReadyToConsumeAndProduce => |s| {
+                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
+                        c2s_len += data.len;
+                        client.consumed(data.len) catch {};
+                        if (s2c_len > 0) {
+                            const feed = @min(s.consume, s2c_len);
+                            client.write(s2c_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &s2c_buf, s2c_buf[feed..s2c_len]);
+                            s2c_len -= feed;
+                        }
+                    },
+                    .Event => |code| switch (code) {
+                        .CheckHostKey => client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {},
+                        .GetPrivateKey => {
+                            if (client_key_ascii) |key| client.setPrivateKey(key) catch {};
+                            client.clearEvent(.GetPrivateKey) catch {};
+                        },
+                        .GetAuthPassphrase => {
+                            client.session.setAuthPassphrase("testpass") catch {};
+                            client.clearEvent(.GetAuthPassphrase) catch {};
+                        },
+                        .Connected => {
+                            connected_client = true;
+                            client.clearEvent(.Connected) catch {};
+                        },
+                        .EndSession => break,
+                        else => { client.clearEvent(code) catch {}; },
+                    },
+                }
+            } else {
+                const sev = server.getNextEvent() catch continue;
+                switch (sev) {
+                    .ReadyToProduce => {
+                        const data = server.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(s2c_buf[s2c_len .. s2c_len + data.len], data);
+                        s2c_len += data.len;
+                        server.consumed(data.len) catch {};
+                    },
+                    .ReadyToConsume => |n| {
+                        if (c2s_len > 0) {
+                            const feed = @min(n, c2s_len);
+                            server.write(c2s_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
+                            c2s_len -= feed;
+                        }
+                    },
+                    .ReadyToConsumeAndProduce => |s| {
+                        const data = server.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(s2c_buf[s2c_len .. s2c_len + data.len], data);
+                        s2c_len += data.len;
+                        server.consumed(data.len) catch {};
+                        if (c2s_len > 0) {
+                            const feed = @min(s.consume, c2s_len);
+                            server.write(c2s_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
+                            c2s_len -= feed;
+                        }
+                    },
+                    .Event => |code| switch (code) {
+                        .UserAuth => |credentials| {
+                            if (expected_pubkey_algorithm) |expected| {
+                                if (credentials.auth) |auth| switch (auth) {
+                                    .Pubkey => |pubkey| {
+                                        try std.testing.expectEqualStrings(expected, pubkey.algorithm);
+                                        try std.testing.expect(pubkey.blob.len > 0);
+                                        saw_expected_pubkey = true;
+                                    },
+                                    else => {},
+                                };
+                            }
+                            server.grantAccess(true) catch {};
+                            server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
+                        },
+                        .Connected => server.clearEvent(.{ .Connected = 0 }) catch {},
+                        .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }) catch {},
+                        else => { server.clearEvent(code) catch {}; },
+                    },
+                }
+            }
+        }
+    }
+
+    try std.testing.expect(connected_client);
+    try std.testing.expect(saw_expected_pubkey);
+}
+
+test "handshake supports ECDSA and RSA host keys" {
+    const privkey = @import("privkey.zig");
+    try driveHandshakeForKeys(privkey.testkey_ecdsa_p256, null, null);
+    try driveHandshakeForKeys(privkey.testkey_rsa_2048, null, null);
+}
+
+test "public key auth supports Ed25519 ECDSA and RSA SHA2 keys" {
+    const privkey = @import("privkey.zig");
+    try driveHandshakeForKeys(privkey.testkey_valid, privkey.testkey_valid, "ssh-ed25519");
+    try driveHandshakeForKeys(privkey.testkey_valid, privkey.testkey_ecdsa_p256, "ecdsa-sha2-nistp256");
+    try driveHandshakeForKeys(privkey.testkey_valid, privkey.testkey_rsa_2048, "rsa-sha2-512");
 }

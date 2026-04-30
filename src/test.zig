@@ -9,4 +9,5 @@ comptime {
     _ = @import("protocol.zig");
     _ = @import("misshod.zig");
     _ = @import("channel.zig");
+    _ = @import("key.zig");
 }

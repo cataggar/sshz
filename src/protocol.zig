@@ -110,6 +110,16 @@ pub const enc_algo = std.crypto.core.aes.Aes256;
 pub const enc_algo_name = "aes256-ctr";
 pub const AesCtrT = AesCtr(enc_algo);
 
+pub const channel_type_session = "session";
+pub const channel_type_auth_agent_openssh = "auth-agent@openssh.com";
+pub const channel_type_auth_agent = "auth-agent";
+pub const channel_request_auth_agent = "auth-agent-req@openssh.com";
+
+pub fn isAgentChannelType(channel_type: []const u8) bool {
+    return std.mem.eql(u8, channel_type, channel_type_auth_agent_openssh) or
+        std.mem.eql(u8, channel_type, channel_type_auth_agent);
+}
+
 // Note, the buffers are not used for storage, they're just passed forward to signal to receiver where the data can be found
 pub const IoSessionState = union(enum) {
     Init,
@@ -304,6 +314,12 @@ test "MaxChannelDataLen accounts for framing overhead" {
     try std.testing.expectEqual(MaxPayload - 9, MaxChannelDataLen);
     try std.testing.expect(MaxChannelDataLen > 0);
     try std.testing.expect(MaxChannelDataLen > 64); // must be larger than old hardcoded value
+}
+
+test "agent forwarding channel type aliases" {
+    try std.testing.expect(isAgentChannelType(channel_type_auth_agent_openssh));
+    try std.testing.expect(isAgentChannelType(channel_type_auth_agent));
+    try std.testing.expect(!isAgentChannelType(channel_type_session));
 }
 
 test "KeyDataBi.clear zeros all key material" {
