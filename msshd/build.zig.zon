@@ -1,7 +1,7 @@
 .{
     .name = .msshd,
     .version = "0.0.1",
-    .fingerprint = 0xc3d5e7f9a1b2c4d6,
+    .fingerprint = 0x6f46d97445d0ffbe,
     .dependencies = .{
         .misshod = .{ .path = ".." },
     },

@@ -29,7 +29,7 @@ It aims to be:
 
 # Building
 
-MiSSHod requires [Zig 0.14.0](https://ziglang.org/download/). 
+MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/).
 
 ## Client
 
@@ -43,8 +43,10 @@ zig build test
 cd mssh
 zig build
 ./zig-out/bin/mssh
-./zig-out/bin/mssh <username@host> <port> [idfile]
+./zig-out/bin/mssh <username@host> <port> [-A|--agent-forward] [idfile]
 ```
+
+Use `-A` or `--agent-forward` to forward the local SSH agent from `SSH_AUTH_SOCK`.
 
 To run a test SSH server (dropbear) in docker
 
@@ -142,4 +144,3 @@ Tiny uses a weaker PRNG, a fixed buffer allocator and does no file I/O.
 MiSSHod was developed rapidly. The main aim was to get it working and learn something along the way. I don't know what's next, but hopefully you can learn something too by looking at a small SSH implementation.
 
 It's entirely undocumented and there aren't enough tests. The IO systems are a bit arcane, as I've tried wherever possible to avoid using excess RAM.
-
