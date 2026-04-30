@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    exe_mod.linkSystemLibrary("z", .{});
 
     const misshod_dep = b.dependency("misshod", .{
         .target = target,

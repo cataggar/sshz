@@ -21,15 +21,16 @@ It aims to be:
 
  - Public key auth
  - Password auth
- - Supports exactly one of each of the required protocols
+ - Supports a focused set of SSH transport algorithms
     - hmac-sha2-256 (hmac)
     - curve25519-sha256 (key exchange)
     - ssh-ed25519 (key)
     - aes256-ctr (cipher)
+    - zlib@openssh.com (delayed compression)
 
 # Building
 
-MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/).
+MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/) and system zlib.
 
 ## Client
 

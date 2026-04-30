@@ -277,6 +277,7 @@ pub fn MisshodImpl(role: Role) type {
         // full-duplex: separate read and write buffers
         iobuf_rd: [Protocol.MaxSSHPacket]u8 = undefined,
         iobuf_wr: [Protocol.MaxSSHPacket]u8 = undefined,
+        iobuf_decompressed: [Protocol.MaxPayload]u8 = undefined,
         rd_nbytes: usize,
         rd_off: usize,
         wr_nbytes: usize,
@@ -298,6 +299,7 @@ pub fn MisshodImpl(role: Role) type {
             self.session.deinit();
             std.crypto.secureZero(u8, &self.iobuf_rd);
             std.crypto.secureZero(u8, &self.iobuf_wr);
+            std.crypto.secureZero(u8, &self.iobuf_decompressed);
         }
 
         // for session use
@@ -528,14 +530,20 @@ pub fn MisshodImpl(role: Role) type {
                 // flip bytes
                 std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
             }
-            const payload_len = hdr.packet_length - hdr.padding_length - 1;
+            if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
+                return IoError.InvalidPacketSize;
+            }
+            const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
+            if (payload_len > Protocol.MaxPayload) return IoError.InvalidPacketSize;
+            const pkt_len = Protocol.sizeof_PktHdr + payload_len + hdr.padding_length;
+            if (pkt_len > iobuf.len) return IoError.InvalidPacketSize;
             const payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
 
             if (!self.session.encrypted) {
-                return BufferReader.init(payload);
+                const decompressed = try inkeys.compression.decompressPayload(payload, &self.iobuf_decompressed);
+                return BufferReader.init(decompressed);
             } else {
                 TRACEDUMP(.Debug, "all buf", .{}, iobuf);
-                const pkt_len = payload_len + (Protocol.sizeof_PktHdr) + hdr.padding_length;
                 if (pkt_len > Protocol.AesCtrT.block_size) { // if there's more to be decrypted after first block
                     const remaining_pkt_bytes = pkt_len - Protocol.AesCtrT.block_size;
                     var dec: [Protocol.MaxSSHPacket]u8 = undefined;
@@ -549,20 +557,20 @@ pub fn MisshodImpl(role: Role) type {
 
                 // verify mac
                 if (iobuf.len < Protocol.mac_algo.key_length) {
-                    return error.InvalidPacketSize; // too small to have a mac
+                    return IoError.InvalidPacketSize; // too small to have a mac
                 }
                 const rxmac = iobuf[pkt_len..iobuf.len]; // at the end
                 var calcmac: [Protocol.mac_algo.key_length]u8 = undefined;
                 var m = Protocol.mac_algo.init(inkeys.mackey[0..Protocol.mac_algo.key_length]);
                 const seq = std.mem.nativeTo(u32, inkeys.seq - 1, .big); // seq has already been incremented
                 m.update(std.mem.asBytes(&seq));
-                m.update(iobuf[0 .. iobuf.len - Protocol.mac_algo.key_length]); // plaintext
+                m.update(iobuf[0..pkt_len]); // plaintext
                 m.final(&calcmac);
 
                 TRACEDUMP(.Debug, "rxmac", .{}, rxmac);
                 TRACEDUMP(.Debug, "mackey", .{}, inkeys.mackey[0..Protocol.mac_algo.key_length]);
                 TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
-                TRACEDUMP(.Debug, "macdata", .{}, iobuf[0 .. iobuf.len - Protocol.mac_algo.key_length]);
+                TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..pkt_len]);
                 TRACEDUMP(.Debug, "calcmac", .{}, std.mem.asBytes(&calcmac));
 
                 if (!std.mem.eql(u8, &calcmac, rxmac)) {
@@ -570,7 +578,9 @@ pub fn MisshodImpl(role: Role) type {
                 }
 
                 // remove mac and return buffer containing just plaintext payload
-                return BufferReader.init(iobuf[Protocol.sizeof_PktHdr .. iobuf.len - Protocol.mac_algo.key_length]);
+                const decrypted_payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
+                const decompressed = try inkeys.compression.decompressPayload(decrypted_payload, &self.iobuf_decompressed);
+                return BufferReader.init(decompressed);
             }
         }
 
@@ -650,13 +660,19 @@ pub fn MisshodImpl(role: Role) type {
                         }
 
                         // padding len is such that payload_len + sizeof(hdr) + padding = block size
-                        const payload_len = hdr.packet_length - (hdr.padding_length + 1);
+                        if (hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
+                            return IoError.InvalidPacketSize;
+                        }
+                        const payload_len: usize = @intCast(hdr.packet_length - (@as(u32, hdr.padding_length) + 1));
                         if (hdr.padding_length < 4) {
+                            return IoError.InvalidPacketSize;
+                        }
+                        if (payload_len > Protocol.MaxPayload) {
                             return IoError.InvalidPacketSize;
                         }
                         const pkt_len = payload_len + (Protocol.sizeof_PktHdr) + hdr.padding_length;
                         // avoid reading obviously bad packet sizes
-                        if (pkt_len < 8 or pkt_len > Protocol.MaxSSHPacket) {
+                        if (pkt_len < 8 or pkt_len > Protocol.MaxSSHPacket or pkt_len % Protocol.AesCtrT.block_size != 0) {
                             TRACE(.Info, "Bad pkt size {d}\n", .{pkt_len});
                             return IoError.InvalidPacketSize;
                         }
@@ -681,8 +697,11 @@ pub fn MisshodImpl(role: Role) type {
 
                         TRACE(.Debug, ".ReadPktBody hdr={any}", .{hdr});
                         // read in payload
-                        const payload_len = hdr.packet_length - hdr.padding_length - 1;
-                        std.debug.assert(payload_len <= Protocol.MaxPayload);
+                        if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
+                            return IoError.InvalidPacketSize;
+                        }
+                        const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
+                        if (payload_len > Protocol.MaxPayload) return IoError.InvalidPacketSize;
 
                         self.requestRead(buf.len, payload_len + hdr.padding_length, .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + payload_len + hdr.padding_length] });
                         inkeys.seq +%= 1;
@@ -1760,6 +1779,14 @@ test "full handshake round-trip then channel data exchange" {
     try std.testing.expect(connected_client);
     try std.testing.expect(connected_server);
     try std.testing.expect(client_rx_data);
+    try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.c2s.compression.algorithm);
+    try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.s2c.compression.algorithm);
+    try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, server.session.keydata.c2s.compression.algorithm);
+    try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, server.session.keydata.s2c.compression.algorithm);
+    try std.testing.expect(client.session.keydata.c2s.compression.active);
+    try std.testing.expect(client.session.keydata.s2c.compression.active);
+    try std.testing.expect(server.session.keydata.c2s.compression.active);
+    try std.testing.expect(server.session.keydata.s2c.compression.active);
 }
 
 test "client channelWriteComplete uses direct write when read is active" {
