@@ -1,6 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
-const MisshodClient = @import("misshod").MisshodClient;
+const Misshod = @import("misshod");
+const MisshodClient = Misshod.MisshodClient;
+const SshOpenFailureReason = Misshod.SshOpenFailureReason;
 
 // Turn off echo and read a password
 fn readPassphrase(password_buf: []u8) ![]u8 {
@@ -322,6 +324,22 @@ pub fn main(init: std.process.Init) !void {
                                 try misshod.session.setKeyboardInteractiveResponse(try readPassphrase(&password_buf));
                                 try misshod.clearEvent(eventCode);
                             },
+                            .ChannelOpened,
+                            .ChannelOpenFailure,
+                            .TcpipForwardSuccess,
+                            .TcpipForwardFailure,
+                            .CancelTcpipForwardSuccess,
+                            .CancelTcpipForwardFailure,
+                            => {
+                                try misshod.clearEvent(eventCode);
+                            },
+                            .ChannelOpenRequest => |request| {
+                                try misshod.rejectChannelOpen(
+                                    request.channel,
+                                    SshOpenFailureReason.AdministrativelyProhibited,
+                                    "unsupported channel open",
+                                );
+                            },
                             .AgentChannelOpen => |channel| {
                                 try misshod.clearEvent(eventCode);
                                 addAgentSocket(&agent_sockets, channel, agent_sock_path.?) catch |err| {
@@ -368,7 +386,7 @@ pub fn main(init: std.process.Init) !void {
 
                         var fds: [2 + MaxAgentSockets]std.posix.pollfd = undefined;
                         fds[0] = .{
-                                .fd = stream.socket.handle,
+                            .fd = stream.socket.handle,
                             .events = pollevts,
                             .revents = undefined,
                         };

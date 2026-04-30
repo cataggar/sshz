@@ -1,5 +1,7 @@
 const std = @import("std");
-const MisshodServer = @import("misshod").MisshodServer;
+const Misshod = @import("misshod");
+const MisshodServer = Misshod.MisshodServer;
+const SshOpenFailureReason = Misshod.SshOpenFailureReason;
 
 fn readFd(fd: std.c.fd_t, buf: []u8) !usize {
     if (buf.len == 0) return 0;
@@ -47,7 +49,7 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Server listening on port {d}\n", .{port});
 
-    nextclient: while(true) {
+    nextclient: while (true) {
         var stream = try server.accept(init.io);
         defer stream.close(init.io);
 
@@ -92,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
                         .UserAuth => |credentials| {
                             //std.debug.print("credentials: {any}\n", .{credentials});
                             if (credentials.auth) |auth| {
-                                switch(auth) {
+                                switch (auth) {
                                     .Password => |password| {
                                         // FIXME, some kind of username/password lookup
                                         // for now, rule is password must match username
@@ -104,7 +106,7 @@ pub fn main(init: std.process.Init) !void {
                                         const fingerprint = std.base64.standard.Encoder.encode(&fingerprint_buf, pubkey.blob);
                                         std.debug.print("FIXME decide whether to allow username={s} pubkey_alg={s} pubkey={s}\n", .{ credentials.username, pubkey.algorithm, fingerprint });
 
-                                        try misshod.grantAccess(true);  // FIXME
+                                        try misshod.grantAccess(true); // FIXME
                                     },
                                     .KeyboardInteractive => {
                                         try misshod.grantAccess(false);
@@ -119,8 +121,29 @@ pub fn main(init: std.process.Init) !void {
                             std.debug.print(".GetPubkeyForUser: {s}\n", .{username});
                             std.debug.assert(false);
                         },
-                        .ChannelRequest, .WindowChange, .Signal, .RxExtendedData, .AgentChannelOpen, .AgentChannelClosed => {
+                        .ChannelRequest,
+                        .WindowChange,
+                        .Signal,
+                        .RxExtendedData,
+                        .ChannelOpened,
+                        .ChannelOpenFailure,
+                        .AgentChannelOpen,
+                        .AgentChannelClosed,
+                        => {
                             try misshod.clearEvent(eventCode);
+                        },
+                        .ChannelOpenRequest => |request| {
+                            try misshod.rejectChannelOpen(
+                                request.channel,
+                                SshOpenFailureReason.AdministrativelyProhibited,
+                                "unsupported channel open",
+                            );
+                        },
+                        .TcpipForward => {
+                            try misshod.rejectTcpipForward();
+                        },
+                        .CancelTcpipForward => {
+                            try misshod.rejectCancelTcpipForward();
                         },
                     }
                 },
