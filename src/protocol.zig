@@ -13,6 +13,9 @@ const Hasher = @import("hasher.zig").Hasher;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const decodePrivKey = @import("privkey.zig").decodePrivKey;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
+const zlib = @cImport({
+    @cInclude("zlib.h");
+});
 
 pub const CommDir = enum {
     ClientToServer,
@@ -111,6 +114,10 @@ pub const enc_algo = std.crypto.core.aes.Aes256;
 pub const enc_algo_name = "aes256-ctr";
 pub const AesCtrT = AesCtr(enc_algo);
 
+pub const compression_none = "none";
+pub const compression_zlib_openssh = "zlib@openssh.com";
+pub const compression_algorithms = compression_zlib_openssh ++ "," ++ compression_none;
+
 pub const channel_type_session = "session";
 pub const channel_type_auth_agent_openssh = "auth-agent@openssh.com";
 pub const channel_type_auth_agent = "auth-agent";
@@ -134,12 +141,185 @@ pub const IoSessionState = union(enum) {
     ReadPktCompletion: []const u8,
 };
 
+pub const CompressionAlgorithm = enum {
+    None,
+    ZlibOpenSsh,
+
+    pub fn name(self: CompressionAlgorithm) []const u8 {
+        return switch (self) {
+            .None => compression_none,
+            .ZlibOpenSsh => compression_zlib_openssh,
+        };
+    }
+
+    pub fn fromName(name_bytes: []const u8) ?CompressionAlgorithm {
+        if (std.mem.eql(u8, name_bytes, compression_none)) return .None;
+        if (std.mem.eql(u8, name_bytes, compression_zlib_openssh)) return .ZlibOpenSsh;
+        return null;
+    }
+};
+
+pub fn selectCompressionAlgorithm(client_namelist: []const u8, server_namelist: []const u8) ?CompressionAlgorithm {
+    var client_iter = util.NameListTokenizer.init(client_namelist);
+    while (client_iter.next()) |client_name| {
+        const algorithm = CompressionAlgorithm.fromName(client_name) orelse continue;
+        var server_iter = util.NameListTokenizer.init(server_namelist);
+        while (server_iter.next()) |server_name| {
+            if (std.mem.eql(u8, client_name, server_name)) return algorithm;
+        }
+    }
+    return null;
+}
+
+pub const CompressionState = struct {
+    const Self = @This();
+
+    algorithm: CompressionAlgorithm = .None,
+    pending_algorithm: ?CompressionAlgorithm = null,
+    active: bool = false,
+    deflate_initialized: bool = false,
+    inflate_initialized: bool = false,
+    deflate_stream: zlib.z_stream = std.mem.zeroes(zlib.z_stream),
+    inflate_stream: zlib.z_stream = std.mem.zeroes(zlib.z_stream),
+
+    pub fn queueAlgorithm(self: *Self, algorithm: CompressionAlgorithm) void {
+        self.pending_algorithm = algorithm;
+    }
+
+    pub fn applyPendingAlgorithm(self: *Self) void {
+        if (self.pending_algorithm) |algorithm| {
+            self.endStreams();
+            self.algorithm = algorithm;
+            self.active = false;
+            self.pending_algorithm = null;
+        }
+    }
+
+    pub fn activateDeflate(self: *Self) MisshodError!void {
+        switch (self.algorithm) {
+            .None => {},
+            .ZlibOpenSsh => {
+                if (!self.deflate_initialized) {
+                    try self.initDeflate();
+                }
+                self.active = true;
+            },
+        }
+    }
+
+    pub fn activateInflate(self: *Self) MisshodError!void {
+        switch (self.algorithm) {
+            .None => {},
+            .ZlibOpenSsh => {
+                if (!self.inflate_initialized) {
+                    try self.initInflate();
+                }
+                self.active = true;
+            },
+        }
+    }
+
+    pub fn compressPayload(self: *Self, input: []const u8, output: []u8) MisshodError![]const u8 {
+        if (!self.active or self.algorithm == .None) return input;
+        if (input.len > MaxPayload or output.len == 0) return IoError.tooBig;
+
+        switch (self.algorithm) {
+            .None => return input,
+            .ZlibOpenSsh => {
+                if (!self.deflate_initialized) {
+                    try self.initDeflate();
+                }
+                self.deflate_stream.next_in = @ptrCast(@constCast(input.ptr));
+                self.deflate_stream.avail_in = @intCast(input.len);
+                self.deflate_stream.next_out = @ptrCast(output.ptr);
+                self.deflate_stream.avail_out = @intCast(output.len);
+
+                const rc = zlib.deflate(&self.deflate_stream, zlib.Z_SYNC_FLUSH);
+                if (rc != zlib.Z_OK) return IoError.UnexpectedResponse;
+                if (self.deflate_stream.avail_in != 0 or self.deflate_stream.avail_out == 0) return IoError.tooBig;
+
+                return output[0 .. output.len - self.deflate_stream.avail_out];
+            },
+        }
+    }
+
+    pub fn decompressPayload(self: *Self, input: []const u8, output: []u8) MisshodError![]const u8 {
+        if (!self.active or self.algorithm == .None) return input;
+        if (output.len == 0) return IoError.tooBig;
+
+        switch (self.algorithm) {
+            .None => return input,
+            .ZlibOpenSsh => {
+                if (!self.inflate_initialized) {
+                    try self.initInflate();
+                }
+                self.inflate_stream.next_in = @ptrCast(@constCast(input.ptr));
+                self.inflate_stream.avail_in = @intCast(input.len);
+                self.inflate_stream.next_out = @ptrCast(output.ptr);
+                self.inflate_stream.avail_out = @intCast(output.len);
+
+                const rc = zlib.inflate(&self.inflate_stream, zlib.Z_SYNC_FLUSH);
+                if (rc != zlib.Z_OK) {
+                    if (rc == zlib.Z_BUF_ERROR and self.inflate_stream.avail_out == 0) return IoError.tooBig;
+                    return IoError.InvalidPacketSize;
+                }
+                if (self.inflate_stream.avail_in != 0) return IoError.tooBig;
+
+                return output[0 .. output.len - self.inflate_stream.avail_out];
+            },
+        }
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.endStreams();
+        self.algorithm = .None;
+        self.pending_algorithm = null;
+        self.active = false;
+    }
+
+    fn initDeflate(self: *Self) MisshodError!void {
+        self.deflate_stream = std.mem.zeroes(zlib.z_stream);
+        const rc = zlib.deflateInit_(&self.deflate_stream, zlib.Z_DEFAULT_COMPRESSION, zlib.ZLIB_VERSION, @sizeOf(zlib.z_stream));
+        if (rc != zlib.Z_OK) return IoError.UnexpectedResponse;
+        self.deflate_initialized = true;
+    }
+
+    fn initInflate(self: *Self) MisshodError!void {
+        self.inflate_stream = std.mem.zeroes(zlib.z_stream);
+        const rc = zlib.inflateInit_(&self.inflate_stream, zlib.ZLIB_VERSION, @sizeOf(zlib.z_stream));
+        if (rc != zlib.Z_OK) return IoError.UnexpectedResponse;
+        self.inflate_initialized = true;
+    }
+
+    fn endStreams(self: *Self) void {
+        if (self.deflate_initialized) {
+            _ = zlib.deflateEnd(&self.deflate_stream);
+            self.deflate_initialized = false;
+        }
+        if (self.inflate_initialized) {
+            _ = zlib.inflateEnd(&self.inflate_stream);
+            self.inflate_initialized = false;
+        }
+        self.deflate_stream = std.mem.zeroes(zlib.z_stream);
+        self.inflate_stream = std.mem.zeroes(zlib.z_stream);
+    }
+};
+
 pub const KeyDataUni = struct {
     iv: [MaxIVLen]u8 = undefined,
     key: [MaxKeyLen]u8 = undefined,
     mackey: [MaxKeyLen]u8 = undefined,
     seq: u32,
     aesctr: AesCtrT = undefined,
+    compression: CompressionState = .{},
+
+    pub fn clear(self: *KeyDataUni) void {
+        std.crypto.secureZero(u8, &self.iv);
+        std.crypto.secureZero(u8, &self.key);
+        std.crypto.secureZero(u8, &self.mackey);
+        self.compression.deinit();
+        self.seq = 0;
+    }
 };
 
 pub const KeyDataBi = struct {
@@ -156,12 +336,8 @@ pub const KeyDataBi = struct {
     }
 
     pub fn clear(self: *Self) void {
-        std.crypto.secureZero(u8, &self.c2s.iv);
-        std.crypto.secureZero(u8, &self.c2s.key);
-        std.crypto.secureZero(u8, &self.c2s.mackey);
-        std.crypto.secureZero(u8, &self.s2c.iv);
-        std.crypto.secureZero(u8, &self.s2c.key);
-        std.crypto.secureZero(u8, &self.s2c.mackey);
+        self.c2s.clear();
+        self.s2c.clear();
     }
 
     // generate session keys from shared secret
@@ -233,13 +409,26 @@ pub const KeyDataBi = struct {
 };
 
 pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer: *BufferWriter, iobuf: []u8) MisshodError![]const u8 {
+    return wrapPayload(rand, encrypted, keysuni, buffer.active(), iobuf);
+}
+
+pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, payload: []const u8, iobuf: []u8) MisshodError![]const u8 {
     // https://datatracker.ietf.org/doc/html/rfc4253#section-6
+    if (payload.len > MaxPayload) return IoError.tooBig;
+
+    var compressed_payload_buf: [MaxPayload]u8 = undefined;
+    const packet_payload = try keysuni.compression.compressPayload(payload, &compressed_payload_buf);
+    if (packet_payload.len > MaxPayload) return IoError.tooBig;
+
     // pad such that whole packet (payload + hdr) is multiple of block_size
-    const buffer_len = buffer.active().len;
+    const buffer_len = packet_payload.len;
     var padding_length: u8 = @intCast(AesCtrT.block_size - (buffer_len + sizeof_PktHdr) % AesCtrT.block_size);
     if (padding_length < 4) {
         padding_length += @intCast(AesCtrT.block_size);
     }
+    const packet_len = sizeof_PktHdr + buffer_len + padding_length;
+    if (packet_len > MaxSSHPacket or packet_len > iobuf.len) return IoError.tooBig;
+
     // construct header
     var hdr: PktHdr = .{
         .packet_length = @intCast(buffer_len + padding_length + 1),
@@ -249,45 +438,44 @@ pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer:
     if (native_endian != .big) {
         std.mem.byteSwapAllFields(PktHdr, &hdr);
     }
-    // insert hdr into hole
-    @memcpy(buffer.payload[0..sizeof_PktHdr], util.asPackedBytes(PktHdr, &hdr));
+    @memcpy(iobuf[0..sizeof_PktHdr], util.asPackedBytes(PktHdr, &hdr));
+    std.mem.copyForwards(u8, iobuf[sizeof_PktHdr .. sizeof_PktHdr + packet_payload.len], packet_payload);
 
-    // append padding, NOTE, will change buffer.payload.len (stored in hdr above)
     var rndbuf: [255]u8 = undefined; // block_size would do
     rand.bytes(rndbuf[0..padding_length]);
-    _ = try buffer.writeBytes(rndbuf[0..padding_length]);
+    @memcpy(iobuf[sizeof_PktHdr + packet_payload.len .. packet_len], rndbuf[0..padding_length]);
 
     if (encrypted) {
+        if (packet_len + mac_algo.key_length > iobuf.len) return IoError.tooBig;
         var out: [MaxSSHPacket]u8 = undefined;
 
-        TRACEDUMP(.Debug, "sendbuffer enc:plaintext", .{}, buffer.payload);
-        keysuni.aesctr.encrypt(buffer.payload, out[0..buffer.payload.len]);
+        TRACEDUMP(.Debug, "sendbuffer enc:plaintext", .{}, iobuf[0..packet_len]);
+        keysuni.aesctr.encrypt(iobuf[0..packet_len], out[0..packet_len]);
 
         var mac: [mac_algo.key_length]u8 = undefined;
         var m = mac_algo.init(keysuni.mackey[0..mac_algo.key_length]);
         const seq = std.mem.nativeTo(u32, keysuni.seq, .big);
         m.update(std.mem.asBytes(&seq));
-        m.update(buffer.payload); // plaintext
+        m.update(iobuf[0..packet_len]); // plaintext
         m.final(&mac);
 
         TRACEDUMP(.Debug, "mackey", .{}, keysuni.mackey[0..mac_algo.key_length]);
         TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
-        TRACEDUMP(.Debug, "macdata", .{}, buffer.payload);
+        TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..packet_len]);
 
-        // new bufferwriter, to append mac to out
-        var out_buffer = BufferWriter.init(&out, buffer.payload.len); // append
-        try out_buffer.writeBytes(&mac);
+        @memcpy(out[packet_len .. packet_len + mac_algo.key_length], &mac);
+        const out_len = packet_len + mac_algo.key_length;
 
-        // everything is now encrypted and in out_buffer with mac, copy back to self.writebuf before sending
-        @memcpy(iobuf[0..out_buffer.payload.len], out_buffer.payload);
+        // Copy encrypted packet plus MAC back to the caller's output buffer.
+        @memcpy(iobuf[0..out_len], out[0..out_len]);
 
-        TRACEDUMP(.Debug, "enc send", .{}, iobuf[0..out_buffer.payload.len]);
+        TRACEDUMP(.Debug, "enc send", .{}, iobuf[0..out_len]);
 
         keysuni.seq +%= 1;
-        return iobuf[0..out_buffer.payload.len];
+        return iobuf[0..out_len];
     } else {
         keysuni.seq +%= 1;
-        return iobuf[0..buffer.payload.len];
+        return iobuf[0..packet_len];
     }
 }
 
@@ -324,6 +512,90 @@ test "agent forwarding channel type aliases" {
     try std.testing.expect(isAgentChannelType(channel_type_auth_agent_openssh));
     try std.testing.expect(isAgentChannelType(channel_type_auth_agent));
     try std.testing.expect(!isAgentChannelType(channel_type_session));
+}
+
+test "compression algorithm selection follows client preference" {
+    try std.testing.expectEqual(CompressionAlgorithm.ZlibOpenSsh, selectCompressionAlgorithm(compression_algorithms, compression_algorithms).?);
+    try std.testing.expectEqual(CompressionAlgorithm.None, selectCompressionAlgorithm("none,zlib@openssh.com", compression_algorithms).?);
+    try std.testing.expectEqual(CompressionAlgorithm.None, selectCompressionAlgorithm(compression_algorithms, "none").?);
+    try std.testing.expect(selectCompressionAlgorithm("zstd@openssh.com", compression_algorithms) == null);
+}
+
+test "zlib openssh compression streams round trip flushed packets" {
+    var compressor = CompressionState{ .algorithm = .ZlibOpenSsh };
+    defer compressor.deinit();
+    var decompressor = CompressionState{ .algorithm = .ZlibOpenSsh };
+    defer decompressor.deinit();
+
+    try compressor.activateDeflate();
+    try decompressor.activateInflate();
+
+    var compressed: [MaxPayload]u8 = undefined;
+    var decompressed: [MaxPayload]u8 = undefined;
+
+    const payload1 = "hello hello hello hello hello";
+    const compressed1 = try compressor.compressPayload(payload1, &compressed);
+    const decompressed1 = try decompressor.decompressPayload(compressed1, &decompressed);
+    try std.testing.expectEqualStrings(payload1, decompressed1);
+
+    const payload2 = "second packet reuses the same zlib stream";
+    const compressed2 = try compressor.compressPayload(payload2, &compressed);
+    const decompressed2 = try decompressor.decompressPayload(compressed2, &decompressed);
+    try std.testing.expectEqualStrings(payload2, decompressed2);
+}
+
+test "zlib openssh decompression rejects invalid data" {
+    var decompressor = CompressionState{ .algorithm = .ZlibOpenSsh };
+    defer decompressor.deinit();
+    try decompressor.activateInflate();
+
+    var output: [MaxPayload]u8 = undefined;
+    try std.testing.expectError(IoError.InvalidPacketSize, decompressor.decompressPayload("not a zlib stream", &output));
+}
+
+test "wrapPayload preserves uncompressed payload with none compression" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var keys = KeyDataUni{ .seq = 0 };
+    defer keys.clear();
+    var rand = prng.random();
+
+    var iobuf: [MaxSSHPacket]u8 = undefined;
+    const payload = "plain ssh payload";
+    const packet = try wrapPayload(&rand, false, &keys, payload, &iobuf);
+
+    var hdr = std.mem.bytesAsValue(PktHdr, packet[0..sizeof_PktHdr]).*;
+    if (native_endian != .big) {
+        std.mem.byteSwapAllFields(PktHdr, &hdr);
+    }
+    const payload_len = hdr.packet_length - hdr.padding_length - 1;
+    try std.testing.expectEqualStrings(payload, packet[sizeof_PktHdr .. sizeof_PktHdr + payload_len]);
+}
+
+test "wrapPayload compresses active zlib openssh payloads" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var sender = KeyDataUni{ .seq = 0, .compression = .{ .algorithm = .ZlibOpenSsh } };
+    defer sender.clear();
+    var receiver = KeyDataUni{ .seq = 0, .compression = .{ .algorithm = .ZlibOpenSsh } };
+    defer receiver.clear();
+    try sender.compression.activateDeflate();
+    try receiver.compression.activateInflate();
+    var rand = prng.random();
+
+    var iobuf: [MaxSSHPacket]u8 = undefined;
+    const payload = "compressed ssh payload compressed ssh payload compressed ssh payload";
+    const packet = try wrapPayload(&rand, false, &sender, payload, &iobuf);
+
+    var hdr = std.mem.bytesAsValue(PktHdr, packet[0..sizeof_PktHdr]).*;
+    if (native_endian != .big) {
+        std.mem.byteSwapAllFields(PktHdr, &hdr);
+    }
+    const compressed_len = hdr.packet_length - hdr.padding_length - 1;
+    const compressed_payload = packet[sizeof_PktHdr .. sizeof_PktHdr + compressed_len];
+    try std.testing.expect(!std.mem.eql(u8, payload, compressed_payload));
+
+    var decompressed: [MaxPayload]u8 = undefined;
+    const restored = try receiver.compression.decompressPayload(compressed_payload, &decompressed);
+    try std.testing.expectEqualStrings(payload, restored);
 }
 
 test "KeyDataBi.clear zeros all key material" {

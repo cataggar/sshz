@@ -178,6 +178,11 @@ pub const Session = struct {
         return self.allocateClientChannel(mode, .Session, .{});
     }
 
+    fn activateDelayedCompression(self: *Self) MisshodError!void {
+        try self.keydata.c2s.compression.activateDeflate();
+        try self.keydata.s2c.compression.activateInflate();
+    }
+
     pub fn advanceSession(self: *Self, misshod: *MisshodClient) MisshodError!void {
         const outkeys = &self.keydata.c2s;
 
@@ -198,8 +203,8 @@ pub const Session = struct {
                 try pkt.writeU32LenString(Protocol.enc_algo_name); // enc s2c
                 try pkt.writeU32LenString(Protocol.mac_algo_name); // mac c2s
                 try pkt.writeU32LenString(Protocol.mac_algo_name); // mac s2c
-                try pkt.writeU32LenString("none"); // compression c2s
-                try pkt.writeU32LenString("none"); // compression s2c
+                try pkt.writeU32LenString(Protocol.compression_algorithms); // compression c2s
+                try pkt.writeU32LenString(Protocol.compression_algorithms); // compression s2c
                 try pkt.writeU32LenString(""); // lang c2s
                 try pkt.writeU32LenString(""); // lang s2c
 
@@ -265,7 +270,12 @@ pub const Session = struct {
                 // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
+                self.keydata.c2s.compression.applyPendingAlgorithm();
+                if (self.is_rekeying) {
+                    try self.keydata.c2s.compression.activateDeflate();
+                }
+                misshod.requestWrite(wrapped, .Idle);
                 if (self.is_rekeying) {
                     self.is_rekeying = false;
                     self.setSessionState(.ChannelActive);
@@ -1148,10 +1158,21 @@ pub const Session = struct {
                     }
                 }
 
-                // skip remaining lists (compression, languages) - we accept any
-                for (0..4) |_| {
-                    _ = try rdr.readU32LenString();
-                }
+                const compression_c2s_namelist = try rdr.readU32LenString();
+                const compression_s2c_namelist = try rdr.readU32LenString();
+                const compression_c2s = Protocol.selectCompressionAlgorithm(Protocol.compression_algorithms, compression_c2s_namelist) orelse {
+                    TRACE(.Info, "No mutual algorithm for compression_algorithms_client_to_server: peer offers '{s}', we can use '{s}'", .{ compression_c2s_namelist, Protocol.compression_algorithms });
+                    return IoError.AlgorithmNegotiationFailed;
+                };
+                const compression_s2c = Protocol.selectCompressionAlgorithm(Protocol.compression_algorithms, compression_s2c_namelist) orelse {
+                    TRACE(.Info, "No mutual algorithm for compression_algorithms_server_to_client: peer offers '{s}', we can use '{s}'", .{ compression_s2c_namelist, Protocol.compression_algorithms });
+                    return IoError.AlgorithmNegotiationFailed;
+                };
+                self.keydata.c2s.compression.queueAlgorithm(compression_c2s);
+                self.keydata.s2c.compression.queueAlgorithm(compression_s2c);
+
+                _ = try rdr.readU32LenString(); // language c2s
+                _ = try rdr.readU32LenString(); // language s2c
 
                 const first_kex_packet_follows = try rdr.readBoolean();
                 TRACE(.Debug, "first_kex_packet_follows = {any}\n", .{first_kex_packet_follows});
@@ -1222,6 +1243,10 @@ pub const Session = struct {
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS) => {
                 if (self.sessionState == .NewKeysRead) {
+                    self.keydata.s2c.compression.applyPendingAlgorithm();
+                    if (self.is_rekeying) {
+                        try self.keydata.s2c.compression.activateInflate();
+                    }
                     self.setSessionState(.NewKeysWrite);
                     self.setIoSessionState(.Idle);
                 } else {
@@ -1245,6 +1270,7 @@ pub const Session = struct {
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS) => {
                 // don't care what state we were in, we've been let in
+                try self.activateDelayedCompression();
                 self.setIoSessionState(.Idle);
                 self.setSessionState(.ChannelOpenReq);
             },

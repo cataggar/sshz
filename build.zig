@@ -17,14 +17,19 @@ pub fn build(b: *std.Build) void {
 
     const mod = b.addModule("misshod", .{
         .root_source_file = b.path("src/misshod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
     });
-    _ = mod;
+    mod.linkSystemLibrary("z", .{});
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    test_mod.linkSystemLibrary("z", .{});
 
     const lib_tests = b.addTest(.{
         .root_module = test_mod,
