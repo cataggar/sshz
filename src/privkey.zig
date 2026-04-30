@@ -6,13 +6,14 @@ const TRACEDUMP = util.tracedump;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const BufferReader = @import("buffer.zig").BufferReader;
 const BufferError = @import("buffer.zig").BufferError;
+const Key = @import("key.zig");
 
 // cat id_ed25519  | grep -v "^-----" | base64 -d | xxd
 
 const KdfError = crypto.pwhash.KdfError;
 const HasherError = crypto.pwhash.HasherError;
 
-pub const PrivKeyError = PrivKeyInternalError || BufferError || std.base64.Error || crypto.pwhash.Error || KdfError || HasherError || std.crypto.errors.EncodingError;
+pub const PrivKeyError = PrivKeyInternalError || BufferError || Key.KeyError || std.base64.Error || crypto.pwhash.Error || KdfError || HasherError || std.crypto.errors.EncodingError;
 
 pub const PrivKeyInternalError = error{
     PrivKeyOutofSpace,
@@ -21,9 +22,6 @@ pub const PrivKeyInternalError = error{
     InvalidInput,
     UnsupportedPrivKey,
 };
-
-// This format has only been tested for Ed25519 files
-const srv_hostkey_algo = std.crypto.sign.Ed25519;
 
 fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKeyError![]u8 {
     const pre_banner = "-----BEGIN OPENSSH PRIVATE KEY-----";
@@ -49,8 +47,8 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
     }
 }
 
-pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, privkey_blob: *[srv_hostkey_algo.SecretKey.encoded_length]u8, pubkey_blob: *[srv_hostkey_algo.PublicKey.encoded_length]u8) PrivKeyError!void {
-    var keydata_bin_buf: [1024]u8 = undefined;
+pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8) PrivKeyError!Key.PrivateKey {
+    var keydata_bin_buf: [8192]u8 = undefined;
     const bin = try decodeAsciiToBinary(keydata_ascii, &keydata_bin_buf);
     TRACEDUMP(.Debug, "raw len={d}", .{bin.len}, bin);
 
@@ -105,7 +103,8 @@ pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, pri
                 TRACEDUMP(.Debug, "bcrypt hash", .{}, &hash);
                 // https://www.thedigitalcatonline.com/blog/2021/06/03/public-key-cryptography-openssh-private-keys/#a-poorly-documented-format-2ea8
                 var aesctr = AesCtrT.init(hash[AesCtrT.key_size..].*, hash[0..AesCtrT.key_size].*);
-                var dec: [1024]u8 = undefined; // FIXME
+                var dec: [8192]u8 = undefined;
+                if (enc_section.len > dec.len) return PrivKeyError.PrivKeyOutofSpace;
                 aesctr.encrypt(enc_section, dec[0..enc_section.len]);
                 TRACEDUMP(.Debug, "dec", .{}, dec[0..enc_section.len]);
                 // copy decrypted area over original encrypted
@@ -139,15 +138,86 @@ pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, pri
     const key_algo = try encbuffer.readU32LenString();
     TRACE(.Debug, "key_algo={s}\n", .{key_algo});
 
-    const key_blob_pub = try encbuffer.readU32LenString();
-    TRACEDUMP(.Debug, "key_blob_pub", .{}, key_blob_pub);
+    var private_key = try parsePrivateSectionKey(key_algo, &encbuffer);
 
-    @memcpy(pubkey_blob, key_blob_pub);
+    var private_pubkey_blob: Key.Blob = .{};
+    const generated_pubkey = try private_key.publicBlob(&private_pubkey_blob);
+    if (!std.mem.eql(u8, generated_pubkey, pubkey)) {
+        private_key.clear();
+        return PrivKeyError.BadPrivKey;
+    }
 
-    const key_blob_prv = try encbuffer.readU32LenString();
-    TRACEDUMP(.Debug, "key_blob_prv", .{}, key_blob_prv);
+    return private_key;
+}
 
-    @memcpy(privkey_blob, key_blob_prv);
+pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, privkey_blob: *[std.crypto.sign.Ed25519.SecretKey.encoded_length]u8, pubkey_blob: *[std.crypto.sign.Ed25519.PublicKey.encoded_length]u8) PrivKeyError!void {
+    var private_key = try decodeOpenSshPrivateKey(keydata_ascii, passphrase_opt);
+    defer private_key.clear();
+
+    switch (private_key) {
+        .Ed25519 => |key| {
+            @memcpy(privkey_blob, &key.secret);
+            @memcpy(pubkey_blob, &key.public);
+        },
+        else => return PrivKeyError.UnsupportedPrivKey,
+    }
+}
+
+fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKeyError!Key.PrivateKey {
+    if (std.mem.eql(u8, key_algo, Key.ed25519_name)) {
+        const key_blob_pub = try encbuffer.readU32LenString();
+        const key_blob_prv = try encbuffer.readU32LenString();
+        TRACEDUMP(.Debug, "ed25519 key_blob_pub", .{}, key_blob_pub);
+        TRACEDUMP(.Debug, "ed25519 key_blob_prv", .{}, key_blob_prv);
+        if (key_blob_pub.len != std.crypto.sign.Ed25519.PublicKey.encoded_length or
+            key_blob_prv.len != std.crypto.sign.Ed25519.SecretKey.encoded_length)
+        {
+            return PrivKeyError.BadPrivKey;
+        }
+        return .{ .Ed25519 = .{
+            .public = key_blob_pub[0..std.crypto.sign.Ed25519.PublicKey.encoded_length].*,
+            .secret = key_blob_prv[0..std.crypto.sign.Ed25519.SecretKey.encoded_length].*,
+        } };
+    }
+
+    if (std.mem.eql(u8, key_algo, Key.ecdsa_p256_name)) {
+        const curve = try encbuffer.readU32LenString();
+        if (!std.mem.eql(u8, curve, Key.ecdsa_p256_curve_name)) return PrivKeyError.UnsupportedPrivKey;
+        const sec1 = try encbuffer.readU32LenString();
+        if (sec1.len != std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length) {
+            return PrivKeyError.BadPrivKey;
+        }
+        const secret_mpint = try encbuffer.readU32LenString();
+        const secret_scalar = try mpintToFixed(std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.encoded_length, secret_mpint);
+        const secret_key = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(secret_scalar) catch return PrivKeyError.BadPrivKey;
+        const keypair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return PrivKeyError.BadPrivKey;
+        if (!std.mem.eql(u8, &keypair.public_key.toUncompressedSec1(), sec1)) return PrivKeyError.BadPrivKey;
+        return .{ .EcdsaP256 = .{
+            .public_sec1 = sec1[0..std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length].*,
+            .secret_scalar = secret_scalar,
+        } };
+    }
+
+    if (std.mem.eql(u8, key_algo, Key.rsa_key_name)) {
+        var rsa: Key.RsaPrivateKey = .{};
+        try rsa.n.set(try encbuffer.readU32LenString());
+        try rsa.e.set(try encbuffer.readU32LenString());
+        try rsa.d.set(try encbuffer.readU32LenString());
+        try rsa.iqmp.set(try encbuffer.readU32LenString());
+        try rsa.p.set(try encbuffer.readU32LenString());
+        try rsa.q.set(try encbuffer.readU32LenString());
+        return .{ .Rsa = rsa };
+    }
+
+    return PrivKeyError.UnsupportedPrivKey;
+}
+
+fn mpintToFixed(comptime len: usize, mpint: []const u8) PrivKeyError![len]u8 {
+    const trimmed = Key.trimMpint(mpint);
+    if (trimmed.len > len) return PrivKeyError.BadPrivKey;
+    var out: [len]u8 = .{0} ** len;
+    @memcpy(out[len - trimmed.len ..], trimmed);
+    return out;
 }
 
 pub const testkey_valid = "-----BEGIN OPENSSH PRIVATE KEY-----\n" ++
@@ -192,9 +262,47 @@ const testkey_encrypted_valid_passworded = "-----BEGIN OPENSSH PRIVATE KEY-----\
 
 const testkey_encrypted_valid_password = "secretpassword";
 
+pub const testkey_ecdsa_p256 = "-----BEGIN OPENSSH PRIVATE KEY-----\n" ++
+    "b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAaAAAABNlY2RzYS\n" ++
+    "1zaGEyLW5pc3RwMjU2AAAACG5pc3RwMjU2AAAAQQQoNzjURTO/Ky+QNRi8TBgDlEqN1Pii\n" ++
+    "5uGWIB2kfqd4y9JI4MEcV3GKfdhVGQQxCvMbiy+6FNpWVP5JvMUbyq27AAAAsN8uAk3fLg\n" ++
+    "JNAAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCg3ONRFM78rL5A1\n" ++
+    "GLxMGAOUSo3U+KLm4ZYgHaR+p3jL0kjgwRxXcYp92FUZBDEK8xuLL7oU2lZU/km8xRvKrb\n" ++
+    "sAAAAhALqVUmkFwlmnxIndTZ9+/sVOy5pP3A50/dLiNl6DBO0DAAAAEm1pc3Nob2QtZWNk\n" ++
+    "c2EtdGVzdAECAwQF\n" ++
+    "-----END OPENSSH PRIVATE KEY-----\n";
+
+pub const testkey_rsa_2048 = "-----BEGIN OPENSSH PRIVATE KEY-----\n" ++
+    "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\n" ++
+    "-----END OPENSSH PRIVATE KEY-----\n";
+
 test "decodepriv" {
-    var blob: [srv_hostkey_algo.SecretKey.encoded_length]u8 = undefined;
-    var pubblob: [srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined;
+    var blob: [std.crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
+    var pubblob: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
 
     try std.testing.expectError(PrivKeyError.BadPrivKey, decodePrivKey(testkey_invalid_bad_preamble, null, &blob, &pubblob));
     try std.testing.expectError(PrivKeyError.BadPrivKey, decodePrivKey(testkey_invalid_missing_footer, null, &blob, &pubblob));
@@ -204,4 +312,27 @@ test "decodepriv" {
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 168, 158, 23, 77, 212, 94, 57, 255, 157, 6, 173, 128, 17, 109, 67, 232, 3, 126, 106, 1, 93, 9, 70, 135, 50, 35, 207, 108, 76, 128, 251, 24, 189, 27, 142, 8, 84, 46, 86, 64, 66, 99, 249, 172, 207, 208, 211, 134, 21, 193, 250, 85, 48, 57, 251, 81, 133, 110, 66, 16, 244, 86, 130, 249 }));
     try decodePrivKey(testkey_valid, null, &blob, &pubblob);
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 166, 119, 186, 89, 114, 101, 152, 133, 196, 14, 211, 238, 206, 143, 73, 223, 41, 101, 45, 196, 132, 150, 240, 240, 41, 82, 229, 54, 152, 193, 40, 220, 232, 131, 168, 235, 233, 3, 218, 50, 159, 159, 165, 94, 166, 155, 49, 203, 223, 47, 9, 101, 69, 137, 215, 186, 3, 175, 96, 21, 112, 247, 116, 245 }));
+}
+
+test "decode OpenSSH private key algorithms and sign/verify" {
+    const cases = .{
+        .{ testkey_valid, Key.KeyAlgorithm.Ed25519 },
+        .{ testkey_ecdsa_p256, Key.KeyAlgorithm.EcdsaP256 },
+        .{ testkey_rsa_2048, Key.KeyAlgorithm.Rsa },
+    };
+
+    inline for (cases) |case| {
+        var private_key = try decodeOpenSshPrivateKey(case[0], null);
+        defer private_key.clear();
+        try std.testing.expectEqual(case[1], private_key.algorithm());
+
+        var public_blob: Key.Blob = .{};
+        const blob = try private_key.publicBlob(&public_blob);
+        const public_key = try Key.parsePublicKeyBlob(blob);
+
+        var sig_blob: Key.SignatureBlob = .{};
+        const sig = try private_key.sign(private_key.defaultSignatureAlgorithm(), "misshod message", &sig_blob);
+        try Key.verifySignature(public_key, sig, "misshod message");
+        try std.testing.expectError(Key.KeyError.InvalidSignature, Key.verifySignature(public_key, sig, "tampered message"));
+    }
 }
