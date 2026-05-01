@@ -37,14 +37,25 @@ pub const SessionState = enum {
     ChannelOpenReq,
     ChannelOpenRsp,
     ChannelPtyReq,
+    ChannelPtyRsp,
+    ChannelExecReq,
+    ChannelExecRsp,
     ChannelShellReq,
+    ChannelShellRsp,
     ChannelConnected,
     ChannelData,
     ChannelDataRxAdjustWindow,
     ChannelDataRx,
     ChannelDataTx,
     ChannelDataTxComplete,
+    ChannelWindowChange,
 };
+
+fn initPtyTerm(term: []const u8) [64]u8 {
+    var buf: [64]u8 = .{0} ** 64;
+    @memcpy(buf[0..term.len], term);
+    return buf;
+}
 
 pub const Session = struct {
     const Self = @This();
@@ -64,8 +75,18 @@ pub const Session = struct {
     username: []const u8,
     rand: std.Random = undefined,
     encrypted: bool,
-    channel_write_buf: [64]u8 = undefined, // FIXME size
+    local_channel: u32,
+    remote_channel: u32,
+    channel_write_buf: [1024]u8 = undefined,
     channel_write_buf_nbytes: usize,
+    pty_term: [64]u8 = undefined,
+    pty_term_len: usize,
+    pty_cols: u32,
+    pty_rows: u32,
+    pty_width_px: u32,
+    pty_height_px: u32,
+    resize_pending: bool,
+    exec_command: ?[]u8,
 
     privkey_ascii: ?[]u8, // allocated  // FIXME deinit properly and clear
     privkey_passphrase: ?[]u8, //allocated
@@ -81,13 +102,42 @@ pub const Session = struct {
             .allocator = allocator,
             .username = username,
             .encrypted = false,
+            .local_channel = 0,
+            .remote_channel = 0,
             .keydata = Protocol.KeyDataBi.init(),
             .kex_hasher = Hasher(Protocol.hash_algo).init(), // for hashing H
             .privkey_ascii = null,
             .privkey_passphrase = null,
             .auth_passphrase = null,
             .channel_write_buf_nbytes = 0,
+            .pty_term = initPtyTerm("xterm-color"),
+            .pty_term_len = "xterm-color".len,
+            .pty_cols = 80,
+            .pty_rows = 24,
+            .pty_width_px = 640,
+            .pty_height_px = 480,
+            .resize_pending = false,
+            .exec_command = null,
         };
+    }
+
+    pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        if (self.exec_command) |command| {
+            allocator.free(command);
+            self.exec_command = null;
+        }
+        if (self.privkey_ascii) |key| {
+            allocator.free(key);
+            self.privkey_ascii = null;
+        }
+        if (self.privkey_passphrase) |passphrase| {
+            allocator.free(passphrase);
+            self.privkey_passphrase = null;
+        }
+        if (self.auth_passphrase) |passphrase| {
+            allocator.free(passphrase);
+            self.auth_passphrase = null;
+        }
     }
 
     pub fn setIoSessionState(self: *Self, newState: Protocol.IoSessionState) void {
@@ -99,7 +149,6 @@ pub const Session = struct {
         TRACE(.Debug, "sessionState {any} -> {any}", .{ self.sessionState, newState });
         self.sessionState = newState;
     }
-
 
     pub fn advanceSession(self: *Self, misshod: *MisshodClient) MisshodError!void {
         const outkeys = &self.keydata.c2s;
@@ -143,7 +192,12 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT));
 
-                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generate();
+                // Zig 0.16's X25519 KeyPair.generate wants std.Io; keep
+                // misshod's caller-provided CSPRNG and feed X25519 a fresh
+                // seed for each key exchange.
+                var seed: [Protocol.kex_algo.seed_length]u8 = undefined;
+                self.rand.bytes(&seed);
+                self.ecdh_ephem_keypair = try Protocol.kex_algo.KeyPair.generateDeterministic(seed);
                 var q_c = self.ecdh_ephem_keypair.public_key;
                 try pkt.writeU32LenString(&q_c);
 
@@ -205,7 +259,6 @@ pub const Session = struct {
                 if (self.privkey_ascii) |privkey_ascii| { // have private key
                     // attempt passwordless
                     decodePrivKey(privkey_ascii, null, &self.privkey_blob, &self.pubkey_blob) catch |err| {
-                        // free privkey_ascii
                         switch (err) {
                             PrivKeyError.InvalidKeyDecrypt => {
                                 // need a passphrase to decode key
@@ -214,7 +267,11 @@ pub const Session = struct {
                                 return;
                             },
                             else => {
-                                return err;
+                                self.allocator.free(privkey_ascii);
+                                self.privkey_ascii = null;
+                                misshod.requestEvent(.GetAuthPassphrase, .Idle);
+                                self.setSessionState(.PasswordAuthReq);
+                                return;
                             },
                         }
                     };
@@ -309,9 +366,9 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-5.1
                 try pkt.writeU32LenString("session"); // https://datatracker.ietf.org/doc/html/rfc4250#section-4.9.1
-                try pkt.writeU32(0); // sender channel
-                try pkt.writeU32(Protocol.MaxPayload); // initial window size
-                try pkt.writeU32(Protocol.MaxPayload); // maximum packet size
+                try pkt.writeU32(self.local_channel); // sender channel
+                try pkt.writeU32(Protocol.ChannelWindowSize); // initial window size
+                try pkt.writeU32(Protocol.ChannelMaxPacket); // maximum packet size
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.ChannelOpenRsp);
             },
@@ -322,77 +379,61 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
-                try pkt.writeU32(0);
+                try pkt.writeU32(self.remote_channel);
                 try pkt.writeU32LenString("pty-req");
-                try pkt.writeBoolean(false); // want reply
-                try pkt.writeU32LenString("xterm-color");
-                try pkt.writeU32(80);
-                try pkt.writeU32(24);
-                try pkt.writeU32(640);
-                try pkt.writeU32(480);
+                try pkt.writeBoolean(true); // want reply
+                try pkt.writeU32LenString(self.pty_term[0..self.pty_term_len]);
+                try pkt.writeU32(self.pty_cols);
+                try pkt.writeU32(self.pty_rows);
+                try pkt.writeU32(self.pty_width_px);
+                try pkt.writeU32(self.pty_height_px);
 
-                // magic pulled from observing OpenSSH connect
-                const termdata = &[_]u8{
-                    0x81, 0x00, 0x00, 0x25, 0x80, 0x80, 0x00,
-                    0x00, 0x25, 0x80, 0x01, 0x00, 0x00, 0x00,
-                    0x03, 0x02, 0x00, 0x00, 0x00, 0x1c, 0x03,
-                    0x00, 0x00, 0x00, 0x7f, 0x04, 0x00, 0x00,
-                    0x00, 0x15, 0x05, 0x00, 0x00, 0x00, 0x04,
-                    0x06, 0x00, 0x00, 0x00, 0xff, 0x07, 0x00,
-                    0x00, 0x00, 0xff, 0x08, 0x00, 0x00, 0x00,
-                    0x11, 0x09, 0x00, 0x00, 0x00, 0x13, 0x0a,
-                    0x00, 0x00, 0x00, 0x1a, 0x0b, 0x00, 0x00,
-                    0x00, 0x19, 0x0c, 0x00, 0x00, 0x00, 0x12,
-                    0x0d, 0x00, 0x00, 0x00, 0x17, 0x0e, 0x00,
-                    0x00, 0x00, 0x16, 0x11, 0x00, 0x00, 0x00,
-                    0x14, 0x12, 0x00, 0x00, 0x00, 0x0f, 0x1e,
-                    0x00, 0x00, 0x00, 0x01, 0x1f, 0x00, 0x00,
-                    0x00, 0x00, 0x20, 0x00, 0x00, 0x00, 0x00,
-                    0x21, 0x00, 0x00, 0x00, 0x00, 0x22, 0x00,
-                    0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x00,
-                    0x00, 0x24, 0x00, 0x00, 0x00, 0x01, 0x26,
-                    0x00, 0x00, 0x00, 0x01, 0x27, 0x00, 0x00,
-                    0x00, 0x00, 0x28, 0x00, 0x00, 0x00, 0x00,
-                    0x29, 0x00, 0x00, 0x00, 0x01, 0x2a, 0x00,
-                    0x00, 0x00, 0x01, 0x32, 0x00, 0x00, 0x00,
-                    0x01, 0x33, 0x00, 0x00, 0x00, 0x01, 0x35,
-                    0x00, 0x00, 0x00, 0x01, 0x36, 0x00, 0x00,
-                    0x00, 0x01, 0x37, 0x00, 0x00, 0x00, 0x01,
-                    0x38, 0x00, 0x00, 0x00, 0x00, 0x39, 0x00,
-                    0x00, 0x00, 0x00, 0x3a, 0x00, 0x00, 0x00,
-                    0x00, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x3c,
-                    0x00, 0x00, 0x00, 0x01, 0x3d, 0x00, 0x00,
-                    0x00, 0x01, 0x3e, 0x00, 0x00, 0x00, 0x01,
-                    0x46, 0x00, 0x00, 0x00, 0x01, 0x48, 0x00,
-                    0x00, 0x00, 0x01, 0x49, 0x00, 0x00, 0x00,
-                    0x00, 0x4a, 0x00, 0x00, 0x00, 0x00, 0x4b,
-                    0x00, 0x00, 0x00, 0x00, 0x5a, 0x00, 0x00,
-                    0x00, 0x01, 0x5b, 0x00, 0x00, 0x00, 0x01,
-                    0x5c, 0x00, 0x00, 0x00, 0x00, 0x5d, 0x00,
-                    0x00, 0x00, 0x00, 0x00,
-                };
-                try pkt.writeU32LenString(termdata);
+                try pkt.writeU32LenString(&.{});
 
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
-                self.setSessionState(.ChannelShellReq);
+                self.setSessionState(.ChannelPtyRsp);
+            },
+            .ChannelPtyRsp => {
+                self.setIoSessionState(.ReadPktHdr);
+            },
+            .ChannelExecReq => {
+                const command = self.exec_command orelse return IoError.UnexpectedResponse;
+                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+                // https://datatracker.ietf.org/doc/html/rfc4254#section-6.5
+                try pkt.writeU32(self.remote_channel);
+                try pkt.writeU32LenString("exec");
+                try pkt.writeBoolean(true); // want reply
+                try pkt.writeU32LenString(command);
+
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                self.setSessionState(.ChannelExecRsp);
+            },
+            .ChannelExecRsp => {
+                self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelShellReq => {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
-                try pkt.writeU32(0);
+                try pkt.writeU32(self.remote_channel);
                 try pkt.writeU32LenString("shell");
-                try pkt.writeBoolean(false); // want reply
+                try pkt.writeBoolean(true); // want reply
 
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
-                self.setSessionState(.ChannelConnected);
+                self.setSessionState(.ChannelShellRsp);
+            },
+            .ChannelShellRsp => {
+                self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelConnected => {
                 misshod.requestEvent(.Connected, .Idle);
                 self.setSessionState(.ChannelData);
             },
             .ChannelData => {
-                if (self.channel_write_buf_nbytes > 0) { // something to send
+                if (self.resize_pending) {
+                    self.setSessionState(.ChannelWindowChange);
+                } else if (self.channel_write_buf_nbytes > 0) { // something to send
                     self.setSessionState(.ChannelDataTx);
                 } else { // wait for incoming
                     self.setSessionState(.ChannelDataRxAdjustWindow);
@@ -402,8 +443,8 @@ pub const Session = struct {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-5.2
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
-                try pkt.writeU32(0); // channel
-                try pkt.writeU32(Protocol.MaxPayload); // bytes to add
+                try pkt.writeU32(self.remote_channel); // channel
+                try pkt.writeU32(Protocol.ChannelWindowSize); // bytes to add
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.ChannelDataRx);
             },
@@ -415,7 +456,7 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
                 // https://datatracker.ietf.org/doc/html/rfc4250#section-3.3
-                try pkt.writeU32(0);
+                try pkt.writeU32(self.remote_channel);
                 try pkt.writeU32LenString(self.channel_write_buf[0..self.channel_write_buf_nbytes]);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.ChannelDataTxComplete);
@@ -424,7 +465,52 @@ pub const Session = struct {
                 self.channel_write_buf_nbytes = 0;
                 self.setSessionState(.ChannelData);
             },
+            .ChannelWindowChange => {
+                var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+                try pkt.writeU32(self.remote_channel);
+                try pkt.writeU32LenString("window-change");
+                try pkt.writeBoolean(false);
+                try pkt.writeU32(self.pty_cols);
+                try pkt.writeU32(self.pty_rows);
+                try pkt.writeU32(self.pty_width_px);
+                try pkt.writeU32(self.pty_height_px);
+                self.resize_pending = false;
+                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
+                self.setSessionState(.ChannelData);
+            },
         }
+    }
+
+    pub fn setPty(self: *Self, term: []const u8, cols: u16, rows: u16) MisshodError!void {
+        if (term.len > self.pty_term.len) return IoError.tooBig;
+        @memset(&self.pty_term, 0);
+        @memcpy(self.pty_term[0..term.len], term);
+        self.pty_term_len = term.len;
+        self.setWindowSize(cols, rows);
+        self.resize_pending = false;
+    }
+
+    pub fn setWindowSize(self: *Self, cols: u16, rows: u16) void {
+        self.pty_cols = cols;
+        self.pty_rows = rows;
+        self.pty_width_px = @as(u32, cols) * 8;
+        self.pty_height_px = @as(u32, rows) * 16;
+        self.resize_pending = self.sessionState == .ChannelData or
+            self.sessionState == .ChannelDataRxAdjustWindow or
+            self.sessionState == .ChannelDataRx or
+            self.sessionState == .ChannelDataTx or
+            self.sessionState == .ChannelDataTxComplete or
+            self.sessionState == .ChannelWindowChange;
+    }
+
+    pub fn interruptIdleChannelRead(self: *Self) bool {
+        if (self.sessionState == .ChannelDataRx and self.ioSessionState == .ReadPktHdr) {
+            self.setSessionState(.ChannelData);
+            self.setIoSessionState(.Idle);
+            return true;
+        }
+        return false;
     }
 
     pub fn getChannelWriteBuffer(self: *Self) MisshodError![]u8 {
@@ -478,6 +564,14 @@ pub const Session = struct {
         }
         std.debug.assert(self.auth_passphrase == null);
         self.auth_passphrase = try self.allocator.dupe(u8, data);
+    }
+
+    pub fn setExecCommand(self: *Self, command: []const u8) MisshodError!void {
+        if (self.exec_command) |old| {
+            self.allocator.free(old);
+            self.exec_command = null;
+        }
+        self.exec_command = try self.allocator.dupe(u8, command);
     }
 
     // special case as we write direct to stream before entering binary pkt mode
@@ -640,6 +734,11 @@ pub const Session = struct {
                 // uint32    sender channel
                 // uint32    initial window size
                 // uint32    maximum packet size
+                const recipient_channel = try rdr.readU32();
+                if (recipient_channel != self.local_channel) return IoError.UnexpectedResponse;
+                self.remote_channel = try rdr.readU32();
+                _ = try rdr.readU32();
+                _ = try rdr.readU32();
                 self.setIoSessionState(.Idle);
                 self.setSessionState(.ChannelPtyReq);
             },
@@ -652,12 +751,39 @@ pub const Session = struct {
                 misshod.requestEvent(.{ .RxData = s }, .Idle);
                 self.setSessionState(.ChannelData);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT), @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
+                TRACE(.Debug, "Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA", .{});
+                const channelnum = try rdr.readU32();
+                const data_type = try rdr.readU32();
+                const s = try rdr.readU32LenString();
+                TRACE(.Debug, "got extended data chan={d} type={d} '{s}'\n", .{ channelnum, data_type, s });
+
+                misshod.requestEvent(.{ .RxData = s }, .Idle);
+                self.setSessionState(.ChannelData);
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT),
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF),
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE),
+            => {
                 misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle); // FIXME reason code
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
                 // TBD
                 self.setIoSessionState(.ReadPktHdr); // read again
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS) => {
+                if (self.sessionState == .ChannelPtyRsp) {
+                    self.setSessionState(if (self.exec_command != null) .ChannelExecReq else .ChannelShellReq);
+                    self.setIoSessionState(.Idle);
+                } else if (self.sessionState == .ChannelExecRsp or self.sessionState == .ChannelShellRsp) {
+                    self.setSessionState(.ChannelConnected);
+                    self.setIoSessionState(.Idle);
+                } else {
+                    self.setIoSessionState(.ReadPktHdr);
+                }
+            },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE) => {
+                misshod.requestEvent(.{ .EndSession = .Disconnect }, .Idle);
             },
             else => {
                 // unhandled packet type
@@ -666,5 +792,4 @@ pub const Session = struct {
             },
         }
     }
-
 };

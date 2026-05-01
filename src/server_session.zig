@@ -62,17 +62,17 @@ pub const Session = struct {
     privkey_passphrase: ?[]u8, //allocated
     auth_passphrase: ?[]u8, //allocated
 
-    auth_pubkey_attempted:[Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined, // U32LenString with algo name + pubkey
-    q_c:[Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined,
+    auth_pubkey_attempted: [Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined, // U32LenString with algo name + pubkey
+    q_c: [Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined,
 
     // server host key
     privkey_blob: [Protocol.srv_hostkey_algo.SecretKey.encoded_length]u8 = undefined,
     pubkey_blob: [Protocol.srv_hostkey_algo.PublicKey.encoded_length]u8 = undefined,
 
-    chan:u32 = 0,
+    chan: u32 = 0,
 
     pub fn init(rand: std.Random, hostkey_ascii: []const u8, allocator: std.mem.Allocator) !Self {
-        var s = Self {
+        var s = Self{
             .ioSessionState = .Init,
             .sessionState = .Init,
             .rand = rand,
@@ -101,7 +101,7 @@ pub const Session = struct {
         self.sessionState = newState;
     }
 
-    pub fn grantAccess(self: *Self, allow:bool) MisshodError!void {
+    pub fn grantAccess(self: *Self, allow: bool) MisshodError!void {
         if (self.sessionState != .CheckUserPasswordAuth) {
             return IoError.UnexpectedResponse;
         } else {
@@ -173,7 +173,12 @@ pub const Session = struct {
                 self.kex_hash_order = self.kex_hash_order.check(.Q_C);
                 self.kex_hasher.writeU32LenString(&self.q_c);
 
-                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generate();
+                // Zig 0.16's X25519 KeyPair.generate wants std.Io; keep
+                // misshod's caller-provided CSPRNG and feed X25519 a fresh
+                // seed for each key exchange.
+                var seed: [Protocol.kex_algo.seed_length]u8 = undefined;
+                self.rand.bytes(&seed);
+                self.ecdh_ephem_keypair = try Protocol.kex_algo.KeyPair.generateDeterministic(seed);
                 try pkt.writeU32LenString(&self.ecdh_ephem_keypair.public_key);
                 TRACEDUMP(.Debug, "qs", .{}, &self.ecdh_ephem_keypair.public_key);
 
@@ -219,7 +224,6 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.NewKeysRead);
-
             },
             .NewKeysRead => {
                 self.setIoSessionState(.ReadPktHdr);
@@ -241,7 +245,7 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE));
                 try pkt.writeU32LenString("password,publickey");
-                try pkt.writeBoolean(false);    // partial success
+                try pkt.writeBoolean(false); // partial success
                 self.setSessionState(.AuthRead);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
             },
@@ -273,8 +277,8 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
                 try pkt.writeU32(self.chan);
                 try pkt.writeU32(self.chan);
-                try pkt.writeU32(256);  // init window size, FIXME
-                try pkt.writeU32(256);  // max window size
+                try pkt.writeU32(256); // init window size, FIXME
+                try pkt.writeU32(256); // max window size
                 self.setSessionState(.ChannelConnected);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
             },
@@ -304,7 +308,7 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
                 try pkt.writeU32(0); // channel
-                try pkt.writeU32(Protocol.MaxPayload); // bytes to add
+                try pkt.writeU32(Protocol.ChannelWindowSize); // bytes to add
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.ChannelDataTx);
             },
@@ -316,7 +320,7 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
                 // https://datatracker.ietf.org/doc/html/rfc4250#section-3.3
-                try pkt.writeU32(0);    // FIXME chan?
+                try pkt.writeU32(0); // FIXME chan?
                 try pkt.writeU32LenString(self.channel_write_buf[0..self.channel_write_buf_nbytes]);
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf), .Idle);
                 self.setSessionState(.ChannelDataTxComplete);
@@ -473,7 +477,7 @@ pub const Session = struct {
                         return IoError.UnimplementedService;
                     }
                 } else {
-                    return IoError.UnexpectedResponse;  // why is client asking now?
+                    return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => {
@@ -484,7 +488,7 @@ pub const Session = struct {
                     const svcname = try rdr.readU32LenString();
                     const authtyp = try rdr.readU32LenString();
 
-                    TRACE(.Debug, "username={s} svcname={s} authtyp={s}", .{username, svcname, authtyp});
+                    TRACE(.Debug, "username={s} svcname={s} authtyp={s}", .{ username, svcname, authtyp });
                     if (!std.mem.eql(u8, svcname, "ssh-connection")) {
                         return IoError.UnimplementedService;
                     }
@@ -498,14 +502,14 @@ pub const Session = struct {
                         self.setSessionState(.CheckUserPasswordAuth);
                         misshod.requestEvent(.{ .UserAuth = .{
                             .username = username,
-                            .auth = .{.Password = password},
+                            .auth = .{ .Password = password },
                         } }, .Idle);
                     } else if (std.mem.eql(u8, authtyp, "publickey")) {
                         const forreal = try rdr.readBoolean();
                         const algoname = try rdr.readU32LenString();
                         const typed_pubkey = try rdr.readU32LenString();
 
-                        TRACE(.Debug, "forreal={any} algoname={s} typed_pubkey len={d}", .{forreal, algoname, typed_pubkey.len});
+                        TRACE(.Debug, "forreal={any} algoname={s} typed_pubkey len={d}", .{ forreal, algoname, typed_pubkey.len });
 
                         // extract raw pubkey
                         var nb = util.NamedBlob.init(typed_pubkey);
@@ -565,20 +569,17 @@ pub const Session = struct {
                             self.setSessionState(.CheckUserPasswordAuth);
                             misshod.requestEvent(.{ .UserAuth = .{
                                 .username = username,
-                                .auth = .{.Pubkey = typed_pubkey},
+                                .auth = .{ .Pubkey = typed_pubkey },
                             } }, .Idle);
                         }
                     } else if (std.mem.eql(u8, authtyp, "none")) {
                         self.setSessionState(.CheckUserPasswordAuth);
-                        misshod.requestEvent(.{ .UserAuth = .{
-                            .username = username,
-                            .auth = null
-                        } }, .Idle);
+                        misshod.requestEvent(.{ .UserAuth = .{ .username = username, .auth = null } }, .Idle);
                     } else {
                         return IoError.UnimplementedService;
                     }
                 } else {
-                    return IoError.UnexpectedResponse;  // why is client asking now?
+                    return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN) => {
@@ -588,7 +589,7 @@ pub const Session = struct {
                 self.chan = try rdr.readU32();
                 const initwinsz = try rdr.readU32();
                 const maxwinsz = try rdr.readU32();
-                _ = initwinsz;  // FIXME
+                _ = initwinsz; // FIXME
                 _ = maxwinsz;
 
                 if (!std.mem.eql(u8, chantype, "session")) {
@@ -602,7 +603,7 @@ pub const Session = struct {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
                 const chan = try rdr.readU32();
                 if (chan != self.chan) {
-                    std.debug.assert(false);    // FIXME, need to record the channels client is asking for and honour them
+                    std.debug.assert(false); // FIXME, need to record the channels client is asking for and honour them
                 }
                 const typ = try rdr.readU32LenString();
                 const wantreply = try rdr.readBoolean();
@@ -622,7 +623,7 @@ pub const Session = struct {
                     // FIXME, any special shell behaviour here
                 } else {
                     TRACE(.Debug, "channel req '{s}'", .{typ});
-                    if (wantreply) {    // can't do this
+                    if (wantreply) { // can't do this
                         return IoError.UnimplementedService;
                     }
                 }
@@ -631,12 +632,12 @@ pub const Session = struct {
                     self.setSessionState(.ChannelRspWrite);
                     self.setIoSessionState(.Idle);
                 } else {
-                    self.setSessionState(.ChannelData);                
+                    self.setSessionState(.ChannelData);
                     self.setIoSessionState(.Idle);
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA) => {
-                if (self.sessionState == .ChannelDataRx) {  // only accept data when we're expecting it
+                if (self.sessionState == .ChannelDataRx) { // only accept data when we're expecting it
                     TRACE(.Debug, "Protocol.MsgId.SSH_MSG_CHANNEL_DATA", .{});
                     const channelnum = try rdr.readU32();
                     const s = try rdr.readU32LenString();
@@ -662,5 +663,4 @@ pub const Session = struct {
             },
         }
     }
-
 };

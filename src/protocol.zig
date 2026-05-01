@@ -5,7 +5,6 @@ const TRACEDUMP = util.tracedump;
 const Misshod = @import("misshod.zig").Misshod;
 const MisshodError = @import("misshod.zig").MisshodError;
 const IoError = @import("misshod.zig").IoError;
-const native_endian = @import("builtin").target.cpu.arch.endian();
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
@@ -41,13 +40,16 @@ pub const MsgId = enum(u8) {
     SSH_MSG_CHANNEL_DATA = 94,
     SSH_MSG_CHANNEL_EXTENDED_DATA = 95,
     SSH_MSG_CHANNEL_EOF = 96,
+    SSH_MSG_CHANNEL_CLOSE = 97,
     SSH_MSG_CHANNEL_REQUEST = 98,
     SSH_MSG_CHANNEL_SUCCESS = 99,
+    SSH_MSG_CHANNEL_FAILURE = 100,
 };
 
-
-// SSH packet header, appears before payload
+// SSH packet header, appears before payload.
 // https://datatracker.ietf.org/doc/html/rfc4253#section-6
+// Do not cast this struct to/from bytes: packed struct layout is not a stable
+// wire format representation across targets.
 pub const PktHdr = packed struct {
     packet_length: u32,
     padding_length: u8,
@@ -56,6 +58,18 @@ pub const PktHdr = packed struct {
 // Number of bytes used by PktHdr
 // https://datatracker.ietf.org/doc/html/rfc4253#section-6
 pub const sizeof_PktHdr = @bitSizeOf(PktHdr) / 8;
+
+pub fn readPktHdr(data: []const u8) PktHdr {
+    return .{
+        .packet_length = std.mem.readInt(u32, data[0..4], .big),
+        .padding_length = data[4],
+    };
+}
+
+pub fn writePktHdr(data: []u8, hdr: PktHdr) void {
+    std.mem.writeInt(u32, data[0..4], hdr.packet_length, .big);
+    data[4] = hdr.padding_length;
+}
 
 // order in which items must be hashed to produce kex hash, H
 // The key exchange hash is built up piecemeal through several states
@@ -79,8 +93,10 @@ pub const KexHashOrder = enum { // https://datatracker.ietf.org/doc/html/rfc5656
     }
 };
 
-pub const MaxSSHPacket = 4096; // Can be smaller https://datatracker.ietf.org/doc/html/rfc4253#section-5.3
+pub const MaxSSHPacket = 128 * 1024;
 pub const MaxPayload = (MaxSSHPacket - (sizeof_PktHdr + 255 + mac_algo.key_length));
+pub const ChannelWindowSize = 1024 * 1024;
+pub const ChannelMaxPacket = 32 * 1024;
 pub const MaxIVLen = 20; // number of bytes to generate for IVs
 pub const MaxKeyLen = 64; // number of bytes to generate for keys
 
@@ -131,14 +147,14 @@ pub const KeyDataBi = struct {
     s2c: KeyDataUni,
 
     pub fn init() Self {
-        return Self {
-            .c2s = .{.seq = 0},
-            .s2c = .{.seq = 0},
+        return Self{
+            .c2s = .{ .seq = 0 },
+            .s2c = .{ .seq = 0 },
         };
     }
 
     // generate session keys from shared secret
-    pub fn genKeys(self:* Self, H: [hash_algo.digest_length]u8, shared_secret_k:[kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
+    pub fn genKeys(self: *Self, H: [hash_algo.digest_length]u8, shared_secret_k: [kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
 
         // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
 
@@ -205,7 +221,7 @@ pub const KeyDataBi = struct {
     }
 };
 
-pub fn wrapPkt(rand:*std.Random, encrypted:bool, keysuni:*KeyDataUni, buffer: *BufferWriter, iobuf: []u8) MisshodError![]const u8 {
+pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer: *BufferWriter, iobuf: []u8) MisshodError![]const u8 {
     // https://datatracker.ietf.org/doc/html/rfc4253#section-6
     // pad such that whole packet (payload + hdr) is multiple of block_size
     const buffer_len = buffer.active().len;
@@ -213,17 +229,11 @@ pub fn wrapPkt(rand:*std.Random, encrypted:bool, keysuni:*KeyDataUni, buffer: *B
     if (padding_length < 4) {
         padding_length += @intCast(AesCtrT.block_size);
     }
-    // construct header
-    var hdr: PktHdr = .{
+    const hdr: PktHdr = .{
         .packet_length = @intCast(buffer_len + padding_length + 1),
         .padding_length = @intCast(padding_length),
     };
-    // make correct endianness
-    if (native_endian != .big) {
-        std.mem.byteSwapAllFields(PktHdr, &hdr);
-    }
-    // insert hdr into hole
-    @memcpy(buffer.payload[0..sizeof_PktHdr], util.asPackedBytes(PktHdr, &hdr));
+    writePktHdr(buffer.payload[0..sizeof_PktHdr], hdr);
 
     // append padding, NOTE, will change buffer.payload.len (stored in hdr above)
     var rndbuf: [255]u8 = undefined; // block_size would do
@@ -263,4 +273,3 @@ pub fn wrapPkt(rand:*std.Random, encrypted:bool, keysuni:*KeyDataUni, buffer: *B
         return iobuf[0..buffer.payload.len];
     }
 }
-
