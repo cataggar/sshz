@@ -1,5 +1,6 @@
 .{
-    .name = "mssh",
+    .name = .mssh,
+    .fingerprint = 0xf9c4e5944b49b6f1,
     .version = "0.0.1",
     .dependencies = .{
         .misshod = .{ .path = ".." },
