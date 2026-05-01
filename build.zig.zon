@@ -9,6 +9,10 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "interop",
+        "mssh",
+        "msshd",
         "src",
+        "testserver",
     },
 }

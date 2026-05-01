@@ -24,6 +24,15 @@ fn readPassphrase(password_buf: []u8) ![]u8 {
     }
 }
 
+fn envOrReadPassphrase(init: std.process.Init, name: []const u8, prompt: []const u8, password_buf: []u8) ![]const u8 {
+    if (init.environ_map.get(name)) |value| {
+        return value;
+    }
+
+    std.debug.print("{s}", .{prompt});
+    return try readPassphrase(password_buf);
+}
+
 var original_termios: ?std.posix.termios = null;
 const MaxAgentSockets = 4;
 
@@ -258,6 +267,7 @@ pub fn main(init: std.process.Init) !void {
             var agent_sockets: [MaxAgentSockets]?AgentSocket = .{null} ** MaxAgentSockets;
             defer closeAllAgentSockets(&agent_sockets);
             var quit = false;
+            var exit_code: u8 = 0;
             const stdin_fd = std.c.STDIN_FILENO;
 
             outer: while (!quit) {
@@ -284,6 +294,9 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .EndSession => |reason| {
                                 std.debug.print("Session ended: {any}\n", .{reason});
+                                if (reason == .AuthFailure) {
+                                    exit_code = 1;
+                                }
                                 quit = true;
                                 continue :outer;
                             },
@@ -308,20 +321,17 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .GetKeyPassphrase => {
                                 var password_buf: [128]u8 = undefined;
-                                std.debug.print("Password for private key decrypt: ", .{});
-                                try misshod.setPrivateKeyPassphrase(try readPassphrase(&password_buf));
+                                try misshod.setPrivateKeyPassphrase(try envOrReadPassphrase(init, "MSSH_KEY_PASSPHRASE", "Password for private key decrypt: ", &password_buf));
                                 try misshod.clearEvent(eventCode);
                             },
                             .GetAuthPassphrase => {
                                 var password_buf: [128]u8 = undefined;
-                                std.debug.print("Password for auth: ", .{});
-                                try misshod.setAuthPassphrase(try readPassphrase(&password_buf));
+                                try misshod.setAuthPassphrase(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", "Password for auth: ", &password_buf));
                                 try misshod.clearEvent(eventCode);
                             },
                             .KeyboardInteractive => |prompt| {
                                 var password_buf: [128]u8 = undefined;
-                                std.debug.print("{s}", .{prompt.prompt});
-                                try misshod.session.setKeyboardInteractiveResponse(try readPassphrase(&password_buf));
+                                try misshod.session.setKeyboardInteractiveResponse(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", prompt.prompt, &password_buf));
                                 try misshod.clearEvent(eventCode);
                             },
                             .ChannelOpened,
@@ -463,6 +473,10 @@ pub fn main(init: std.process.Init) !void {
                         }
                     },
                 }
+            }
+
+            if (exit_code != 0) {
+                std.process.exit(exit_code);
             }
         } else {
             std.debug.print("Bad/missing user\n", .{});

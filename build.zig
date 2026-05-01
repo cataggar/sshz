@@ -39,4 +39,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    const interop_cmd = b.addSystemCommand(&.{ "bash", "interop/run.sh" });
+    interop_cmd.step.dependOn(&run_lib_tests.step);
+
+    const interop_step = b.step("interop", "Run OpenSSH/libssh interoperability tests");
+    interop_step.dependOn(&interop_cmd.step);
 }

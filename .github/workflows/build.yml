@@ -46,3 +46,19 @@ jobs:
       - name: Build lib
         run: zig build
         working-directory: misshod
+      - name: Build mssh
+        run: zig build
+        working-directory: misshod/mssh
+      - name: Build msshd
+        run: zig build
+        working-directory: misshod/msshd
+      - name: Install interop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libssh-dev openssh-client openssh-server pkg-config
+          sudo mkdir -p /run/sshd
+      - name: Interop test
+        if: runner.os == 'Linux'
+        run: zig build interop
+        working-directory: misshod
