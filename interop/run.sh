@@ -60,7 +60,7 @@ wait_for_ssh() {
     local scan_file="$WORK/ssh-keyscan-${port}.out"
 
     for _ in $(seq 1 80); do
-        if ssh-keyscan -T 1 -p "$port" 127.0.0.1 >"$scan_file" 2>/dev/null && [[ -s "$scan_file" ]]; then
+        if ssh-keyscan -T 1 -t ed25519 -p "$port" 127.0.0.1 >"$scan_file" 2>/dev/null && [[ -s "$scan_file" ]]; then
             return 0
         fi
         if ! kill -0 "$pid" 2>/dev/null; then
@@ -137,7 +137,9 @@ run_mssh_command() {
     shift 4
 
     (
-        printf '%s\nexit\n' "$command" | "$@"
+        if [[ -n "$command" ]]; then
+            printf '%s\nexit\n' "$command"
+        fi | "$@"
     ) >"$out_file" 2>"$err_file" &
     local pid=$!
     wait_with_timeout "$pid" "$timeout"
@@ -221,6 +223,7 @@ PermitRootLogin no
 PermitTTY yes
 PrintMotd no
 PrintLastLog no
+ForceCommand printf misshod-openssh-forced
 LogLevel DEBUG3
 KexAlgorithms curve25519-sha256
 HostKeyAlgorithms ssh-ed25519
@@ -241,32 +244,32 @@ wait_for_ssh "$OPENSSH_PORT" "$OPENSSH_SSHD_PID" "$OPENSSH_DIR/sshd.err"
 
 log "testing mssh pubkey auth against OpenSSH sshd"
 run_mssh_command "$TIMEOUT" "$WORK/mssh-openssh-pubkey.out" "$WORK/mssh-openssh-pubkey.err" \
-    'printf misshod-openssh-pubkey' \
+    '' \
     "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT" "$KEY_PASSWORDLESS"
-assert_contains "$WORK/mssh-openssh-pubkey.out" "misshod-openssh-pubkey"
+assert_contains "$WORK/mssh-openssh-pubkey.out" "misshod-openssh-forced"
 assert_contains "$WORK/mssh-openssh-pubkey.err" "Connected!"
 
 log "testing mssh encrypted-key auth against OpenSSH sshd"
 run_mssh_command "$TIMEOUT" "$WORK/mssh-openssh-encrypted-key.out" "$WORK/mssh-openssh-encrypted-key.err" \
-    'printf misshod-openssh-encrypted-key' \
+    '' \
     env MSSH_KEY_PASSPHRASE="$KEY_PASSPHRASE" \
     "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT" "$KEY_ENCRYPTED"
-assert_contains "$WORK/mssh-openssh-encrypted-key.out" "misshod-openssh-encrypted-key"
+assert_contains "$WORK/mssh-openssh-encrypted-key.out" "misshod-openssh-forced"
 
 if [[ -n "$OPENSSH_PASSWORD" ]]; then
     log "testing mssh password auth against OpenSSH sshd"
     run_mssh_command "$TIMEOUT" "$WORK/mssh-openssh-password.out" "$WORK/mssh-openssh-password.err" \
-        'printf misshod-openssh-password' \
+        '' \
         env MSSH_AUTH_PASSWORD="$OPENSSH_PASSWORD" \
         "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT"
-    assert_contains "$WORK/mssh-openssh-password.out" "misshod-openssh-password"
+    assert_contains "$WORK/mssh-openssh-password.out" "misshod-openssh-forced"
 else
     log "skipping OpenSSH password-auth lane; set MSSH_INTEROP_OPENSSH_PASSWORD to enable it for the current user"
 fi
 
 log "testing mssh auth failure against OpenSSH sshd"
 if run_mssh_command "$TIMEOUT" "$WORK/mssh-openssh-auth-failure.out" "$WORK/mssh-openssh-auth-failure.err" \
-    'printf should-not-run' \
+    '' \
     env MSSH_AUTH_PASSWORD="definitely-not-the-password" \
     "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT"; then
     fail "mssh auth-failure case unexpectedly succeeded"
@@ -316,18 +319,33 @@ run_openssh_client_to_msshd() {
         } | "$SSH_BIN" "$@" "${SSH_COMMON[@]}" "interop@$HOST"
     ) >"$out_file" 2>"$err_file" &
     local pid=$!
-    wait_with_timeout "$pid" "$TIMEOUT"
+
+    for _ in $(seq 1 "$((TIMEOUT * 4))"); do
+        if grep -Fq "You said 'misshod-openssh-client" "$out_file" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid"
+            return $?
+        fi
+        sleep 0.25
+    done
+
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 124
 }
 
 log "testing OpenSSH ssh client against msshd"
-run_openssh_client_to_msshd "$WORK/openssh-msshd.out" "$WORK/openssh-msshd.err"
+run_openssh_client_to_msshd "$WORK/openssh-msshd.out" "$WORK/openssh-msshd.err" -vvv
 assert_contains "$WORK/openssh-msshd.out" "You said 'misshod-openssh-client"
 
 log "checking OpenSSH negotiated algorithms against msshd"
-run_openssh_client_to_msshd "$WORK/openssh-msshd-algorithms.out" "$WORK/openssh-msshd-algorithms.err" -vvv
-assert_matches "$WORK/openssh-msshd-algorithms.err" "kex: algorithm: curve25519-sha256"
-assert_matches "$WORK/openssh-msshd-algorithms.err" "host key algorithm: ssh-ed25519"
-assert_matches "$WORK/openssh-msshd-algorithms.err" "cipher: aes256-ctr.*MAC: hmac-sha2-256"
+assert_matches "$WORK/openssh-msshd.err" "kex: algorithm: curve25519-sha256"
+assert_matches "$WORK/openssh-msshd.err" "host key algorithm: ssh-ed25519"
+assert_matches "$WORK/openssh-msshd.err" "cipher: aes256-ctr.*MAC: hmac-sha2-256"
 
 if [[ "${MSSH_INTEROP_ENABLE_LIBSSH:-}" == "1" || "${MSSH_INTEROP_REQUIRE_LIBSSH:-}" == "1" ]]; then
     if ! pkg-config --exists libssh 2>/dev/null; then

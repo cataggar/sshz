@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
 
         // make a reasonable prng
         var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
-        if (std.c.getrandom(&seed, seed.len, 0) != seed.len) return error.RandomSeedFailed;
+        try init.io.randomSecure(&seed);
         var prng = std.Random.DefaultCsprng.init(seed);
 
         var misshod = try MisshodServer.init(prng.random(), hostkey_ascii, allocator);
@@ -63,6 +63,8 @@ pub fn main(init: std.process.Init) !void {
 
         var iobuf: [8]u8 = undefined; // could be any size
         var quit = false;
+        var pending_eof_channel: ?u32 = null;
+        var pending_close_channel: ?u32 = null;
         var pipe: [2]std.c.fd_t = undefined;
         if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
         defer _ = std.c.close(pipe[0]);
@@ -85,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
                             try writeAllFd(pipe[1], response);
 
                             try misshod.clearEvent(eventCode);
+                            pending_eof_channel = rxdata.channel;
                         },
                         .EndSession => |reason| {
                             std.debug.print("Session ended: {any}\n", .{reason});
@@ -196,6 +199,16 @@ pub fn main(init: std.process.Init) !void {
                             const towrite = try misshod.peek(4);
                             const bytes_written = try writeFd(stream.socket.handle, towrite);
                             try misshod.consumed(bytes_written);
+                            if (bytes_written == towrite.len) {
+                                if (pending_eof_channel) |channel| {
+                                    pending_eof_channel = null;
+                                    pending_close_channel = channel;
+                                    try misshod.sendChannelEof(channel);
+                                } else if (pending_close_channel) |channel| {
+                                    pending_close_channel = null;
+                                    try misshod.sendChannelClose(channel);
+                                }
+                            }
                             continue :ioloop;
                         }
                         if (fds[1].revents & std.posix.POLL.IN > 0) { // data to be sent (from pipe)

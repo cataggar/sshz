@@ -78,7 +78,9 @@ fn connectAgentSocket(path: []const u8) !std.c.fd_t {
     if (fd < 0) return error.SocketFailed;
     errdefer _ = std.c.close(fd);
 
-    var addr: std.c.sockaddr.un = .{ .family = std.c.AF.UNIX, .path = .{0} ** 108 };
+    var addr: std.c.sockaddr.un = undefined;
+    addr.family = std.c.AF.UNIX;
+    @memset(&addr.path, 0);
     if (path.len >= addr.path.len) return error.NameTooLong;
     @memcpy(addr.path[0..path.len], path);
 
@@ -252,7 +254,7 @@ pub fn main(init: std.process.Init) !void {
 
             // make a reasonable prng
             var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
-            if (std.c.getrandom(&seed, seed.len, 0) != seed.len) return error.RandomSeedFailed;
+            try init.io.randomSecure(&seed);
             var prng = std.Random.DefaultCsprng.init(seed);
 
             var misshod = try MisshodClient.init(prng.random(), user, allocator);
@@ -267,16 +269,24 @@ pub fn main(init: std.process.Init) !void {
             var agent_sockets: [MaxAgentSockets]?AgentSocket = .{null} ** MaxAgentSockets;
             defer closeAllAgentSockets(&agent_sockets);
             var quit = false;
+            var connected = false;
             var exit_code: u8 = 0;
             const stdin_fd = std.c.STDIN_FILENO;
 
             outer: while (!quit) {
-                const ev = try misshod.getNextEvent();
+                const ev = misshod.getNextEvent() catch |err| switch (err) {
+                    error.NotReady => {
+                        try init.io.sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .awake);
+                        continue :outer;
+                    },
+                    else => return err,
+                };
                 switch (ev) {
                     .Event => |eventCode| {
                         switch (eventCode) {
                             .Connected => {
                                 std.debug.print("Connected!\n", .{});
+                                connected = true;
                                 try misshod.clearEvent(eventCode);
                                 try raw_mode_start();
                             },
@@ -402,7 +412,7 @@ pub fn main(init: std.process.Init) !void {
                         };
                         fds[1] = .{
                             .fd = stdin_fd,
-                            .events = std.posix.POLL.IN,
+                            .events = if (connected) std.posix.POLL.IN else 0,
                             .revents = undefined,
                         };
                         var fd_count: usize = 2;

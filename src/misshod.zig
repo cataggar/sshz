@@ -8,7 +8,6 @@ const BufferError = @import("buffer.zig").BufferError;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
 const Key = @import("key.zig");
 const Protocol = @import("protocol.zig");
-const native_endian = @import("builtin").target.cpu.arch.endian();
 const BufferReader = @import("buffer.zig").BufferReader;
 
 pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError || PrivKeyError || Key.KeyError;
@@ -525,11 +524,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn getRecvBuffer(self: *Self, iobuf: []u8, inkeys: *Protocol.KeyDataUni) MisshodError!BufferReader {
-            var hdr: Protocol.PktHdr = std.mem.bytesAsValue(Protocol.PktHdr, iobuf[0..Protocol.sizeof_PktHdr]).*;
-            if (native_endian != .big) {
-                // flip bytes
-                std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
-            }
+            const hdr = Protocol.readPktHdr(iobuf[0..Protocol.sizeof_PktHdr]);
             if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
                 return IoError.InvalidPacketSize;
             }
@@ -653,11 +648,7 @@ pub fn MisshodImpl(role: Role) type {
 
                         // read Protocol.PktHdr from first block
                         const pkthdr_size = Protocol.sizeof_PktHdr;
-                        var hdr: Protocol.PktHdr = undefined;
-                        hdr = std.mem.bytesToValue(Protocol.PktHdr, buf[0..pkthdr_size]);
-                        if (native_endian != .big) {
-                            std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
-                        }
+                        const hdr = Protocol.readPktHdr(buf[0..pkthdr_size]);
 
                         // padding len is such that payload_len + sizeof(hdr) + padding = block size
                         if (hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
@@ -689,11 +680,7 @@ pub fn MisshodImpl(role: Role) type {
                         inkeys.seq +%= 1;
                     } else {
                         // copy header
-                        var hdr: Protocol.PktHdr = std.mem.bytesAsValue(Protocol.PktHdr, buf[0..Protocol.sizeof_PktHdr]).*;
-                        if (native_endian != .big) {
-                            // flip bytes
-                            std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
-                        }
+                        const hdr = Protocol.readPktHdr(buf[0..Protocol.sizeof_PktHdr]);
 
                         TRACE(.Debug, ".ReadPktBody hdr={any}", .{hdr});
                         // read in payload
@@ -972,6 +959,13 @@ pub fn MisshodImpl(role: Role) type {
             self.iostate_wr = .Idle;
             try self.advance();
         }
+
+        pub fn sendChannelClose(self: *Self, channel_id: u32) MisshodError!void {
+            try self.session.sendChannelClose(channel_id);
+            self.iostate_wr = .Idle;
+            try self.advance();
+        }
+
         pub fn enableAgentForwarding(self: *Self) MisshodError!void {
             switch (role) {
                 .Client => return try self.session.enableAgentForwarding(),
