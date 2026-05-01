@@ -16,7 +16,7 @@ jobs:
       - name: Setup Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: master
+          version: 0.16.0
       - name: Build test
         run: zig build test
         working-directory: misshod
@@ -29,4 +29,3 @@ jobs:
       - name: Build msshd
         run: zig build
         working-directory: misshod/msshd
-

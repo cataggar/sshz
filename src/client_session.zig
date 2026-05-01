@@ -793,3 +793,77 @@ pub const Session = struct {
         }
     }
 };
+
+fn clearPacketPayload(packet: []const u8) []const u8 {
+    const hdr = Protocol.readPktHdr(packet[0..Protocol.sizeof_PktHdr]);
+    const payload_len: usize = @as(usize, hdr.packet_length) - @as(usize, hdr.padding_length) - 1;
+    return packet[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
+}
+
+fn producedPacket(misshod: *MisshodClient) ![]const u8 {
+    switch (misshod.iostate) {
+        .Active => |step| switch (step.action) {
+            .Producing => |nbytes| return misshod.iobuf[0..nbytes],
+            else => {},
+        },
+        else => {},
+    }
+    try std.testing.expect(false);
+    unreachable;
+}
+
+fn singleMessagePacket(misshod: *MisshodClient, msgid: Protocol.MsgId) MisshodError![]const u8 {
+    var pkt = BufferWriter.init(&misshod.iobuf, Protocol.sizeof_PktHdr);
+    try pkt.writeU8(@intFromEnum(msgid));
+    return try Protocol.wrapPkt(&misshod.session.rand, misshod.session.encrypted, &misshod.session.keydata.s2c, &pkt, &misshod.iobuf);
+}
+
+test "client sends exec channel request" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var misshod = try MisshodClient.init(prng.random(), "alice", std.testing.allocator);
+    defer misshod.deinit(std.testing.allocator);
+
+    try misshod.setExecCommand("printf hi");
+    misshod.session.sessionState = .ChannelExecReq;
+    misshod.session.remote_channel = 42;
+
+    try misshod.session.advanceSession(&misshod);
+
+    var rdr = BufferReader.init(clearPacketPayload(try producedPacket(&misshod)));
+    try std.testing.expect(try rdr.readU8() == @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+    try std.testing.expect(try rdr.readU32() == 42);
+    try std.testing.expect(std.mem.eql(u8, try rdr.readU32LenString(), "exec"));
+    try std.testing.expect(try rdr.readBoolean());
+    try std.testing.expect(std.mem.eql(u8, try rdr.readU32LenString(), "printf hi"));
+    try std.testing.expect(rdr.off == rdr.payload.len);
+    try std.testing.expect(misshod.session.sessionState == .ChannelExecRsp);
+}
+
+test "client channel success after pty selects exec when configured" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var misshod = try MisshodClient.init(prng.random(), "alice", std.testing.allocator);
+    defer misshod.deinit(std.testing.allocator);
+
+    try misshod.setExecCommand("uptime");
+    misshod.session.sessionState = .ChannelPtyRsp;
+
+    const packet = try singleMessagePacket(&misshod, .SSH_MSG_CHANNEL_SUCCESS);
+    try misshod.session.handlePacket(packet, &misshod);
+
+    try std.testing.expect(misshod.session.sessionState == .ChannelExecReq);
+    try std.testing.expect(misshod.session.ioSessionState == .Idle);
+}
+
+test "client channel success after pty selects shell without exec command" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var misshod = try MisshodClient.init(prng.random(), "alice", std.testing.allocator);
+    defer misshod.deinit(std.testing.allocator);
+
+    misshod.session.sessionState = .ChannelPtyRsp;
+
+    const packet = try singleMessagePacket(&misshod, .SSH_MSG_CHANNEL_SUCCESS);
+    try misshod.session.handlePacket(packet, &misshod);
+
+    try std.testing.expect(misshod.session.sessionState == .ChannelShellReq);
+    try std.testing.expect(misshod.session.ioSessionState == .Idle);
+}

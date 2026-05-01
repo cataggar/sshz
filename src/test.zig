@@ -1,4 +1,5 @@
 comptime {
+    _ = @import("misshod.zig");
     _ = @import("privkey.zig");
     _ = @import("util.zig");
     _ = @import("client_session.zig");

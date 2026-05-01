@@ -667,3 +667,81 @@ pub fn MisshodImpl(role: Role) type {
         }
     };
 }
+
+fn clearPacketPayload(packet: []const u8) []const u8 {
+    const hdr = Protocol.readPktHdr(packet[0..Protocol.sizeof_PktHdr]);
+    const payload_len: usize = @as(usize, hdr.packet_length) - @as(usize, hdr.padding_length) - 1;
+    return packet[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
+}
+
+fn producedPacket(misshod: *MisshodClient) ![]const u8 {
+    switch (misshod.iostate) {
+        .Active => |step| switch (step.action) {
+            .Producing => |nbytes| return misshod.iobuf[0..nbytes],
+            else => {},
+        },
+        else => {},
+    }
+    try std.testing.expect(false);
+    unreachable;
+}
+
+fn putClientInPacketRead(misshod: *MisshodClient, buffered_nbytes: usize) void {
+    misshod.session.sessionState = .ChannelDataRx;
+    misshod.session.ioSessionState = .ReadPktHdr;
+    misshod.iostate = .{ .Active = .{
+        .action = .{ .Consuming = Protocol.AesCtrT.block_size },
+        .next_state = .{ .ReadPktBody = misshod.iobuf[0..Protocol.AesCtrT.block_size] },
+    } };
+    misshod.iobuf_nbytes = buffered_nbytes;
+    misshod.iobuf_rdwroff = 0;
+}
+
+test "client channel writes are rejected while packet read has buffered bytes" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var misshod = try MisshodClient.init(prng.random(), "alice", std.testing.allocator);
+    defer misshod.deinit(std.testing.allocator);
+    putClientInPacketRead(&misshod, 1);
+
+    try std.testing.expect((try misshod.getChannelWriteBuffer()).len == 0);
+    try std.testing.expectError(IoError.cannotAcceptWrite, misshod.channelWriteComplete(1));
+}
+
+test "client resize is deferred while packet read has buffered bytes" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var misshod = try MisshodClient.init(prng.random(), "alice", std.testing.allocator);
+    defer misshod.deinit(std.testing.allocator);
+    putClientInPacketRead(&misshod, 1);
+
+    try misshod.setWindowSize(100, 40);
+
+    try std.testing.expect(misshod.session.sessionState == .ChannelDataRx);
+    try std.testing.expect(misshod.session.ioSessionState == .ReadPktHdr);
+    try std.testing.expect(misshod.session.resize_pending);
+    switch (misshod.iostate) {
+        .Active => |step| switch (step.action) {
+            .Consuming => {},
+            else => try std.testing.expect(false),
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "client channel writes interrupt idle packet header read" {
+    var prng = std.Random.DefaultPrng.init(0);
+    var misshod = try MisshodClient.init(prng.random(), "alice", std.testing.allocator);
+    defer misshod.deinit(std.testing.allocator);
+    putClientInPacketRead(&misshod, 0);
+    misshod.session.remote_channel = 7;
+
+    const buf = try misshod.getChannelWriteBuffer();
+    try std.testing.expect(buf.len == misshod.session.channel_write_buf.len);
+    buf[0] = 'x';
+    try misshod.channelWriteComplete(1);
+
+    var rdr = BufferReader.init(clearPacketPayload(try producedPacket(&misshod)));
+    try std.testing.expect(try rdr.readU8() == @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try std.testing.expect(try rdr.readU32() == 7);
+    try std.testing.expect(std.mem.eql(u8, try rdr.readU32LenString(), "x"));
+    try std.testing.expect(rdr.off == rdr.payload.len);
+}
