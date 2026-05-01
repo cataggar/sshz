@@ -77,6 +77,8 @@ Login with pubkey auth using a password protected private key ("secretpassword")
 # Same as: ssh -p 2022 testuser@127.0.0.1 -i ../testserver/id_ed25519_passworded
 ```
 
+For non-interactive runs, `mssh` reads optional secrets from `MSSH_AUTH_PASSWORD` and `MSSH_KEY_PASSPHRASE`.
+
 ## Server
 
 `msshd` is a toy ssh server. It handles one connection at a time and echoes back received data with "You said X".
@@ -118,6 +120,16 @@ Connect using `mssh` using password auth (any password matching username will be
 cd mssh
 zig build run -- foo@127.0.0.1 2022
 ```
+
+## Interop tests
+
+Run the opt-in OpenSSH/libssh interoperability suite from the repository root:
+
+```bash
+zig build interop
+```
+
+The runner builds `mssh` and `msshd`, starts an isolated localhost OpenSSH `sshd`, checks `mssh` public-key and encrypted-key auth against it, starts `msshd`, checks OpenSSH `ssh` against it, and can run the libssh probe when requested. Set `MSSH_INTEROP_ENABLE_LIBSSH=1` to run the libssh lane, `MSSH_INTEROP_REQUIRE_LIBSSH=1` to require it, and `MSSH_INTEROP_KEEP_ARTIFACTS=1` to keep logs.
 
 
 # Tiny client example

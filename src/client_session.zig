@@ -7,7 +7,6 @@ const MisshodClient = Misshod.MisshodClient;
 const MisshodError = Misshod.MisshodError;
 const IoError = Misshod.IoError;
 const SshOpenFailureReason = Misshod.SshOpenFailureReason;
-const native_endian = @import("builtin").target.cpu.arch.endian();
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
@@ -870,6 +869,15 @@ pub const Session = struct {
         self.setIoSessionState(.Idle);
     }
 
+    pub fn sendChannelClose(self: *Self, channel_id: u32) MisshodError!void {
+        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
+        if (chan.close_sent) return;
+        chan.state = .CloseWrite;
+        self.active_channel_id = channel_id;
+        self.setSessionState(.ChannelActive);
+        self.setIoSessionState(.Idle);
+    }
+
     pub fn sendWindowChange(self: *Self, cols: u32, rows: u32, width_px: u32, height_px: u32) void {
         self.pending_window_change = .{ cols, rows, width_px, height_px };
         if (self.sessionState == .ChannelActive) {
@@ -1500,24 +1508,19 @@ fn buildUnencryptedPacket(buf: []u8, payload: []const u8) usize {
     const padding_length: u8 = 8;
     const packet_length: u32 = @intCast(payload.len + padding_length + 1);
     // Build PktHdr the same way wrapPkt does
-    var hdr: Protocol.PktHdr = .{
+    const hdr: Protocol.PktHdr = .{
         .packet_length = packet_length,
         .padding_length = padding_length,
     };
-    if (native_endian != .big) {
-        std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
-    }
-    @memcpy(buf[0..Protocol.sizeof_PktHdr], util.asPackedBytes(Protocol.PktHdr, &hdr));
+    std.mem.writeInt(u32, buf[0..4], hdr.packet_length, .big);
+    buf[4] = hdr.padding_length;
     @memcpy(buf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload.len], payload);
     @memset(buf[Protocol.sizeof_PktHdr + payload.len .. Protocol.sizeof_PktHdr + payload.len + padding_length], 0);
     return Protocol.sizeof_PktHdr + payload.len + padding_length;
 }
 
 fn unencryptedPayload(packet: []const u8) []const u8 {
-    var hdr: Protocol.PktHdr = std.mem.bytesAsValue(Protocol.PktHdr, packet[0..Protocol.sizeof_PktHdr]).*;
-    if (native_endian != .big) {
-        std.mem.byteSwapAllFields(Protocol.PktHdr, &hdr);
-    }
+    const hdr = Protocol.readPktHdr(packet[0..Protocol.sizeof_PktHdr]);
     const payload_len = hdr.packet_length - hdr.padding_length - 1;
     return packet[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
 }

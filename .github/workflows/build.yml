@@ -15,17 +15,50 @@ jobs:
     runs-on: ${{matrix.os}}
     steps:
       - name: Checkout misshod
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@v5
         with:
           path: misshod
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="0.16.0"
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) zig_target="x86_64-linux" ;;
+            macOS-ARM64) zig_target="aarch64-macos" ;;
+            macOS-X64) zig_target="x86_64-macos" ;;
+            *)
+              echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2
+              exit 1
+              ;;
+          esac
+
+          archive="zig-${zig_target}-${version}.tar.xz"
+          zig_dir="${RUNNER_TEMP}/zig-${zig_target}-${version}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          echo "${zig_dir}" >> "${GITHUB_PATH}"
+          "${zig_dir}/zig" version
       - name: Build test
         run: zig build test
         working-directory: misshod
       - name: Build lib
         run: zig build
         working-directory: misshod
-
+      - name: Build mssh
+        run: zig build
+        working-directory: misshod/mssh
+      - name: Build msshd
+        run: zig build
+        working-directory: misshod/msshd
+      - name: Install interop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc libssh-dev openssh-client openssh-server pkg-config
+          sudo mkdir -p /run/sshd
+      - name: Interop test
+        if: runner.os == 'Linux'
+        run: zig build interop
+        working-directory: misshod

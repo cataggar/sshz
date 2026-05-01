@@ -5,7 +5,6 @@ const TRACEDUMP = util.tracedump;
 const Misshod = @import("misshod.zig").Misshod;
 const MisshodError = @import("misshod.zig").MisshodError;
 const IoError = @import("misshod.zig").IoError;
-const native_endian = @import("builtin").target.cpu.arch.endian();
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
@@ -65,6 +64,20 @@ pub const PktHdr = packed struct {
 // Number of bytes used by PktHdr
 // https://datatracker.ietf.org/doc/html/rfc4253#section-6
 pub const sizeof_PktHdr = @bitSizeOf(PktHdr) / 8;
+
+pub fn readPktHdr(packet: []const u8) PktHdr {
+    std.debug.assert(packet.len >= sizeof_PktHdr);
+    return .{
+        .packet_length = std.mem.readInt(u32, packet[0..4], .big),
+        .padding_length = packet[4],
+    };
+}
+
+fn writePktHdr(packet: []u8, hdr: PktHdr) void {
+    std.debug.assert(packet.len >= sizeof_PktHdr);
+    std.mem.writeInt(u32, packet[0..4], hdr.packet_length, .big);
+    packet[4] = hdr.padding_length;
+}
 
 // order in which items must be hashed to produce kex hash, H
 // The key exchange hash is built up piecemeal through several states
@@ -430,15 +443,11 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
     if (packet_len > MaxSSHPacket or packet_len > iobuf.len) return IoError.tooBig;
 
     // construct header
-    var hdr: PktHdr = .{
+    const hdr: PktHdr = .{
         .packet_length = @intCast(buffer_len + padding_length + 1),
         .padding_length = @intCast(padding_length),
     };
-    // make correct endianness
-    if (native_endian != .big) {
-        std.mem.byteSwapAllFields(PktHdr, &hdr);
-    }
-    @memcpy(iobuf[0..sizeof_PktHdr], util.asPackedBytes(PktHdr, &hdr));
+    writePktHdr(iobuf[0..sizeof_PktHdr], hdr);
     std.mem.copyForwards(u8, iobuf[sizeof_PktHdr .. sizeof_PktHdr + packet_payload.len], packet_payload);
 
     var rndbuf: [255]u8 = undefined; // block_size would do
@@ -563,10 +572,7 @@ test "wrapPayload preserves uncompressed payload with none compression" {
     const payload = "plain ssh payload";
     const packet = try wrapPayload(&rand, false, &keys, payload, &iobuf);
 
-    var hdr = std.mem.bytesAsValue(PktHdr, packet[0..sizeof_PktHdr]).*;
-    if (native_endian != .big) {
-        std.mem.byteSwapAllFields(PktHdr, &hdr);
-    }
+    const hdr = readPktHdr(packet[0..sizeof_PktHdr]);
     const payload_len = hdr.packet_length - hdr.padding_length - 1;
     try std.testing.expectEqualStrings(payload, packet[sizeof_PktHdr .. sizeof_PktHdr + payload_len]);
 }
@@ -585,10 +591,7 @@ test "wrapPayload compresses active zlib openssh payloads" {
     const payload = "compressed ssh payload compressed ssh payload compressed ssh payload";
     const packet = try wrapPayload(&rand, false, &sender, payload, &iobuf);
 
-    var hdr = std.mem.bytesAsValue(PktHdr, packet[0..sizeof_PktHdr]).*;
-    if (native_endian != .big) {
-        std.mem.byteSwapAllFields(PktHdr, &hdr);
-    }
+    const hdr = readPktHdr(packet[0..sizeof_PktHdr]);
     const compressed_len = hdr.packet_length - hdr.padding_length - 1;
     const compressed_payload = packet[sizeof_PktHdr .. sizeof_PktHdr + compressed_len];
     try std.testing.expect(!std.mem.eql(u8, payload, compressed_payload));

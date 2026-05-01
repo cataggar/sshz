@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    const required_zig = "0.14.0-dev.2545+e2e363361";
+    const required_zig = "0.16.0";
     const current_zig = builtin.zig_version;
     const min_zig = std.SemanticVersion.parse(required_zig) catch unreachable;
     if (current_zig.order(min_zig) == .lt) {
@@ -39,4 +39,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
+
+    const interop_cmd = b.addSystemCommand(&.{ "bash", "interop/run.sh" });
+    interop_cmd.step.dependOn(&run_lib_tests.step);
+
+    const interop_step = b.step("interop", "Run OpenSSH/libssh interoperability tests");
+    interop_step.dependOn(&interop_cmd.step);
 }
