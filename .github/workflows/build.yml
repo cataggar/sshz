@@ -18,15 +18,31 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           path: misshod
-      - name: Setup Zig
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
-        with:
-          version: 0.16.0
-          mirror: https://github.com/ctaggart/zig/releases/download/v0.16.0
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="0.16.0"
+          case "${{ runner.os }}-${{ runner.arch }}" in
+            Linux-X64) zig_target="x86_64-linux" ;;
+            macOS-ARM64) zig_target="aarch64-macos" ;;
+            macOS-X64) zig_target="x86_64-macos" ;;
+            *)
+              echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2
+              exit 1
+              ;;
+          esac
+
+          archive="zig-${zig_target}-${version}.tar.xz"
+          zig_dir="${RUNNER_TEMP}/zig-${zig_target}-${version}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          echo "${zig_dir}" >> "${GITHUB_PATH}"
+          "${zig_dir}/zig" version
       - name: Build test
         run: zig build test
         working-directory: misshod
       - name: Build lib
         run: zig build
         working-directory: misshod
-
