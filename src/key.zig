@@ -18,6 +18,8 @@ pub const client_hostkey_algorithms = ed25519_name ++ "," ++
     rsa_sha2_512_name ++ "," ++
     rsa_sha2_256_name;
 
+const client_hostkey_preference = [_]SignatureAlgorithm{ .Ed25519, .EcdsaP256Sha256, .RsaSha512, .RsaSha256 };
+
 pub const MaxRsaBits = 4096;
 pub const MaxRsaBytes = MaxRsaBits / 8;
 pub const MaxPublicKeyBlobLen = 4 + ecdsa_p256_name.len + 4 + ecdsa_p256_curve_name.len + 4 + EcdsaP256.PublicKey.uncompressed_sec1_encoded_length;
@@ -378,8 +380,7 @@ pub fn writePublicKeyBlob(public_key: PublicKey, out: *Blob) KeyError![]const u8
 }
 
 pub fn selectHostKeyAlgorithm(peer_namelist: []const u8, private_key: ?*const PrivateKey) ?SignatureAlgorithm {
-    const preference = [_]SignatureAlgorithm{ .RsaSha512, .RsaSha256, .EcdsaP256Sha256, .Ed25519 };
-    for (preference) |alg| {
+    for (client_hostkey_preference) |alg| {
         if (!nameListContains(peer_namelist, alg.name())) continue;
         if (private_key) |key| {
             if (!key.supportsSignatureAlgorithm(alg)) continue;
@@ -520,6 +521,25 @@ test "client host key preference favors modern compact keys first" {
     try std.testing.expectEqualStrings(
         "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
         client_hostkey_algorithms,
+    );
+}
+
+test "host key selection follows advertised client preference" {
+    try std.testing.expectEqual(
+        SignatureAlgorithm.Ed25519,
+        selectHostKeyAlgorithm("rsa-sha2-256,rsa-sha2-512,ssh-rsa,ecdsa-sha2-nistp256,ssh-ed25519", null).?,
+    );
+    try std.testing.expectEqual(
+        SignatureAlgorithm.EcdsaP256Sha256,
+        selectHostKeyAlgorithm("rsa-sha2-256,rsa-sha2-512,ecdsa-sha2-nistp256", null).?,
+    );
+    try std.testing.expectEqual(
+        SignatureAlgorithm.RsaSha512,
+        selectHostKeyAlgorithm("rsa-sha2-256,rsa-sha2-512", null).?,
+    );
+    try std.testing.expectEqual(
+        SignatureAlgorithm.RsaSha256,
+        selectHostKeyAlgorithm("rsa-sha2-256", null).?,
     );
 }
 
