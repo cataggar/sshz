@@ -13,10 +13,10 @@ pub const rsa_key_name = "ssh-rsa";
 pub const rsa_sha2_256_name = "rsa-sha2-256";
 pub const rsa_sha2_512_name = "rsa-sha2-512";
 
-pub const client_hostkey_algorithms = rsa_sha2_512_name ++ "," ++
-    rsa_sha2_256_name ++ "," ++
+pub const client_hostkey_algorithms = ed25519_name ++ "," ++
     ecdsa_p256_name ++ "," ++
-    ed25519_name;
+    rsa_sha2_512_name ++ "," ++
+    rsa_sha2_256_name;
 
 pub const MaxRsaBits = 4096;
 pub const MaxRsaBytes = MaxRsaBits / 8;
@@ -514,6 +514,13 @@ test "nameListContains finds algorithm names exactly" {
     try std.testing.expect(nameListContains(client_hostkey_algorithms, rsa_sha2_512_name));
     try std.testing.expect(nameListContains(client_hostkey_algorithms, ed25519_name));
     try std.testing.expect(!nameListContains(client_hostkey_algorithms, "ssh-r"));
+}
+
+test "client host key preference favors modern compact keys first" {
+    try std.testing.expectEqualStrings(
+        "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
+        client_hostkey_algorithms,
+    );
 }
 
 test "mpint writer trims leading zeros and pads positive values" {
