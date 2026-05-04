@@ -5,6 +5,7 @@ pub const MaxChannels = 4;
 
 pub const ClientChannelOpenMode = enum {
     AutoShell,
+    AutoExec,
     RawSession,
 };
 

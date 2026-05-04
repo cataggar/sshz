@@ -776,6 +776,20 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
+        pub fn setAutoExecCommand(self: *Self, command: []const u8) MisshodError!void {
+            return switch (role) {
+                .Client => try self.session.setAutoExecCommand(command),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) MisshodError!void {
+            return switch (role) {
+                .Client => try self.session.setAutoPty(term, cols, rows, width_px, height_px),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
         pub fn openDirectTcpipChannel(
             self: *Self,
             host: []const u8,
