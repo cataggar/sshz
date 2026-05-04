@@ -86,6 +86,12 @@ pub const Session = struct {
     pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
     agent_forwarding_enabled: bool,
     agent_forwarding_requested: bool,
+    auto_pty_term: ?[]u8,
+    auto_pty_cols: u32,
+    auto_pty_rows: u32,
+    auto_pty_width_px: u32,
+    auto_pty_height_px: u32,
+    auto_exec_command: ?[]u8,
     kbd_interactive_response: ?[]u8, // allocated
     is_rekeying: bool,
 
@@ -115,6 +121,12 @@ pub const Session = struct {
             .pending_global_request = null,
             .agent_forwarding_enabled = false,
             .agent_forwarding_requested = false,
+            .auto_pty_term = null,
+            .auto_pty_cols = 80,
+            .auto_pty_rows = 24,
+            .auto_pty_width_px = 640,
+            .auto_pty_height_px = 480,
+            .auto_exec_command = null,
             .kbd_interactive_response = null,
             .is_rekeying = false,
         };
@@ -124,6 +136,8 @@ pub const Session = struct {
         self.clearAndFreeOptional(&self.privkey_ascii);
         self.clearAndFreeOptional(&self.privkey_passphrase);
         self.clearAndFreeOptional(&self.auth_passphrase);
+        self.clearAndFreeOptional(&self.auto_pty_term);
+        self.clearAndFreeOptional(&self.auto_exec_command);
         self.clearAndFreeOptional(&self.kbd_interactive_response);
         if (self.hostkey_ks) |ks| {
             std.crypto.secureZero(u8, ks);
@@ -441,7 +455,8 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelOpenReq => {
-                const chan = try self.allocateClientSessionChannel(.AutoShell);
+                const mode: ClientChannelOpenMode = if (self.auto_exec_command != null) .AutoExec else .AutoShell;
+                const chan = try self.allocateClientSessionChannel(mode);
                 self.active_channel_id = chan.local_id;
                 self.setSessionState(.ChannelActive);
             },
@@ -496,11 +511,11 @@ pub const Session = struct {
                 try pkt.writeU32(chan.remote_id);
                 try pkt.writeU32LenString("pty-req");
                 try pkt.writeBoolean(false); // want reply
-                try pkt.writeU32LenString("xterm-color");
-                try pkt.writeU32(80);
-                try pkt.writeU32(24);
-                try pkt.writeU32(640);
-                try pkt.writeU32(480);
+                try pkt.writeU32LenString(self.auto_pty_term orelse "xterm-color");
+                try pkt.writeU32(self.auto_pty_cols);
+                try pkt.writeU32(self.auto_pty_rows);
+                try pkt.writeU32(self.auto_pty_width_px);
+                try pkt.writeU32(self.auto_pty_height_px);
 
                 // magic pulled from observing OpenSSH connect
                 const termdata = &[_]u8{
@@ -556,8 +571,19 @@ pub const Session = struct {
                     try pkt.writeBoolean(false); // want reply
                     self.agent_forwarding_requested = true;
                 } else {
-                    try pkt.writeU32LenString("shell");
-                    try pkt.writeBoolean(false); // want reply
+                    switch (chan.client_open_mode) {
+                        .AutoShell => {
+                            try pkt.writeU32LenString("shell");
+                            try pkt.writeBoolean(false); // want reply
+                        },
+                        .AutoExec => {
+                            const command = self.auto_exec_command orelse return IoError.UnexpectedResponse;
+                            try pkt.writeU32LenString("exec");
+                            try pkt.writeBoolean(false); // want reply
+                            try pkt.writeU32LenString(command);
+                        },
+                        .RawSession => return IoError.UnexpectedResponse,
+                    }
                     chan.state = .Connected;
                 }
 
@@ -900,6 +926,22 @@ pub const Session = struct {
                 self.agent_forwarding_enabled = true;
             },
         }
+    }
+
+    pub fn setAutoExecCommand(self: *Self, command: []const u8) MisshodError!void {
+        if (self.channel_table.activeCount() != 0) return IoError.UnexpectedResponse;
+        self.clearAndFreeOptional(&self.auto_exec_command);
+        self.auto_exec_command = try self.allocator.dupe(u8, command);
+    }
+
+    pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) MisshodError!void {
+        if (self.channel_table.activeCount() != 0) return IoError.UnexpectedResponse;
+        self.clearAndFreeOptional(&self.auto_pty_term);
+        self.auto_pty_term = try self.allocator.dupe(u8, term);
+        self.auto_pty_cols = cols;
+        self.auto_pty_rows = rows;
+        self.auto_pty_width_px = width_px;
+        self.auto_pty_height_px = height_px;
     }
 
     pub fn setKeyboardInteractiveResponse(self: *Self, response: []const u8) MisshodError!void {
@@ -1327,7 +1369,7 @@ pub const Session = struct {
                     chan.peer_window = peer_window;
                     chan.remote_max_packet_size = max_packet_size;
                     switch (chan.client_open_mode) {
-                        .AutoShell => if (chan.channel_type == .Session) {
+                        .AutoShell, .AutoExec => if (chan.channel_type == .Session) {
                             chan.state = .Open;
                             self.active_channel_id = chan.local_id;
                             self.setSessionState(.ChannelActive);
@@ -1531,6 +1573,37 @@ fn expectProducedChannelRequest(m: *MisshodClient, expected_type: []const u8) !v
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try rdr.readU8());
     _ = try rdr.readU32(); // recipient channel
     try std.testing.expectEqualStrings(expected_type, try rdr.readU32LenString());
+}
+
+fn expectProducedPtyRequest(
+    m: *MisshodClient,
+    expected_term: []const u8,
+    expected_cols: u32,
+    expected_rows: u32,
+    expected_width_px: u32,
+    expected_height_px: u32,
+) !void {
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try rdr.readU8());
+    _ = try rdr.readU32(); // recipient channel
+    try std.testing.expectEqualStrings("pty-req", try rdr.readU32LenString());
+    try std.testing.expect(!(try rdr.readBoolean()));
+    try std.testing.expectEqualStrings(expected_term, try rdr.readU32LenString());
+    try std.testing.expectEqual(expected_cols, try rdr.readU32());
+    try std.testing.expectEqual(expected_rows, try rdr.readU32());
+    try std.testing.expectEqual(expected_width_px, try rdr.readU32());
+    try std.testing.expectEqual(expected_height_px, try rdr.readU32());
+}
+
+fn expectProducedExecRequest(m: *MisshodClient, expected_command: []const u8) !void {
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try rdr.readU8());
+    _ = try rdr.readU32(); // recipient channel
+    try std.testing.expectEqualStrings("exec", try rdr.readU32LenString());
+    try std.testing.expect(!(try rdr.readBoolean()));
+    try std.testing.expectEqualStrings(expected_command, try rdr.readU32LenString());
 }
 
 test "handlePacket: SSH_MSG_IGNORE is silently consumed" {
@@ -2236,9 +2309,52 @@ test "handlePacket: auto-shell confirmation still emits Connected" {
     try std.testing.expectEqual(ChannelState.Open, chan.state);
 
     try m.advance();
-    try expectProducedChannelRequest(&m, "pty-req");
+    try expectProducedPtyRequest(&m, "xterm-color", 80, 24, 640, 480);
     try m.consumed(m.wr_nbytes);
     try expectProducedChannelRequest(&m, "shell");
+    try m.consumed(m.wr_nbytes);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .Connected => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handlePacket: auto-exec confirmation sends pty then exec" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.setAutoExecCommand("zmx attach default");
+    try m.setAutoPty("xterm-ghostty", 123, 45, 984, 720);
+
+    const chan = m.session.channel_table.allocChannel(0, 0, 0).?;
+    chan.client_open_mode = .AutoExec;
+    chan.state = .OpenWrite;
+
+    var payload_backing: [32]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try pw.writeU32(chan.local_id); // recipient channel
+    try pw.writeU32(42); // sender channel
+    try pw.writeU32(32768); // initial window size
+    try pw.writeU32(4096); // max packet size
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    m.session.setSessionState(.ChannelOpenRsp);
+
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+    try std.testing.expectEqual(ChannelState.Open, chan.state);
+
+    try m.advance();
+    try expectProducedPtyRequest(&m, "xterm-ghostty", 123, 45, 984, 720);
+    try m.consumed(m.wr_nbytes);
+    try expectProducedExecRequest(&m, "zmx attach default");
     try m.consumed(m.wr_nbytes);
 
     const evt = try m.getNextEvent();
