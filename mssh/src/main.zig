@@ -284,6 +284,13 @@ pub fn main(init: std.process.Init) !void {
                 switch (ev) {
                     .Event => |eventCode| {
                         switch (eventCode) {
+                            .ServerIdentification => {
+                                try misshod.clearEvent(eventCode);
+                            },
+                            .AuthMethodStarted => |method| {
+                                std.debug.print("Trying authentication method: {s}\n", .{method.name()});
+                                try misshod.clearEvent(eventCode);
+                            },
                             .Connected => {
                                 std.debug.print("Connected!\n", .{});
                                 connected = true;
@@ -303,9 +310,18 @@ pub fn main(init: std.process.Init) !void {
                                 try misshod.clearEvent(eventCode);
                             },
                             .EndSession => |reason| {
-                                std.debug.print("Session ended: {any}\n", .{reason});
-                                if (reason == .AuthFailure) {
-                                    exit_code = 1;
+                                switch (reason) {
+                                    .AuthFailure => |failure| {
+                                        std.debug.print(
+                                            "AuthFailure: stage {d} after {s} (partial_success={any})\n",
+                                            .{ failure.auth_stage, failure.attempted_method.name(), failure.partial_success },
+                                        );
+                                        for (failure.supportedMethods()) |method| {
+                                            std.debug.print("  server method: {s}\n", .{method.name()});
+                                        }
+                                        exit_code = 1;
+                                    },
+                                    else => std.debug.print("Session ended: {any}\n", .{reason}),
                                 }
                                 quit = true;
                                 continue :outer;

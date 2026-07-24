@@ -68,11 +68,19 @@ pub const Session = struct {
     keydata: Protocol.KeyDataBi,
     rand: std.Random = undefined,
     encrypted: bool,
+    inbound_encrypted: bool,
     channel_table: ChannelTable,
     active_channel_id: ?u32,
     pending_global_request: ?PendingGlobalRequest,
     pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
     is_rekeying: bool,
+    pending_c2s_keys: ?Protocol.KeyDataUni,
+    pending_s2c_keys: ?Protocol.KeyDataUni,
+    negotiated_compression_c2s: Protocol.CompressionAlgorithm,
+    negotiated_compression_s2c: Protocol.CompressionAlgorithm,
+    client_version: ?[]u8,
+    server_version: ?[]u8,
+    pre_identification_lines: usize,
 
     privkey_ascii: ?[]u8, // allocated
     privkey_passphrase: ?[]u8, //allocated
@@ -91,6 +99,7 @@ pub const Session = struct {
             .rand = rand,
             .allocator = allocator,
             .encrypted = false,
+            .inbound_encrypted = false,
             .keydata = Protocol.KeyDataBi.init(),
             .kex_hasher = Hasher(Protocol.hash_algo).init(), // for hashing H
             .selected_hostkey_algorithm = null,
@@ -104,9 +113,18 @@ pub const Session = struct {
             .active_channel_id = null,
             .pending_global_request = null,
             .is_rekeying = false,
+            .pending_c2s_keys = null,
+            .pending_s2c_keys = null,
+            .negotiated_compression_c2s = .None,
+            .negotiated_compression_s2c = .None,
+            .client_version = null,
+            .server_version = null,
+            .pre_identification_lines = 0,
         };
 
         s.host_private_key = try decodeOpenSshPrivateKey(hostkey_ascii, null);
+        errdefer s.host_private_key.clear();
+        s.server_version = try allocator.dupe(u8, Protocol.version);
 
         return s;
     }
@@ -115,6 +133,9 @@ pub const Session = struct {
         self.clearAndFreeOptional(&self.privkey_ascii);
         self.clearAndFreeOptional(&self.privkey_passphrase);
         self.clearAndFreeOptional(&self.auth_passphrase);
+        self.clearAndFreeOptional(&self.client_version);
+        self.clearAndFreeOptional(&self.server_version);
+        self.clearPendingKeys();
         std.crypto.secureZero(u8, &self.shared_secret_k);
         std.crypto.secureZero(u8, &self.session_id);
         self.host_private_key.clear();
@@ -141,6 +162,63 @@ pub const Session = struct {
     pub fn setSessionState(self: *Self, newState: SessionState) void {
         TRACE(.Debug, "sessionState {any} -> {any}", .{ self.sessionState, newState });
         self.sessionState = newState;
+    }
+
+    pub fn setPeerProtocolVersion(self: *Self, version: []const u8) MisshodError!void {
+        self.clearAndFreeOptional(&self.client_version);
+        self.client_version = try self.allocator.dupe(u8, version);
+    }
+
+    fn resetKexHasherForRekey(self: *Self) void {
+        self.kex_hasher = Hasher(Protocol.hash_algo).init();
+        self.kex_hash_order = .Init;
+        self.kex_hash_order = self.kex_hash_order.check(.V_C);
+        self.kex_hasher.writeU32LenString(self.client_version.?);
+        self.kex_hash_order = self.kex_hash_order.check(.V_S);
+        self.kex_hasher.writeU32LenString(self.server_version.?);
+    }
+
+    fn clearPendingKeys(self: *Self) void {
+        if (self.pending_c2s_keys) |*keys| keys.clear();
+        if (self.pending_s2c_keys) |*keys| keys.clear();
+        self.pending_c2s_keys = null;
+        self.pending_s2c_keys = null;
+    }
+
+    fn installExchangeKeys(self: *Self, kexhash: [Protocol.hash_algo.digest_length]u8) MisshodError!void {
+        if (!self.is_rekeying) @memcpy(&self.session_id, &kexhash);
+        self.clearPendingKeys();
+        var pending = Protocol.KeyDataBi.init();
+        defer pending.clear();
+        try pending.genKeys(kexhash, self.shared_secret_k, self.session_id);
+        pending.c2s.compression.queueAlgorithm(self.negotiated_compression_c2s);
+        pending.s2c.compression.queueAlgorithm(self.negotiated_compression_s2c);
+        self.pending_c2s_keys = pending.c2s;
+        self.pending_s2c_keys = pending.s2c;
+        pending.c2s = .{ .seq = 0 };
+        pending.s2c = .{ .seq = 0 };
+    }
+
+    fn activatePendingC2sKeys(self: *Self) MisshodError!void {
+        var next = self.pending_c2s_keys orelse return IoError.UnexpectedResponse;
+        self.pending_c2s_keys = null;
+        next.seq = self.keydata.c2s.seq;
+        next.compression.applyPendingAlgorithm();
+        if (self.is_rekeying) try next.compression.activateInflate();
+        self.keydata.c2s.clear();
+        self.keydata.c2s = next;
+        self.inbound_encrypted = true;
+    }
+
+    fn activatePendingS2cKeys(self: *Self) MisshodError!void {
+        var next = self.pending_s2c_keys orelse return IoError.UnexpectedResponse;
+        self.pending_s2c_keys = null;
+        next.seq = self.keydata.s2c.seq;
+        next.compression.applyPendingAlgorithm();
+        if (self.is_rekeying) try next.compression.activateDeflate();
+        self.keydata.s2c.clear();
+        self.keydata.s2c = next;
+        self.encrypted = true;
     }
 
     pub fn grantAccess(self: *Self, allow: bool) MisshodError!void {
@@ -240,15 +318,12 @@ pub const Session = struct {
                 self.kex_hasher.final(&kexhash, null);
                 TRACEDUMP(.Debug, "kexhash: (len={d})", .{kexhash.len}, &kexhash);
 
-                @memcpy(&self.session_id, &kexhash); // store as session_id
-
                 const sig_alg = self.selected_hostkey_algorithm orelse self.host_private_key.defaultSignatureAlgorithm();
                 var typed_sig: Key.SignatureBlob = .{};
                 const sig = try self.host_private_key.sign(sig_alg, &kexhash, &typed_sig);
                 try pkt.writeU32LenString(sig);
 
-                // generate keys
-                try self.keydata.genKeys(kexhash, self.shared_secret_k, self.session_id);
+                try self.installExchangeKeys(kexhash);
 
                 misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
 
@@ -259,11 +334,8 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
-                self.keydata.s2c.compression.applyPendingAlgorithm();
-                if (self.is_rekeying) {
-                    try self.keydata.s2c.compression.activateDeflate();
-                }
                 misshod.requestWrite(wrapped, .Idle);
+                try self.activatePendingS2cKeys();
                 self.setSessionState(.NewKeysRead);
             },
             .NewKeysRead => {
@@ -636,10 +708,11 @@ pub const Session = struct {
 
     // special case as we write direct to stream before entering binary pkt mode
     pub fn writeProtocolVersion(self: *Self, buf: []u8) []const u8 {
-        const vers = std.fmt.bufPrint(buf, "{s}\r\n", .{Protocol.version}) catch unreachable;
-        TRACE(.Debug, "TX: version '{s}'", .{Protocol.version});
+        const server_version = self.server_version.?;
+        const vers = std.fmt.bufPrint(buf, "{s}\r\n", .{server_version}) catch unreachable;
+        TRACE(.Debug, "TX: version '{s}'", .{server_version});
         self.kex_hash_order = self.kex_hash_order.check(.V_S);
-        self.kex_hasher.writeU32LenString(Protocol.version);
+        self.kex_hasher.writeU32LenString(server_version);
         return vers;
     }
 
@@ -930,12 +1003,7 @@ pub const Session = struct {
                         return;
                     }
                     TRACE(.Info, "Re-keying initiated by peer", .{});
-                    self.kex_hasher = Hasher(Protocol.hash_algo).init();
-                    self.kex_hash_order = .Init;
-                    self.kex_hash_order = self.kex_hash_order.check(.V_C);
-                    self.kex_hasher.writeU32LenString(Protocol.version);
-                    self.kex_hash_order = self.kex_hash_order.check(.V_S);
-                    self.kex_hasher.writeU32LenString(Protocol.version);
+                    self.resetKexHasherForRekey();
                     self.is_rekeying = true;
                 }
 
@@ -983,8 +1051,8 @@ pub const Session = struct {
                     TRACE(.Info, "No mutual algorithm for compression_algorithms_server_to_client: peer offers '{s}', we can use '{s}'", .{ compression_s2c_namelist, Protocol.compression_algorithms });
                     return IoError.AlgorithmNegotiationFailed;
                 };
-                self.keydata.c2s.compression.queueAlgorithm(compression_c2s);
-                self.keydata.s2c.compression.queueAlgorithm(compression_s2c);
+                self.negotiated_compression_c2s = compression_c2s;
+                self.negotiated_compression_s2c = compression_s2c;
 
                 _ = try rdr.readU32LenString(); // language c2s
                 _ = try rdr.readU32LenString(); // language s2c
@@ -1020,11 +1088,7 @@ pub const Session = struct {
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS) => {
                 if (self.sessionState == .NewKeysRead) {
-                    self.keydata.c2s.compression.applyPendingAlgorithm();
-                    if (self.is_rekeying) {
-                        try self.keydata.c2s.compression.activateInflate();
-                    }
-                    self.encrypted = true;
+                    try self.activatePendingC2sKeys();
                     if (self.is_rekeying) {
                         self.is_rekeying = false;
                         self.setSessionState(.ChannelActive);
@@ -1408,6 +1472,137 @@ fn unencryptedPayload(packet: []const u8) []const u8 {
     const hdr = Protocol.readPktHdr(packet[0..Protocol.sizeof_PktHdr]);
     const payload_len = hdr.packet_length - hdr.padding_length - 1;
     return packet[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
+}
+
+fn decryptFirstBlockForTest(packet: []u8, keys: *Protocol.KeyDataUni) void {
+    var encrypted_block: [Protocol.AesCtrT.block_size]u8 = undefined;
+    @memcpy(&encrypted_block, packet[0..Protocol.AesCtrT.block_size]);
+    keys.aesctr.encrypt(&encrypted_block, packet[0..Protocol.AesCtrT.block_size]);
+    keys.seq +%= 1;
+}
+
+test "server rekey hashes retained exact client and server versions" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer session.deinit();
+
+    try session.setPeerProtocolVersion("SSH-2.0-exact_client comment");
+    session.clearAndFreeOptional(&session.server_version);
+    session.server_version = try std.testing.allocator.dupe(u8, "SSH-2.0-exact_server comment");
+    session.resetKexHasherForRekey();
+
+    var expected_hasher = Hasher(Protocol.hash_algo).init();
+    expected_hasher.writeU32LenString("SSH-2.0-exact_client comment");
+    expected_hasher.writeU32LenString("SSH-2.0-exact_server comment");
+    var expected: [Protocol.hash_algo.digest_length]u8 = undefined;
+    expected_hasher.final(&expected, null);
+    var actual: [Protocol.hash_algo.digest_length]u8 = undefined;
+    session.kex_hasher.final(&actual, null);
+
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "server rekey preserves initial session id for key derivation" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer session.deinit();
+
+    const original_session_id: [Protocol.hash_algo.digest_length]u8 = .{0x11} ** Protocol.hash_algo.digest_length;
+    const rekey_hash: [Protocol.hash_algo.digest_length]u8 = .{0x33} ** Protocol.hash_algo.digest_length;
+    const rekey_secret: [Protocol.kex_algo.shared_length]u8 = .{0x22} ** Protocol.kex_algo.shared_length;
+    session.session_id = original_session_id;
+    session.shared_secret_k = rekey_secret;
+    session.is_rekeying = true;
+
+    var expected = Protocol.KeyDataBi.init();
+    defer expected.clear();
+    try expected.genKeys(rekey_hash, rekey_secret, original_session_id);
+    var wrong = Protocol.KeyDataBi.init();
+    defer wrong.clear();
+    try wrong.genKeys(rekey_hash, rekey_secret, rekey_hash);
+
+    try session.installExchangeKeys(rekey_hash);
+
+    const pending_c2s = &session.pending_c2s_keys.?;
+    const pending_s2c = &session.pending_s2c_keys.?;
+    try std.testing.expectEqualSlices(u8, &original_session_id, &session.session_id);
+    try std.testing.expectEqualSlices(u8, &expected.c2s.iv, &pending_c2s.iv);
+    try std.testing.expectEqualSlices(u8, &expected.c2s.key, &pending_c2s.key);
+    try std.testing.expectEqualSlices(u8, &expected.c2s.mackey, &pending_c2s.mackey);
+    try std.testing.expectEqualSlices(u8, &expected.s2c.iv, &pending_s2c.iv);
+    try std.testing.expectEqualSlices(u8, &expected.s2c.key, &pending_s2c.key);
+    try std.testing.expectEqualSlices(u8, &expected.s2c.mackey, &pending_s2c.mackey);
+    try std.testing.expect(!std.mem.eql(u8, &wrong.c2s.key, &pending_c2s.key));
+}
+
+test "server rekey activates outbound and inbound keys at NEWKEYS boundaries" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    const session_id: [Protocol.hash_algo.digest_length]u8 = .{0x10} ** Protocol.hash_algo.digest_length;
+    const old_hash: [Protocol.hash_algo.digest_length]u8 = .{0x20} ** Protocol.hash_algo.digest_length;
+    const old_secret: [Protocol.kex_algo.shared_length]u8 = .{0x30} ** Protocol.kex_algo.shared_length;
+    const new_hash: [Protocol.hash_algo.digest_length]u8 = .{0x40} ** Protocol.hash_algo.digest_length;
+    const new_secret: [Protocol.kex_algo.shared_length]u8 = .{0x50} ** Protocol.kex_algo.shared_length;
+    m.session.session_id = session_id;
+    try m.session.keydata.genKeys(old_hash, old_secret, session_id);
+    m.session.encrypted = true;
+    m.session.inbound_encrypted = true;
+    m.session.is_rekeying = true;
+    m.session.shared_secret_k = new_secret;
+    try m.session.installExchangeKeys(new_hash);
+
+    var old_c2s = m.session.keydata.c2s;
+    defer old_c2s.clear();
+    var old_s2c = m.session.keydata.s2c;
+    const new_c2s_key = m.session.pending_c2s_keys.?.key;
+    const new_s2c_key = m.session.pending_s2c_keys.?.key;
+
+    m.session.setSessionState(.NewKeysWrite);
+    try m.session.advanceSession(&m);
+    const server_newkeys = try m.peek(Protocol.MaxSSHPacket);
+    try std.testing.expectEqualSlices(u8, &new_s2c_key, &m.session.keydata.s2c.key);
+    try std.testing.expectEqual(@as(u32, 1), m.session.keydata.s2c.seq);
+    try std.testing.expectEqualSlices(u8, &old_c2s.key, &m.session.keydata.c2s.key);
+    try std.testing.expect(m.session.pending_s2c_keys == null);
+    try std.testing.expect(m.session.pending_c2s_keys != null);
+
+    var verifier_prng = std.Random.DefaultPrng.init(7);
+    var verifier = try Misshod.MisshodClient.init(verifier_prng.random(), "testuser", std.testing.allocator);
+    defer verifier.deinit();
+    verifier.session.keydata.s2c.clear();
+    verifier.session.keydata.s2c = old_s2c;
+    old_s2c = .{ .seq = 0 };
+    verifier.session.inbound_encrypted = true;
+    @memcpy(verifier.iobuf_rd[0..server_newkeys.len], server_newkeys);
+    decryptFirstBlockForTest(verifier.iobuf_rd[0..server_newkeys.len], &verifier.session.keydata.s2c);
+    var server_rdr = try verifier.getRecvBuffer(
+        verifier.iobuf_rd[0..server_newkeys.len],
+        &verifier.session.keydata.s2c,
+    );
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS), try server_rdr.readU8());
+
+    var client_packet_buf: [Protocol.MaxSSHPacket]u8 = undefined;
+    var client_packet = BufferWriter.init(&client_packet_buf, Protocol.sizeof_PktHdr);
+    try client_packet.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
+    var client_prng = std.Random.DefaultPrng.init(99);
+    var client_rand = client_prng.random();
+    const wrapped_client_newkeys = try Protocol.wrapPkt(
+        &client_rand,
+        true,
+        &old_c2s,
+        &client_packet,
+        &client_packet_buf,
+    );
+    @memcpy(m.iobuf_rd[0..wrapped_client_newkeys.len], wrapped_client_newkeys);
+    decryptFirstBlockForTest(m.iobuf_rd[0..wrapped_client_newkeys.len], &m.session.keydata.c2s);
+    m.session.setSessionState(.NewKeysRead);
+    try m.session.handlePacket(m.iobuf_rd[0..wrapped_client_newkeys.len], &m);
+
+    try std.testing.expectEqualSlices(u8, &new_c2s_key, &m.session.keydata.c2s.key);
+    try std.testing.expectEqual(@as(u32, 1), m.session.keydata.c2s.seq);
+    try std.testing.expect(m.session.pending_c2s_keys == null);
 }
 
 test "handlePacket: direct-tcpip open emits request and accept confirms" {

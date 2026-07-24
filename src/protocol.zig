@@ -107,9 +107,38 @@ pub const MaxPayload = (MaxSSHPacket - (sizeof_PktHdr + 255 + mac_algo.key_lengt
 pub const MaxChannelDataLen = MaxPayload - 9;
 pub const MaxIVLen = 20; // number of bytes to generate for IVs
 pub const MaxKeyLen = 64; // number of bytes to generate for keys
+pub const MaxIdentificationLineLen = 255;
+pub const MaxPreIdentificationLines = 50;
 
 // https://datatracker.ietf.org/doc/html/rfc4253#section-4.2
-pub const version = "SSH-2.0-SSH_ZS-0.0.1";
+pub const version = "SSH-2.0-SSH_ZS_0.0.1";
+
+pub fn isValidIdentification(identification: []const u8) bool {
+    const prefix = if (std.mem.startsWith(u8, identification, "SSH-2.0-"))
+        "SSH-2.0-"
+    else if (std.mem.startsWith(u8, identification, "SSH-1.99-"))
+        "SSH-1.99-"
+    else
+        return false;
+
+    const remainder = identification[prefix.len..];
+    const comments_separator = std.mem.indexOfScalar(u8, remainder, ' ');
+    const software_version = if (comments_separator) |index| remainder[0..index] else remainder;
+    if (software_version.len == 0) return false;
+    for (software_version) |byte| {
+        const valid = (byte >= 0x21 and byte <= 0x2c) or (byte >= 0x2e and byte <= 0x7e);
+        if (!valid) return false;
+    }
+
+    if (comments_separator) |index| {
+        const comments = remainder[index + 1 ..];
+        for (comments) |byte| {
+            if (byte == 0 or byte == '\r' or byte == '\n') return false;
+        }
+        if (!std.unicode.utf8ValidateSlice(comments)) return false;
+    }
+    return true;
+}
 
 pub const hash_algo = std.crypto.hash.sha2.Sha256;
 pub const hash_algo_name = "hmac-sha2-256";
@@ -486,6 +515,25 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
         keysuni.seq +%= 1;
         return iobuf[0..packet_len];
     }
+}
+
+test "identification accepts valid UTF-8 comments" {
+    try std.testing.expect(isValidIdentification("SSH-2.0-server café 🚀"));
+}
+
+test "identification accepts SSH 1.99 compatibility version" {
+    try std.testing.expect(isValidIdentification("SSH-1.99-server compatibility"));
+}
+
+test "identification rejects hyphen in softwareversion" {
+    try std.testing.expect(!isValidIdentification("SSH-2.0-server-name comment"));
+}
+
+test "identification rejects invalid UTF-8 and forbidden comment bytes" {
+    try std.testing.expect(!isValidIdentification("SSH-2.0-server \x80"));
+    try std.testing.expect(!isValidIdentification("SSH-2.0-server comment\x00text"));
+    try std.testing.expect(!isValidIdentification("SSH-2.0-server comment\rtext"));
+    try std.testing.expect(!isValidIdentification("SSH-2.0-server comment\ntext"));
 }
 
 test "MsgId enum values match SSH RFC" {
