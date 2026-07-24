@@ -3,6 +3,77 @@ const posix = std.posix;
 const Misshod = @import("misshod");
 const MisshodClient = Misshod.MisshodClient;
 const SshOpenFailureReason = Misshod.SshOpenFailureReason;
+const known_hosts = @import("known_hosts.zig");
+
+const HostKeyMode = enum {
+    strict,
+    accept_new,
+    insecure_demo,
+};
+
+fn printUsage(program: []const u8) void {
+    std.debug.print(
+        \\Usage: {s} <username@host> <port> [options] [idfile]
+        \\
+        \\Host key verification (strict by default):
+        \\  --host-key-mode <strict|accept-new|insecure-demo>
+        \\  --strict-host-key-checking  Require a matching known_hosts entry
+        \\  --accept-new                Add new hosts, but reject changed keys
+        \\  --insecure-demo             DANGEROUS: accept every host key
+        \\  --known-hosts <path>        Override $HOME/.ssh/known_hosts
+        \\
+        \\Other options:
+        \\  -A, --agent-forward         Forward the local SSH agent
+        \\  -h, --help                  Show this help
+        \\
+    , .{program});
+}
+
+fn parseHostKeyMode(value: []const u8) !HostKeyMode {
+    if (std.mem.eql(u8, value, "strict")) return .strict;
+    if (std.mem.eql(u8, value, "accept-new")) return .accept_new;
+    if (std.mem.eql(u8, value, "insecure-demo") or std.mem.eql(u8, value, "insecure")) {
+        return .insecure_demo;
+    }
+    return error.InvalidHostKeyMode;
+}
+
+fn selectHostKeyMode(
+    selected: *?HostKeyMode,
+    mode: HostKeyMode,
+) !void {
+    if (selected.*) |previous| {
+        if (previous != mode) return error.ConflictingHostKeyModes;
+    }
+    selected.* = mode;
+}
+
+fn printHostKeyMismatch(
+    endpoint: []const u8,
+    path: []const u8,
+    fingerprint: []const u8,
+) void {
+    std.debug.print(
+        \\HOST KEY VERIFICATION FAILED: the key for {s} does not match {s}
+        \\Presented fingerprint: SHA256:{s}
+        \\Refusing to authenticate. Remove the stale entry manually after verifying the new key;
+        \\accept-new will not replace a changed key.
+        \\
+    , .{ endpoint, path, fingerprint });
+}
+
+fn printHostKeyUnknown(
+    endpoint: []const u8,
+    path: []const u8,
+    fingerprint: []const u8,
+) void {
+    std.debug.print(
+        \\HOST KEY VERIFICATION FAILED: no trusted key for {s} in {s}
+        \\Presented fingerprint: SHA256:{s}
+        \\Verify the fingerprint, then rerun with --accept-new to add this host.
+        \\
+    , .{ endpoint, path, fingerprint });
+}
 
 // Turn off echo and read a password
 fn readPassphrase(password_buf: []u8) ![]u8 {
@@ -195,28 +266,170 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
+            printUsage(args[0]);
+            return;
+        }
+    }
+
     if (args.len < 3) {
-        std.debug.print("{s} <username@host> <port> [-A|--agent-forward] [idfile]\n", .{args[0]});
+        printUsage(args[0]);
         std.process.exit(1);
     }
 
     const user_host = args[1];
-    const port = try std.fmt.parseInt(u16, args[2], 10);
+    const port = std.fmt.parseInt(u16, args[2], 10) catch {
+        std.debug.print("Invalid SSH port: {s}\n", .{args[2]});
+        printUsage(args[0]);
+        std.process.exit(1);
+    };
+    if (port == 0) {
+        std.debug.print("Invalid SSH port: 0\n", .{});
+        std.process.exit(1);
+    }
+
     var agent_forwarding = false;
     var idfile: ?[]const u8 = null;
-    var host_opt: ?[]u8 = null;
-    var user_opt: ?[]u8 = null;
+    var selected_host_key_mode: ?HostKeyMode = null;
+    var known_hosts_path_opt: ?[]const u8 = null;
 
     var arg_i: usize = 3;
     while (arg_i < args.len) : (arg_i += 1) {
-        if (std.mem.eql(u8, args[arg_i], "-A") or std.mem.eql(u8, args[arg_i], "--agent-forward")) {
+        const arg = args[arg_i];
+        if (std.mem.eql(u8, arg, "-A") or std.mem.eql(u8, arg, "--agent-forward")) {
             agent_forwarding = true;
+        } else if (std.mem.eql(u8, arg, "--host-key-mode")) {
+            arg_i += 1;
+            if (arg_i >= args.len) {
+                std.debug.print("--host-key-mode requires a value\n", .{});
+                printUsage(args[0]);
+                std.process.exit(1);
+            }
+            const mode = parseHostKeyMode(args[arg_i]) catch {
+                std.debug.print("Invalid host key mode: {s}\n", .{args[arg_i]});
+                printUsage(args[0]);
+                std.process.exit(1);
+            };
+            selectHostKeyMode(&selected_host_key_mode, mode) catch {
+                std.debug.print("Conflicting host key modes\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.startsWith(u8, arg, "--host-key-mode=")) {
+            const value = arg["--host-key-mode=".len..];
+            const mode = parseHostKeyMode(value) catch {
+                std.debug.print("Invalid host key mode: {s}\n", .{value});
+                printUsage(args[0]);
+                std.process.exit(1);
+            };
+            selectHostKeyMode(&selected_host_key_mode, mode) catch {
+                std.debug.print("Conflicting host key modes\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--strict-host-key-checking") or
+            std.mem.eql(u8, arg, "--strict"))
+        {
+            selectHostKeyMode(&selected_host_key_mode, .strict) catch {
+                std.debug.print("Conflicting host key modes\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--accept-new")) {
+            selectHostKeyMode(&selected_host_key_mode, .accept_new) catch {
+                std.debug.print("Conflicting host key modes\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--insecure-demo") or
+            std.mem.eql(u8, arg, "--insecure"))
+        {
+            selectHostKeyMode(&selected_host_key_mode, .insecure_demo) catch {
+                std.debug.print("Conflicting host key modes\n", .{});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, arg, "--known-hosts")) {
+            arg_i += 1;
+            if (arg_i >= args.len or args[arg_i].len == 0) {
+                std.debug.print("--known-hosts requires a path\n", .{});
+                printUsage(args[0]);
+                std.process.exit(1);
+            }
+            if (known_hosts_path_opt != null) {
+                std.debug.print("--known-hosts may only be specified once\n", .{});
+                std.process.exit(1);
+            }
+            known_hosts_path_opt = args[arg_i];
+        } else if (std.mem.startsWith(u8, arg, "--known-hosts=")) {
+            const path = arg["--known-hosts=".len..];
+            if (path.len == 0 or known_hosts_path_opt != null) {
+                std.debug.print("--known-hosts requires one non-empty path\n", .{});
+                std.process.exit(1);
+            }
+            known_hosts_path_opt = path;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            std.debug.print("Unknown option: {s}\n", .{arg});
+            printUsage(args[0]);
+            std.process.exit(1);
         } else if (idfile == null) {
-            idfile = args[arg_i];
+            idfile = arg;
         } else {
-            std.debug.print("{s} <username@host> <port> [-A|--agent-forward] [idfile]\n", .{args[0]});
+            printUsage(args[0]);
             std.process.exit(1);
         }
+    }
+
+    const host_key_mode = selected_host_key_mode orelse .strict;
+    const at_index = std.mem.lastIndexOfScalar(u8, user_host, '@') orelse {
+        std.debug.print("Bad username@host: {s}\n", .{user_host});
+        std.process.exit(1);
+    };
+    if (at_index == 0 or at_index + 1 == user_host.len) {
+        std.debug.print("Bad username@host: {s}\n", .{user_host});
+        std.process.exit(1);
+    }
+    const user = user_host[0..at_index];
+    const host = user_host[at_index + 1 ..];
+
+    var endpoint_buffer: [known_hosts.max_endpoint_length]u8 = undefined;
+    const endpoint = known_hosts.formatEndpoint(&endpoint_buffer, host, port) catch |err| {
+        std.debug.print("Invalid SSH endpoint {s}:{d}: {any}\n", .{ host, port, err });
+        std.process.exit(1);
+    };
+
+    const using_default_known_hosts = host_key_mode != .insecure_demo and
+        known_hosts_path_opt == null;
+    const known_hosts_path: ?[]const u8 = if (host_key_mode == .insecure_demo)
+        known_hosts_path_opt
+    else if (known_hosts_path_opt) |path|
+        path
+    else if (init.environ_map.get("HOME")) |home|
+        try std.fmt.allocPrint(allocator, "{s}/.ssh/known_hosts", .{home})
+    else {
+        std.debug.print(
+            "Cannot determine known_hosts path because HOME is unset; use --known-hosts <path>\n",
+            .{},
+        );
+        std.process.exit(1);
+    };
+
+    if (using_default_known_hosts and host_key_mode == .accept_new) {
+        const home = init.environ_map.get("HOME").?;
+        const ssh_directory = try std.fmt.allocPrint(allocator, "{s}/.ssh", .{home});
+        known_hosts.ensureDefaultSshDirectory(init.io, ssh_directory) catch |err| {
+            std.debug.print(
+                "Cannot safely create the default SSH directory {s}: {any}\n",
+                .{ ssh_directory, err },
+            );
+            std.process.exit(1);
+        };
+    }
+
+    if (host_key_mode == .insecure_demo) {
+        std.debug.print(
+            \\
+            \\*** WARNING: INSECURE DEMO MODE ENABLED ***
+            \\Host keys for {s} will not be verified. This is vulnerable to machine-in-the-middle attacks.
+            \\
+            \\
+        , .{endpoint});
     }
 
     const agent_sock_path = if (agent_forwarding)
@@ -227,22 +440,8 @@ pub fn main(init: std.process.Init) !void {
     else
         null;
 
-    var iter = std.mem.tokenizeSequence(u8, user_host, "@");
-    var i: usize = 0;
-    while (iter.next()) |item| {
-        switch (i) {
-            0 => user_opt = try allocator.dupe(u8, item),
-            1 => host_opt = try allocator.dupe(u8, item),
-            else => {
-                std.debug.print("Bad user@host\n", .{});
-                std.process.exit(1);
-            },
-        }
-        i += 1;
-    }
-
-    if (host_opt) |host| {
-        if (user_opt) |user| {
+    {
+        {
             var stream = connectTcp(init.io, host, port) catch |err| {
                 switch (err) {
                     error.ConnectionRefused => std.debug.print("ConnectionRefused\n", .{}),
@@ -321,18 +520,108 @@ pub fn main(init: std.process.Init) !void {
                                         }
                                         exit_code = 1;
                                     },
+                                    .HostKeyRejected => {
+                                        std.debug.print("Host key rejected; authentication was not attempted.\n", .{});
+                                        exit_code = 1;
+                                    },
                                     else => std.debug.print("Session ended: {any}\n", .{reason}),
                                 }
                                 quit = true;
                                 continue :outer;
                             },
                             .CheckHostKey => |keydata| {
-                                // make a decision about whether to accept host key
-                                // a real client could check ~/.ssh/known_hosts
                                 var fingerprint_buf: [44]u8 = undefined;
-                                const fingerprint = keydata.fingerprintStr(&fingerprint_buf);
-                                std.debug.print("Auto accepting host key {s}\n", .{fingerprint});
-                                try misshod.clearEvent(eventCode);
+                                const padded_fingerprint = keydata.fingerprintStr(&fingerprint_buf);
+                                const fingerprint = std.mem.trimEnd(u8, padded_fingerprint, "=");
+                                const raw_key = keydata.raw_key orelse {
+                                    std.debug.print(
+                                        "HOST KEY VERIFICATION FAILED for {s}: the server supplied no host key blob\n",
+                                        .{endpoint},
+                                    );
+                                    try misshod.rejectHostKey();
+                                    exit_code = 1;
+                                    quit = true;
+                                    continue :outer;
+                                };
+
+                                switch (host_key_mode) {
+                                    .strict => {
+                                        const result = known_hosts.checkFile(
+                                            init.io,
+                                            allocator,
+                                            known_hosts_path.?,
+                                            endpoint,
+                                            raw_key,
+                                        ) catch |err| {
+                                            std.debug.print(
+                                                \\HOST KEY VERIFICATION FAILED for {s}
+                                                \\known_hosts file: {s}
+                                                \\Presented fingerprint: SHA256:{s}
+                                                \\Could not safely parse or read known_hosts: {any}
+                                                \\
+                                            , .{ endpoint, known_hosts_path.?, fingerprint, err });
+                                            try misshod.rejectHostKey();
+                                            exit_code = 1;
+                                            quit = true;
+                                            continue :outer;
+                                        };
+                                        switch (result) {
+                                            .match => {},
+                                            .unknown => {
+                                                printHostKeyUnknown(endpoint, known_hosts_path.?, fingerprint);
+                                                try misshod.rejectHostKey();
+                                                exit_code = 1;
+                                                quit = true;
+                                                continue :outer;
+                                            },
+                                            .changed => {
+                                                printHostKeyMismatch(endpoint, known_hosts_path.?, fingerprint);
+                                                try misshod.rejectHostKey();
+                                                exit_code = 1;
+                                                quit = true;
+                                                continue :outer;
+                                            },
+                                        }
+                                    },
+                                    .accept_new => {
+                                        const result = known_hosts.acceptNew(
+                                            init.io,
+                                            allocator,
+                                            known_hosts_path.?,
+                                            endpoint,
+                                            raw_key,
+                                        ) catch |err| {
+                                            if (err == error.HostKeyChanged) {
+                                                printHostKeyMismatch(endpoint, known_hosts_path.?, fingerprint);
+                                            } else {
+                                                std.debug.print(
+                                                    \\HOST KEY VERIFICATION FAILED for {s}
+                                                    \\known_hosts file: {s}
+                                                    \\Presented fingerprint: SHA256:{s}
+                                                    \\Could not safely update known_hosts: {any}
+                                                    \\
+                                                , .{ endpoint, known_hosts_path.?, fingerprint, err });
+                                            }
+                                            try misshod.rejectHostKey();
+                                            exit_code = 1;
+                                            quit = true;
+                                            continue :outer;
+                                        };
+                                        if (result == .added) {
+                                            std.debug.print(
+                                                "Added host key for {s} to {s} (SHA256:{s})\n",
+                                                .{ endpoint, known_hosts_path.?, fingerprint },
+                                            );
+                                        }
+                                    },
+                                    .insecure_demo => {
+                                        std.debug.print(
+                                            "WARNING: insecure demo mode accepted the unverified host key for {s} (SHA256:{s})\n",
+                                            .{ endpoint, fingerprint },
+                                        );
+                                    },
+                                }
+                                try misshod.acceptHostKey();
                             },
                             .GetPrivateKey => {
                                 if (idfile) |path| {
@@ -504,10 +793,6 @@ pub fn main(init: std.process.Init) !void {
             if (exit_code != 0) {
                 std.process.exit(exit_code);
             }
-        } else {
-            std.debug.print("Bad/missing user\n", .{});
         }
-    } else {
-        std.debug.print("Bad/missing user\n", .{});
     }
 }

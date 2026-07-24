@@ -1,14 +1,13 @@
 const std = @import("std");
 const util = @import("util.zig");
 const TRACE = util.trace;
-const TRACEDUMP = util.tracedump;
+const UNSAFE_TRACEDUMP = util.unsafeTracedump;
 const Misshod = @import("misshod.zig").Misshod;
 const MisshodError = @import("misshod.zig").MisshodError;
 const IoError = @import("misshod.zig").IoError;
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
-const Hasher = @import("hasher.zig").Hasher;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const decodePrivKey = @import("privkey.zig").decodePrivKey;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
@@ -168,20 +167,195 @@ pub const hash_algo_name = "hmac-sha2-256";
 
 pub const kex_algo = std.crypto.dh.X25519;
 pub const kex_algo_name = "curve25519-sha256";
+pub const kex_algorithms = kex_algo_name;
 
 pub const srv_hostkey_algo = std.crypto.sign.Ed25519;
 pub const srv_hostkey_algo_name = "ssh-ed25519";
 
 pub const mac_algo = std.crypto.auth.hmac.sha2.HmacSha256;
 pub const mac_algo_name = "hmac-sha2-256";
+pub const mac_algorithms = mac_algo_name;
 
 pub const enc_algo = std.crypto.core.aes.Aes256;
 pub const enc_algo_name = "aes256-ctr";
+pub const encryption_algorithms = enc_algo_name;
 pub const AesCtrT = AesCtr(enc_algo);
 
 pub const compression_none = "none";
 pub const compression_zlib_openssh = "zlib@openssh.com";
 pub const compression_algorithms = compression_zlib_openssh ++ "," ++ compression_none;
+
+pub const AlgorithmRole = enum {
+    Client,
+    Server,
+};
+
+pub const AlgorithmOffers = struct {
+    kex: []const u8,
+    host_key: []const u8,
+    encryption_c2s: []const u8,
+    encryption_s2c: []const u8,
+    mac_c2s: []const u8,
+    mac_s2c: []const u8,
+    compression_c2s: []const u8,
+    compression_s2c: []const u8,
+};
+
+pub fn localAlgorithmOffers(host_key_algorithms: []const u8) AlgorithmOffers {
+    return .{
+        .kex = kex_algorithms,
+        .host_key = host_key_algorithms,
+        .encryption_c2s = encryption_algorithms,
+        .encryption_s2c = encryption_algorithms,
+        .mac_c2s = mac_algorithms,
+        .mac_s2c = mac_algorithms,
+        .compression_c2s = compression_algorithms,
+        .compression_s2c = compression_algorithms,
+    };
+}
+
+pub const KexInit = struct {
+    offers: AlgorithmOffers,
+    language_c2s: []const u8,
+    language_s2c: []const u8,
+    first_kex_packet_follows: bool,
+};
+
+pub const NegotiatedAlgorithms = struct {
+    host_key: []const u8,
+    compression_c2s: CompressionAlgorithm,
+    compression_s2c: CompressionAlgorithm,
+    ignore_next_peer_packet: bool,
+};
+
+pub const MaxNameListEntries: usize = 64;
+
+pub fn isValidNameList(namelist: []const u8, require_non_empty: bool) bool {
+    if (namelist.len == 0) return !require_non_empty;
+
+    var entry_count: usize = 0;
+    var names = std.mem.splitScalar(u8, namelist, ',');
+    while (names.next()) |name| {
+        entry_count += 1;
+        if (entry_count > MaxNameListEntries) return false;
+        if (name.len == 0) return false;
+        for (name) |byte| {
+            if (byte < 0x21 or byte > 0x7e or byte == ',') return false;
+        }
+
+        var prior = std.mem.splitScalar(u8, namelist, ',');
+        while (prior.next()) |candidate| {
+            if (candidate.ptr == name.ptr) break;
+            if (std.mem.eql(u8, candidate, name)) return false;
+        }
+    }
+    return true;
+}
+
+pub fn nameListContains(namelist: []const u8, target: []const u8) bool {
+    var names = std.mem.splitScalar(u8, namelist, ',');
+    while (names.next()) |name| {
+        if (std.mem.eql(u8, name, target)) return true;
+    }
+    return false;
+}
+
+fn firstName(namelist: []const u8) []const u8 {
+    return std.mem.sliceTo(namelist, ',');
+}
+
+fn selectClientPreferred(client_namelist: []const u8, server_namelist: []const u8) ?[]const u8 {
+    var client_names = std.mem.splitScalar(u8, client_namelist, ',');
+    while (client_names.next()) |client_name| {
+        if (nameListContains(server_namelist, client_name)) return client_name;
+    }
+    return null;
+}
+
+pub fn readKexInit(rdr: *BufferReader) MisshodError!KexInit {
+    _ = try rdr.readBytes(16);
+    const result: KexInit = .{
+        .offers = .{
+            .kex = try rdr.readU32LenString(),
+            .host_key = try rdr.readU32LenString(),
+            .encryption_c2s = try rdr.readU32LenString(),
+            .encryption_s2c = try rdr.readU32LenString(),
+            .mac_c2s = try rdr.readU32LenString(),
+            .mac_s2c = try rdr.readU32LenString(),
+            .compression_c2s = try rdr.readU32LenString(),
+            .compression_s2c = try rdr.readU32LenString(),
+        },
+        .language_c2s = try rdr.readU32LenString(),
+        .language_s2c = try rdr.readU32LenString(),
+        .first_kex_packet_follows = try rdr.readBoolean(),
+    };
+    _ = try rdr.readU32();
+    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+
+    inline for (std.meta.fields(AlgorithmOffers)) |field| {
+        if (!isValidNameList(@field(result.offers, field.name), true)) {
+            return IoError.AlgorithmNegotiationFailed;
+        }
+    }
+    if (!isValidNameList(result.language_c2s, false) or
+        !isValidNameList(result.language_s2c, false))
+    {
+        return IoError.AlgorithmNegotiationFailed;
+    }
+    return result;
+}
+
+pub fn negotiateAlgorithms(
+    peer: KexInit,
+    role: AlgorithmRole,
+    local_host_key_algorithms: []const u8,
+) MisshodError!NegotiatedAlgorithms {
+    inline for (std.meta.fields(AlgorithmOffers)) |field| {
+        if (!isValidNameList(@field(peer.offers, field.name), true)) {
+            return IoError.AlgorithmNegotiationFailed;
+        }
+    }
+    if (!isValidNameList(peer.language_c2s, false) or
+        !isValidNameList(peer.language_s2c, false))
+    {
+        return IoError.AlgorithmNegotiationFailed;
+    }
+    if (!isValidNameList(local_host_key_algorithms, true)) {
+        return IoError.AlgorithmNegotiationFailed;
+    }
+
+    const local = localAlgorithmOffers(local_host_key_algorithms);
+    const client = if (role == .Client) local else peer.offers;
+    const server = if (role == .Client) peer.offers else local;
+
+    const selected_kex = selectClientPreferred(client.kex, server.kex) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    const selected_host_key = selectClientPreferred(client.host_key, server.host_key) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    _ = selectClientPreferred(client.encryption_c2s, server.encryption_c2s) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    _ = selectClientPreferred(client.encryption_s2c, server.encryption_s2c) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    _ = selectClientPreferred(client.mac_c2s, server.mac_c2s) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    _ = selectClientPreferred(client.mac_s2c, server.mac_s2c) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    const selected_compression_c2s = selectClientPreferred(client.compression_c2s, server.compression_c2s) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    const selected_compression_s2c = selectClientPreferred(client.compression_s2c, server.compression_s2c) orelse
+        return IoError.AlgorithmNegotiationFailed;
+
+    const peer_guessed_correctly =
+        std.mem.eql(u8, firstName(peer.offers.kex), selected_kex) and
+        std.mem.eql(u8, firstName(peer.offers.host_key), selected_host_key);
+
+    return .{
+        .host_key = selected_host_key,
+        .compression_c2s = CompressionAlgorithm.fromName(selected_compression_c2s) orelse unreachable,
+        .compression_s2c = CompressionAlgorithm.fromName(selected_compression_s2c) orelse unreachable,
+        .ignore_next_peer_packet = peer.first_kex_packet_follows and !peer_guessed_correctly,
+    };
+}
 
 pub const channel_type_session = "session";
 pub const channel_type_auth_agent_openssh = "auth-agent@openssh.com";
@@ -227,15 +401,9 @@ pub const CompressionAlgorithm = enum {
 };
 
 pub fn selectCompressionAlgorithm(client_namelist: []const u8, server_namelist: []const u8) ?CompressionAlgorithm {
-    var client_iter = util.NameListTokenizer.init(client_namelist);
-    while (client_iter.next()) |client_name| {
-        const algorithm = CompressionAlgorithm.fromName(client_name) orelse continue;
-        var server_iter = util.NameListTokenizer.init(server_namelist);
-        while (server_iter.next()) |server_name| {
-            if (std.mem.eql(u8, client_name, server_name)) return algorithm;
-        }
-    }
-    return null;
+    if (!isValidNameList(client_namelist, true) or !isValidNameList(server_namelist, true)) return null;
+    const selected = selectClientPreferred(client_namelist, server_namelist) orelse return null;
+    return CompressionAlgorithm.fromName(selected);
 }
 
 pub const CompressionState = struct {
@@ -331,6 +499,16 @@ pub const CompressionState = struct {
                     return IoError.InvalidPacketSize;
                 }
                 if (self.inflate_stream.avail_in != 0) return IoError.tooBig;
+                if (self.inflate_stream.avail_out == 0) {
+                    var overflow_probe: [1]u8 = undefined;
+                    self.inflate_stream.next_out = @ptrCast(&overflow_probe);
+                    self.inflate_stream.avail_out = 1;
+                    const probe_rc = zlib.inflate(&self.inflate_stream, zlib.Z_SYNC_FLUSH);
+                    if (self.inflate_stream.avail_out == 0) return IoError.tooBig;
+                    if (probe_rc != zlib.Z_OK and probe_rc != zlib.Z_BUF_ERROR)
+                        return IoError.InvalidPacketSize;
+                    return output;
+                }
 
                 return output[0 .. output.len - self.inflate_stream.avail_out];
             },
@@ -377,17 +555,66 @@ pub const KeyDataUni = struct {
     key: [MaxKeyLen]u8 = undefined,
     mackey: [MaxKeyLen]u8 = undefined,
     seq: u32,
+    epoch: u64 = 0,
+    encrypted_bytes: u64 = 0,
+    encrypted_packets: u64 = 0,
+    activated_at_monotonic_tick: ?u64 = null,
     aesctr: AesCtrT = undefined,
     compression: CompressionState = .{},
 
+    pub fn activateEpoch(self: *KeyDataUni, previous_epoch: u64, activated_at: ?u64) MisshodError!void {
+        if (previous_epoch == std.math.maxInt(u64)) return IoError.KeyLifetimeExceeded;
+        self.epoch = previous_epoch + 1;
+        self.encrypted_bytes = 0;
+        self.encrypted_packets = 0;
+        self.activated_at_monotonic_tick = activated_at;
+    }
+
+    pub fn accountEncryptedPacket(self: *KeyDataUni, packet_len: usize) MisshodError!void {
+        self.encrypted_bytes = std.math.add(u64, self.encrypted_bytes, packet_len) catch
+            return IoError.KeyLifetimeExceeded;
+        self.encrypted_packets = std.math.add(u64, self.encrypted_packets, 1) catch
+            return IoError.KeyLifetimeExceeded;
+    }
+
     pub fn clear(self: *KeyDataUni) void {
+        self.compression.deinit();
         std.crypto.secureZero(u8, &self.iv);
         std.crypto.secureZero(u8, &self.key);
         std.crypto.secureZero(u8, &self.mackey);
-        self.compression.deinit();
+        self.aesctr.clear();
         self.seq = 0;
+        self.epoch = 0;
+        self.encrypted_bytes = 0;
+        self.encrypted_packets = 0;
+        self.activated_at_monotonic_tick = null;
     }
 };
+
+fn deriveKeyMaterial(out: []u8, data_kh: []const u8, discriminator: u8, session_id: []const u8) void {
+    var hasher = hash_algo.init(.{});
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
+    var digest: [hash_algo.digest_length]u8 = undefined;
+    defer std.crypto.secureZero(u8, &digest);
+
+    hasher.update(data_kh);
+    hasher.update(&.{discriminator});
+    hasher.update(session_id);
+    hasher.final(&digest);
+
+    var written: usize = @min(out.len, digest.len);
+    @memcpy(out[0..written], digest[0..written]);
+    while (written < out.len) {
+        std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
+        hasher = hash_algo.init(.{});
+        hasher.update(data_kh);
+        hasher.update(out[0..written]);
+        hasher.final(&digest);
+        const take: usize = @min(out.len - written, digest.len);
+        @memcpy(out[written .. written + take], digest[0..take]);
+        written += take;
+    }
+}
 
 pub const KeyDataBi = struct {
     const Self = @This();
@@ -409,65 +636,42 @@ pub const KeyDataBi = struct {
 
     // generate session keys from shared secret
     pub fn genKeys(self: *Self, H: [hash_algo.digest_length]u8, shared_secret_k: [kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
-
         // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
-
-        var hasher: Hasher(hash_algo) = undefined;
+        // The inputs are borrowed from session-owned state; only the encoded
+        // K || H scratch and derived state created here are owned here.
+        errdefer self.clear();
 
         // prepare contact(K,H) = K:mpint concat H:raw
         var backing: [4 + kex_algo.shared_length + 1 + hash_algo.digest_length]u8 = undefined; // 4 for len, 1 for possible padding
+        defer std.crypto.secureZero(u8, &backing);
         var khbuf = BufferWriter.init(&backing, 0);
         try khbuf.writeMpint(&shared_secret_k); // K
         try khbuf.writeBytes(&H); // H
         const data_kh = khbuf.payload;
 
         // c2s.iv
-        hasher = Hasher(hash_algo).init();
-        hasher.writeBytes(data_kh);
-        hasher.writeU8('A'); // "A"
-        hasher.writeBytes(&session_id); // session_id
-        hasher.final(&self.c2s.iv, data_kh);
-        TRACEDUMP(.Debug, "c2s.iv", .{}, &self.c2s.iv);
+        deriveKeyMaterial(&self.c2s.iv, data_kh, 'A', &session_id);
+        UNSAFE_TRACEDUMP(.Debug, "c2s.iv", .{}, &self.c2s.iv);
 
         // s2c.iv
-        hasher = Hasher(hash_algo).init();
-        hasher.writeBytes(data_kh);
-        hasher.writeU8('B'); // "B"
-        hasher.writeBytes(&session_id); // session_id
-        hasher.final(&self.s2c.iv, data_kh);
-        TRACEDUMP(.Debug, "s2c.iv", .{}, &self.s2c.iv);
+        deriveKeyMaterial(&self.s2c.iv, data_kh, 'B', &session_id);
+        UNSAFE_TRACEDUMP(.Debug, "s2c.iv", .{}, &self.s2c.iv);
 
         // c2s.key
-        hasher = Hasher(hash_algo).init();
-        hasher.writeBytes(data_kh);
-        hasher.writeU8('C'); // "C"
-        hasher.writeBytes(&session_id); // session_id
-        hasher.final(&self.c2s.key, data_kh);
-        TRACEDUMP(.Debug, "c2s.key", .{}, &self.c2s.key);
+        deriveKeyMaterial(&self.c2s.key, data_kh, 'C', &session_id);
+        UNSAFE_TRACEDUMP(.Debug, "c2s.key", .{}, &self.c2s.key);
 
         // s2c.key
-        hasher = Hasher(hash_algo).init();
-        hasher.writeBytes(data_kh);
-        hasher.writeU8('D'); // "D"
-        hasher.writeBytes(&session_id); // session_id
-        hasher.final(&self.s2c.key, data_kh);
-        TRACEDUMP(.Debug, "s2c.key", .{}, &self.s2c.key);
+        deriveKeyMaterial(&self.s2c.key, data_kh, 'D', &session_id);
+        UNSAFE_TRACEDUMP(.Debug, "s2c.key", .{}, &self.s2c.key);
 
         // c2s.mackey
-        hasher = Hasher(hash_algo).init();
-        hasher.writeBytes(data_kh);
-        hasher.writeU8('E'); // "E"
-        hasher.writeBytes(&session_id); // session_id
-        hasher.final(&self.c2s.mackey, data_kh);
-        TRACEDUMP(.Debug, "c2s.mackey", .{}, &self.c2s.mackey);
+        deriveKeyMaterial(&self.c2s.mackey, data_kh, 'E', &session_id);
+        UNSAFE_TRACEDUMP(.Debug, "c2s.mackey", .{}, &self.c2s.mackey);
 
         // s2c.mackey
-        hasher = Hasher(hash_algo).init();
-        hasher.writeBytes(data_kh);
-        hasher.writeU8('F'); // "F"
-        hasher.writeBytes(&session_id); // session_id
-        hasher.final(&self.s2c.mackey, data_kh);
-        TRACEDUMP(.Debug, "s2c.mackey", .{}, &self.s2c.mackey);
+        deriveKeyMaterial(&self.s2c.mackey, data_kh, 'F', &session_id);
+        UNSAFE_TRACEDUMP(.Debug, "s2c.mackey", .{}, &self.s2c.mackey);
 
         // setup aesctrs
         self.c2s.aesctr = AesCtrT.init(self.c2s.iv[0..AesCtrT.iv_size].*, self.c2s.key[0..AesCtrT.key_size].*);
@@ -482,8 +686,10 @@ pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer:
 pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, payload: []const u8, iobuf: []u8) MisshodError![]const u8 {
     // https://datatracker.ietf.org/doc/html/rfc4253#section-6
     if (payload.len > MaxPayload) return IoError.tooBig;
+    if (keysuni.seq == std.math.maxInt(u32)) return IoError.KeyLifetimeExceeded;
 
     var compressed_payload_buf: [MaxPayload]u8 = undefined;
+    defer std.crypto.secureZero(u8, &compressed_payload_buf);
     const packet_payload = try keysuni.compression.compressPayload(payload, &compressed_payload_buf);
     if (packet_payload.len > MaxPayload) return IoError.tooBig;
 
@@ -493,8 +699,10 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
     if (padding_length < 4) {
         padding_length += @intCast(AesCtrT.block_size);
     }
+
     const packet_len = sizeof_PktHdr + buffer_len + padding_length;
     if (packet_len > MaxSSHPacket or packet_len > iobuf.len) return IoError.tooBig;
+    if (encrypted and packet_len + mac_algo.key_length > iobuf.len) return IoError.tooBig;
 
     // construct header
     const hdr: PktHdr = .{
@@ -507,24 +715,25 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
     var rndbuf: [255]u8 = undefined; // block_size would do
     rand.bytes(rndbuf[0..padding_length]);
     @memcpy(iobuf[sizeof_PktHdr + packet_payload.len .. packet_len], rndbuf[0..padding_length]);
-
     if (encrypted) {
-        if (packet_len + mac_algo.key_length > iobuf.len) return IoError.tooBig;
         var out: [MaxSSHPacket]u8 = undefined;
 
-        TRACEDUMP(.Debug, "sendbuffer enc:plaintext", .{}, iobuf[0..packet_len]);
-        keysuni.aesctr.encrypt(iobuf[0..packet_len], out[0..packet_len]);
+        UNSAFE_TRACEDUMP(.Debug, "sendbuffer enc:plaintext", .{}, iobuf[0..packet_len]);
+        keysuni.aesctr.encrypt(iobuf[0..packet_len], out[0..packet_len]) catch
+            return IoError.KeyLifetimeExceeded;
 
         var mac: [mac_algo.key_length]u8 = undefined;
+        defer std.crypto.secureZero(u8, &mac);
         var m = mac_algo.init(keysuni.mackey[0..mac_algo.key_length]);
+        defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
         const seq = std.mem.nativeTo(u32, keysuni.seq, .big);
         m.update(std.mem.asBytes(&seq));
         m.update(iobuf[0..packet_len]); // plaintext
         m.final(&mac);
 
-        TRACEDUMP(.Debug, "mackey", .{}, keysuni.mackey[0..mac_algo.key_length]);
-        TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
-        TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..packet_len]);
+        UNSAFE_TRACEDUMP(.Debug, "mackey", .{}, keysuni.mackey[0..mac_algo.key_length]);
+        UNSAFE_TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
+        UNSAFE_TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..packet_len]);
 
         @memcpy(out[packet_len .. packet_len + mac_algo.key_length], &mac);
         const out_len = packet_len + mac_algo.key_length;
@@ -532,14 +741,27 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
         // Copy encrypted packet plus MAC back to the caller's output buffer.
         @memcpy(iobuf[0..out_len], out[0..out_len]);
 
-        TRACEDUMP(.Debug, "enc send", .{}, iobuf[0..out_len]);
+        UNSAFE_TRACEDUMP(.Debug, "enc send", .{}, iobuf[0..out_len]);
 
-        keysuni.seq +%= 1;
+        keysuni.seq += 1;
+        try keysuni.accountEncryptedPacket(packet_len);
         return iobuf[0..out_len];
     } else {
-        keysuni.seq +%= 1;
+        keysuni.seq += 1;
         return iobuf[0..packet_len];
     }
+}
+
+test "packet sequence hard bound fails before wrapping" {
+    var prng = std.Random.DefaultPrng.init(91);
+    var rand = prng.random();
+    var keys = KeyDataUni{ .seq = std.math.maxInt(u32) };
+    var output: [MaxSSHPacket]u8 = undefined;
+    try std.testing.expectError(
+        IoError.KeyLifetimeExceeded,
+        wrapPayload(&rand, false, &keys, &.{@intFromEnum(MsgId.SSH_MSG_IGNORE)}, &output),
+    );
+    try std.testing.expectEqual(std.math.maxInt(u32), keys.seq);
 }
 
 test "identification accepts valid UTF-8 comments" {
@@ -605,6 +827,136 @@ test "compression algorithm selection follows client preference" {
     try std.testing.expectEqual(CompressionAlgorithm.None, selectCompressionAlgorithm("none,zlib@openssh.com", compression_algorithms).?);
     try std.testing.expectEqual(CompressionAlgorithm.None, selectCompressionAlgorithm(compression_algorithms, "none").?);
     try std.testing.expect(selectCompressionAlgorithm("zstd@openssh.com", compression_algorithms) == null);
+}
+
+fn testKexInit() KexInit {
+    return .{
+        .offers = .{
+            .kex = kex_algorithms,
+            .host_key = srv_hostkey_algo_name,
+            .encryption_c2s = encryption_algorithms,
+            .encryption_s2c = encryption_algorithms,
+            .mac_c2s = mac_algorithms,
+            .mac_s2c = mac_algorithms,
+            .compression_c2s = compression_algorithms,
+            .compression_s2c = compression_algorithms,
+        },
+        .language_c2s = "",
+        .language_s2c = "",
+        .first_kex_packet_follows = false,
+    };
+}
+
+test "SSH name-list grammar rejects empty elements invalid bytes and duplicates" {
+    try std.testing.expect(isValidNameList("", false));
+    try std.testing.expect(!isValidNameList("", true));
+    try std.testing.expect(isValidNameList("curve25519-sha256,aes256-ctr", true));
+    try std.testing.expect(!isValidNameList(",aes256-ctr", true));
+    try std.testing.expect(!isValidNameList("aes256-ctr,", true));
+    try std.testing.expect(!isValidNameList("aes256-ctr,,none", true));
+    try std.testing.expect(!isValidNameList("aes256-ctr,aes256-ctr", true));
+    try std.testing.expect(!isValidNameList("aes256-ctr,\x7f", true));
+    try std.testing.expect(!isValidNameList("aes256 ctr", true));
+
+    var too_many: [MaxNameListEntries * 2 + 1]u8 = undefined;
+    for (0..MaxNameListEntries + 1) |index| {
+        if (index != 0) too_many[index * 2 - 1] = ',';
+        var name: u8 = @intCast(0x21 + index);
+        if (name >= ',') name += 1;
+        too_many[index * 2] = name;
+    }
+    try std.testing.expect(!isValidNameList(&too_many, true));
+}
+
+test "algorithm negotiation always follows client preference for both roles" {
+    var server_kexinit = testKexInit();
+    server_kexinit.offers.kex = "unsupported-kex,curve25519-sha256";
+    server_kexinit.offers.host_key = "rsa-sha2-256,ssh-ed25519";
+    server_kexinit.offers.compression_c2s = "none,zlib@openssh.com";
+    server_kexinit.offers.compression_s2c = "none,zlib@openssh.com";
+    server_kexinit.first_kex_packet_follows = true;
+
+    const as_client = try negotiateAlgorithms(
+        server_kexinit,
+        .Client,
+        "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
+    );
+    try std.testing.expectEqualStrings("ssh-ed25519", as_client.host_key);
+    try std.testing.expectEqual(CompressionAlgorithm.ZlibOpenSsh, as_client.compression_c2s);
+    try std.testing.expect(as_client.ignore_next_peer_packet);
+
+    var client_kexinit = testKexInit();
+    client_kexinit.offers.host_key = "rsa-sha2-256,rsa-sha2-512";
+    client_kexinit.offers.compression_c2s = "none,zlib@openssh.com";
+    client_kexinit.offers.compression_s2c = "none,zlib@openssh.com";
+    client_kexinit.first_kex_packet_follows = true;
+
+    const as_server = try negotiateAlgorithms(
+        client_kexinit,
+        .Server,
+        "rsa-sha2-512,rsa-sha2-256",
+    );
+    try std.testing.expectEqualStrings("rsa-sha2-256", as_server.host_key);
+    try std.testing.expectEqual(CompressionAlgorithm.None, as_server.compression_c2s);
+    try std.testing.expect(!as_server.ignore_next_peer_packet);
+}
+
+test "algorithm negotiation fails closed for every required category" {
+    inline for (std.meta.fields(AlgorithmOffers)) |field| {
+        var peer = testKexInit();
+        @field(peer.offers, field.name) = "unsupported-only";
+        try std.testing.expectError(
+            IoError.AlgorithmNegotiationFailed,
+            negotiateAlgorithms(peer, .Server, srv_hostkey_algo_name),
+        );
+        try std.testing.expectError(
+            IoError.AlgorithmNegotiationFailed,
+            negotiateAlgorithms(
+                peer,
+                .Client,
+                "ssh-ed25519,ecdsa-sha2-nistp256,rsa-sha2-512,rsa-sha2-256",
+            ),
+        );
+    }
+
+    var duplicate = testKexInit();
+    duplicate.offers.kex = "curve25519-sha256,curve25519-sha256";
+    try std.testing.expectError(
+        IoError.AlgorithmNegotiationFailed,
+        negotiateAlgorithms(duplicate, .Server, srv_hostkey_algo_name),
+    );
+}
+
+fn writeTestKexInitBody(writer: *BufferWriter, kexinit: KexInit) !void {
+    try writer.writeBytes(&(.{0x5a} ** 16));
+    inline for (std.meta.fields(AlgorithmOffers)) |field| {
+        try writer.writeU32LenString(@field(kexinit.offers, field.name));
+    }
+    try writer.writeU32LenString(kexinit.language_c2s);
+    try writer.writeU32LenString(kexinit.language_s2c);
+    try writer.writeBoolean(kexinit.first_kex_packet_follows);
+    try writer.writeU32(0);
+}
+
+test "KEXINIT parser validates name-lists and exact framing" {
+    var backing: [512]u8 = undefined;
+    var writer = BufferWriter.init(&backing, 0);
+    try writeTestKexInitBody(&writer, testKexInit());
+    var reader = BufferReader.init(writer.active());
+    _ = try readKexInit(&reader);
+
+    var malformed = testKexInit();
+    malformed.offers.kex = "curve25519-sha256,curve25519-sha256";
+    writer = BufferWriter.init(&backing, 0);
+    try writeTestKexInitBody(&writer, malformed);
+    reader = BufferReader.init(writer.active());
+    try std.testing.expectError(IoError.AlgorithmNegotiationFailed, readKexInit(&reader));
+
+    writer = BufferWriter.init(&backing, 0);
+    try writeTestKexInitBody(&writer, testKexInit());
+    try writer.writeU8(0);
+    reader = BufferReader.init(writer.active());
+    try std.testing.expectError(IoError.UnexpectedResponse, readKexInit(&reader));
 }
 
 test "zlib openssh compression streams round trip flushed packets" {
@@ -685,6 +1037,32 @@ test "zlib openssh decompression rejects invalid data" {
     try std.testing.expectError(IoError.InvalidPacketSize, decompressor.decompressPayload("not a zlib stream", &output));
 }
 
+fn expectDecompressionBoundary(input_len: usize, output_len: usize, expect_overflow: bool) !void {
+    var input: [65]u8 = .{'A'} ** 65;
+    var compressed: [MaxPayload]u8 = undefined;
+    var output: [64]u8 = undefined;
+    var compressor = CompressionState{ .algorithm = .ZlibOpenSsh };
+    defer compressor.deinit();
+    var decompressor = CompressionState{ .algorithm = .ZlibOpenSsh };
+    defer decompressor.deinit();
+    try compressor.activateDeflate();
+    try decompressor.activateInflate();
+    const encoded = try compressor.compressPayload(input[0..input_len], &compressed);
+    if (expect_overflow) {
+        try std.testing.expectError(IoError.tooBig, decompressor.decompressPayload(encoded, output[0..output_len]));
+    } else {
+        const decoded = try decompressor.decompressPayload(encoded, output[0..output_len]);
+        try std.testing.expectEqual(input_len, decoded.len);
+        try std.testing.expectEqualSlices(u8, input[0..input_len], decoded);
+    }
+}
+
+test "zlib decompression output limit enforces below at and above" {
+    try expectDecompressionBoundary(63, 64, false);
+    try expectDecompressionBoundary(64, 64, false);
+    try expectDecompressionBoundary(65, 64, true);
+}
+
 test "wrapPayload preserves uncompressed payload with none compression" {
     var prng = std.Random.DefaultPrng.init(42);
     var keys = KeyDataUni{ .seq = 0 };
@@ -726,6 +1104,7 @@ test "wrapPayload compresses active zlib openssh payloads" {
 
 test "KeyDataBi.clear zeros all key material" {
     var kd = KeyDataBi.init();
+    try kd.genKeys(.{0x11} ** hash_algo.digest_length, .{0x22} ** kex_algo.shared_length, .{0x33} ** hash_algo.digest_length);
     // fill with non-zero data
     @memset(&kd.c2s.iv, 0xAA);
     @memset(&kd.c2s.key, 0xBB);
@@ -744,4 +1123,102 @@ test "KeyDataBi.clear zeros all key material" {
     try std.testing.expectEqualSlices(u8, &zero_iv, &kd.s2c.iv);
     try std.testing.expectEqualSlices(u8, &zero_key, &kd.s2c.key);
     try std.testing.expectEqualSlices(u8, &zero_key, &kd.s2c.mackey);
+    for (std.mem.asBytes(&kd.c2s.aesctr)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (std.mem.asBytes(&kd.s2c.aesctr)) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
+test "RFC 4253 key derivation known-answer values" {
+    var kd = KeyDataBi.init();
+    defer kd.clear();
+    try kd.genKeys(
+        .{0x11} ** hash_algo.digest_length,
+        .{0x22} ** kex_algo.shared_length,
+        .{0x33} ** hash_algo.digest_length,
+    );
+
+    try std.testing.expectEqualStrings(
+        "8441e455d5c7994f454d015def5da3f7b37f39b3",
+        &std.fmt.bytesToHex(kd.c2s.iv, .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "59a323f617d854218c353b19836fb3822e88f2dc",
+        &std.fmt.bytesToHex(kd.s2c.iv, .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "6c576d8021225f6a850479e89de9955a0b1dd72606a7a5bdc78644bb8454ff3e3581aaca0eb48ad49832316f26a2b0e58e6fb4234db5f755c91de7908dcd5159",
+        &std.fmt.bytesToHex(kd.c2s.key, .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "30bb139eea959f6f80edd3e7e201d9de7cf84e6531e1c0e319a0bcff6f85a7cefddc9a01e81335bec5301f1524c127024abbb1175440d33dffa42bb011616cc3",
+        &std.fmt.bytesToHex(kd.s2c.key, .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "891de80b5b0094a754825522d91f677ec5334e35ce41685e6e45a6a95389491b3430564ee9bb2e70404a980d0363d582fc3c617050deaaeb207c295cbe126f13",
+        &std.fmt.bytesToHex(kd.c2s.mackey, .lower),
+    );
+    try std.testing.expectEqualStrings(
+        "9bf2dcd1ba7dd872b42c633fe3e670e4e2f6ee706b3590f572641da35eee5de49fb889edccb61c0e8b243a1a1437dd7b70af415834c0600c12c0f04463d90757",
+        &std.fmt.bytesToHex(kd.s2c.mackey, .lower),
+    );
+}
+
+test "RFC 4231 HMAC-SHA-256 known-answer vector" {
+    var actual: [mac_algo.mac_length]u8 = undefined;
+    var hmac = mac_algo.init(&(.{0x0b} ** 20));
+    hmac.update("Hi There");
+    hmac.final(&actual);
+    try std.testing.expectEqualStrings(
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        &std.fmt.bytesToHex(actual, .lower),
+    );
+}
+
+test "NIST SP 800-38A AES-256-CTR known-answer vector" {
+    const key = [_]u8{
+        0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
+        0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
+        0x1f, 0x35, 0x2c, 0x07, 0x3b, 0x61, 0x08, 0xd7,
+        0x2d, 0x98, 0x10, 0xa3, 0x09, 0x14, 0xdf, 0xf4,
+    };
+    const iv = [_]u8{
+        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+        0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff,
+    };
+    const plaintext = [_]u8{
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+        0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+        0x30, 0xc8, 0x1c, 0x46, 0xa3, 0x5c, 0xe4, 0x11,
+        0xe5, 0xfb, 0xc1, 0x19, 0x1a, 0x0a, 0x52, 0xef,
+        0xf6, 0x9f, 0x24, 0x45, 0xdf, 0x4f, 0x9b, 0x17,
+        0xad, 0x2b, 0x41, 0x7b, 0xe6, 0x6c, 0x37, 0x10,
+    };
+    const expected = [_]u8{
+        0x60, 0x1e, 0xc3, 0x13, 0x77, 0x57, 0x89, 0xa5,
+        0xb7, 0xa7, 0xf5, 0x04, 0xbb, 0xf3, 0xd2, 0x28,
+        0xf4, 0x43, 0xe3, 0xca, 0x4d, 0x62, 0xb5, 0x9a,
+        0xca, 0x84, 0xe9, 0x90, 0xca, 0xca, 0xf5, 0xc5,
+        0x2b, 0x09, 0x30, 0xda, 0xa2, 0x3d, 0xe9, 0x4c,
+        0xe8, 0x70, 0x17, 0xba, 0x2d, 0x84, 0x98, 0x8d,
+        0xdf, 0xc9, 0xc5, 0x8d, 0xb6, 0x7a, 0xad, 0xa6,
+        0x13, 0xc2, 0xdd, 0x08, 0x45, 0x79, 0x41, 0xa6,
+    };
+
+    var aes = AesCtrT.init(iv, key);
+    defer aes.clear();
+    var actual: [plaintext.len]u8 = undefined;
+    try aes.encrypt(&plaintext, &actual);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "encrypted wrap capacity error does not expose plaintext" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var rand = prng.random();
+    var keys = KeyDataUni{ .seq = 0 };
+    defer keys.clear();
+    var iobuf: [AesCtrT.block_size * 2]u8 = .{0xA5} ** (AesCtrT.block_size * 2);
+
+    try std.testing.expectError(IoError.tooBig, wrapPayload(&rand, true, &keys, "secret payload", &iobuf));
+    try std.testing.expectEqualSlices(u8, &(.{0xA5} ** iobuf.len), &iobuf);
 }

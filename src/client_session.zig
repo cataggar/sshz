@@ -1,7 +1,7 @@
 const std = @import("std");
 const util = @import("util.zig");
 const TRACE = util.trace;
-const TRACEDUMP = util.tracedump;
+const UNSAFE_TRACEDUMP = util.unsafeTracedump;
 const Misshod = @import("misshod.zig");
 const MisshodClient = Misshod.MisshodClient;
 const MisshodError = Misshod.MisshodError;
@@ -34,7 +34,8 @@ pub const SessionState = enum {
     EcdhInitWrite,
     EcdhReply,
     CheckHostKey,
-    CheckHostKeyCompleted,
+    HostKeyDecision,
+    HostKeyRejected,
     NewKeysRead,
     NewKeysWrite,
     AuthServReq,
@@ -76,17 +77,20 @@ pub const Session = struct {
     const Self = @This();
 
     allocator: std.mem.Allocator,
+    limits: Misshod.ResourceLimits,
     ioSessionState: Protocol.IoSessionState,
     sessionState: SessionState,
 
-    ecdh_ephem_keypair: Protocol.kex_algo.KeyPair = undefined,
+    // Owned only while an ECDH exchange is in progress.
+    ecdh_ephem_keypair: Protocol.kex_algo.KeyPair = std.mem.zeroes(Protocol.kex_algo.KeyPair),
+    ecdh_ephem_keypair_active: bool,
     // In form U32LenString("ssh-ed25519"), U32LenString(secret)
     hostkey_ks: ?[]u8 = null, // K_S, allocated
-    shared_secret_k: [Protocol.kex_algo.shared_length]u8 = undefined, // K
+    shared_secret_k: [Protocol.kex_algo.shared_length]u8 = .{0} ** Protocol.kex_algo.shared_length, // K
     kex_hasher: Hasher(Protocol.hash_algo) = undefined, // for building H
     kex_hash_order: Protocol.KexHashOrder = .Init,
     selected_hostkey_algorithm: ?Key.SignatureAlgorithm,
-    session_id: [Protocol.hash_algo.digest_length]u8 = undefined,
+    session_id: [Protocol.hash_algo.digest_length]u8 = .{0} ** Protocol.hash_algo.digest_length,
     keydata: Protocol.KeyDataBi,
     username: []const u8,
     rand: std.Random = undefined,
@@ -107,6 +111,7 @@ pub const Session = struct {
     auto_exec_command: ?[]u8,
     kbd_interactive_response: ?[]u8, // allocated
     is_rekeying: bool,
+    rekey_resume_state: ?SessionState,
     client_version: ?[]u8,
     server_version: ?[]u8,
     pre_identification_lines: usize,
@@ -126,24 +131,37 @@ pub const Session = struct {
     negotiated_compression_c2s: Protocol.CompressionAlgorithm,
     negotiated_compression_s2c: Protocol.CompressionAlgorithm,
     pending_server_kexinit: ?[]u8,
+    ignore_next_kex_packet: bool,
 
     pub fn init(rand: std.Random, username: []const u8, allocator: std.mem.Allocator) !Self {
+        return initWithLimits(rand, username, allocator, .{});
+    }
+
+    pub fn initWithLimits(
+        rand: std.Random,
+        username: []const u8,
+        allocator: std.mem.Allocator,
+        limits: Misshod.ResourceLimits,
+    ) !Self {
+        try limits.validate();
         return .{
             .ioSessionState = .Init,
             .sessionState = .Init,
             .rand = rand,
             .allocator = allocator,
+            .limits = limits,
             .username = username,
             .encrypted = false,
             .inbound_encrypted = false,
             .keydata = Protocol.KeyDataBi.init(),
             .kex_hasher = Hasher(Protocol.hash_algo).init(), // for hashing H
             .selected_hostkey_algorithm = null,
+            .ecdh_ephem_keypair_active = false,
             .privkey_ascii = null,
             .privkey_passphrase = null,
             .auth_passphrase = null,
             .private_key = null,
-            .channel_table = ChannelTable{},
+            .channel_table = ChannelTable{ .limits = limits.channelLimits() },
             .active_channel_id = null,
             .pending_window_change = null,
             .pending_global_request = null,
@@ -157,6 +175,7 @@ pub const Session = struct {
             .auto_exec_command = null,
             .kbd_interactive_response = null,
             .is_rekeying = false,
+            .rekey_resume_state = null,
             .client_version = try allocator.dupe(u8, Protocol.version),
             .server_version = null,
             .pre_identification_lines = 0,
@@ -171,7 +190,51 @@ pub const Session = struct {
             .negotiated_compression_c2s = .None,
             .negotiated_compression_s2c = .None,
             .pending_server_kexinit = null,
+            .ignore_next_kex_packet = false,
         };
+    }
+
+    pub fn failClosed(self: *Self) void {
+        self.clearAndFreeOptional(&self.privkey_ascii);
+        self.clearAndFreeOptional(&self.privkey_passphrase);
+        self.clearAndFreeOptional(&self.auth_passphrase);
+        self.clearAndFreeOptional(&self.kbd_interactive_response);
+        self.clearAndFreeOptional(&self.auto_exec_command);
+        self.clearAndFreeOptional(&self.auto_pty_term);
+        self.clearPendingKeys();
+        self.clearAndFreeOptional(&self.pending_server_kexinit);
+        self.rekey_resume_state = null;
+        self.is_rekeying = false;
+        if (self.private_key) |*key| {
+            key.clear();
+            self.private_key = null;
+        }
+        self.channel_table.secureZeroAll();
+        self.active_channel_id = null;
+        self.pending_global_request = null;
+        self.keydata.clear();
+        self.clearKexState();
+        std.crypto.secureZero(u8, &self.session_id);
+        self.encrypted = false;
+        self.inbound_encrypted = false;
+    }
+
+    pub fn isActive(self: *const Self) bool {
+        return self.sessionState == .ChannelActive;
+    }
+
+    fn validatePeerChannel(self: *const Self, window: u32, packet_size: u32) MisshodError!void {
+        if (window > self.limits.max_channel_window or packet_size == 0 or
+            packet_size > self.limits.max_peer_packet_size)
+            return IoError.InvalidChannelParameters;
+    }
+
+    fn pendingBufferedData(self: *const Self) usize {
+        var total: usize = 0;
+        for (self.channel_table.channels) |slot| {
+            if (slot) |chan| total += chan.write_buf_nbytes;
+        }
+        return total;
     }
 
     pub fn deinit(self: *Self) void {
@@ -190,7 +253,7 @@ pub const Session = struct {
             self.allocator.free(ks);
             self.hostkey_ks = null;
         }
-        std.crypto.secureZero(u8, &self.shared_secret_k);
+        self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
         if (self.private_key) |*key| {
             key.clear();
@@ -208,8 +271,30 @@ pub const Session = struct {
         }
     }
 
+    fn clearEphemeralKeyPair(self: *Self) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(&self.ecdh_ephem_keypair));
+        self.ecdh_ephem_keypair_active = false;
+    }
+
+    fn clearKexState(self: *Self) void {
+        self.clearEphemeralKeyPair();
+        std.crypto.secureZero(u8, &self.shared_secret_k);
+        self.kex_hasher.clear();
+    }
+
+    fn clearPrivateKeyInputs(self: *Self) void {
+        self.clearAndFreeOptional(&self.privkey_ascii);
+        self.clearAndFreeOptional(&self.privkey_passphrase);
+    }
+
+    fn clearPrivateKeyMaterial(self: *Self) void {
+        self.clearPrivateKeyInputs();
+        if (self.private_key) |*key| key.clear();
+        self.private_key = null;
+    }
+
     pub fn setIoSessionState(self: *Self, newState: Protocol.IoSessionState) void {
-        TRACE(.Debug, "ioSessionState {any} -> {any}", .{ self.ioSessionState, newState });
+        TRACE(.Debug, "ioSessionState {s} -> {s}", .{ @tagName(self.ioSessionState), @tagName(newState) });
         self.ioSessionState = newState;
     }
 
@@ -246,12 +331,12 @@ pub const Session = struct {
         misshod: *MisshodClient,
         method: AuthMethod,
         packet: []const u8,
-    ) void {
+    ) MisshodError!void {
         const method_index = authMethodIndex(method);
         self.auth_attempts_total += 1;
         self.auth_stage_attempts_by_method[method_index] += 1;
         self.current_auth_method = method;
-        misshod.requestWrite(packet, .Idle);
+        try misshod.requestWrite(packet, .Idle);
         self.setSessionState(.AuthMethodQueued);
     }
 
@@ -285,12 +370,33 @@ pub const Session = struct {
     }
 
     fn resetKexHasherForRekey(self: *Self) void {
+        self.clearKexState();
         self.kex_hasher = Hasher(Protocol.hash_algo).init();
         self.kex_hash_order = .Init;
         self.kex_hash_order = self.kex_hash_order.check(.V_C);
         self.kex_hasher.writeU32LenString(self.client_version.?);
         self.kex_hash_order = self.kex_hash_order.check(.V_S);
         self.kex_hasher.writeU32LenString(self.server_version.?);
+    }
+
+    pub fn startLocalRekey(self: *Self) void {
+        std.debug.assert(self.encrypted and self.inbound_encrypted);
+        std.debug.assert(!self.is_rekeying);
+        self.resetKexHasherForRekey();
+        self.clearAndFreeOptional(&self.pending_server_kexinit);
+        self.rekey_resume_state = self.sessionState;
+        self.is_rekeying = true;
+        self.setSessionState(.KexInitWrite);
+        self.setIoSessionState(.Idle);
+    }
+
+    fn startPeerRekey(self: *Self, server_kexinit: []const u8) MisshodError!void {
+        if (self.is_rekeying) return IoError.UnexpectedResponse;
+        self.resetKexHasherForRekey();
+        self.clearAndFreeOptional(&self.pending_server_kexinit);
+        self.pending_server_kexinit = try self.allocator.dupe(u8, server_kexinit);
+        self.rekey_resume_state = self.sessionState;
+        self.is_rekeying = true;
     }
 
     fn clearPendingKeys(self: *Self) void {
@@ -300,7 +406,25 @@ pub const Session = struct {
         self.pending_s2c_keys = null;
     }
 
+    fn decodeValidatedPrivateKey(key_data: []const u8, passphrase: ?[]const u8) MisshodError!Key.PrivateKey {
+        var key = try decodeOpenSshPrivateKey(key_data, passphrase);
+        errdefer key.clear();
+        try key.validate();
+        return key;
+    }
+
+    fn bindVerifiedHostKey(self: *Self, server_hostkey: []const u8) MisshodError!void {
+        if (self.is_rekeying) {
+            const trusted_hostkey = self.hostkey_ks orelse return IoError.HostKeyChanged;
+            if (!std.mem.eql(u8, trusted_hostkey, server_hostkey)) return IoError.HostKeyChanged;
+            return;
+        }
+        if (self.hostkey_ks != null) return IoError.UnexpectedResponse;
+        self.hostkey_ks = try self.allocator.dupe(u8, server_hostkey);
+    }
+
     fn installExchangeKeys(self: *Self, kexhash: [Protocol.hash_algo.digest_length]u8) MisshodError!void {
+        defer std.crypto.secureZero(u8, &self.shared_secret_k);
         if (!self.is_rekeying) @memcpy(&self.session_id, &kexhash);
         self.clearPendingKeys();
         var pending = Protocol.KeyDataBi.init();
@@ -314,25 +438,31 @@ pub const Session = struct {
         pending.s2c = .{ .seq = 0 };
     }
 
-    fn activatePendingC2sKeys(self: *Self) MisshodError!void {
+    fn activatePendingC2sKeys(self: *Self, misshod: *MisshodClient) MisshodError!void {
         var next = self.pending_c2s_keys orelse return IoError.UnexpectedResponse;
         self.pending_c2s_keys = null;
+        errdefer next.clear();
         next.seq = self.keydata.c2s.seq;
+        try next.activateEpoch(self.keydata.c2s.epoch, misshod.keyActivationTime());
         next.compression.applyPendingAlgorithm();
-        if (self.is_rekeying) try next.compression.activateDeflate();
         self.keydata.c2s.clear();
         self.keydata.c2s = next;
+        next.clear();
+        if (self.is_rekeying) try self.keydata.c2s.compression.activateDeflate();
         self.encrypted = true;
     }
 
-    fn activatePendingS2cKeys(self: *Self) MisshodError!void {
+    fn activatePendingS2cKeys(self: *Self, misshod: *MisshodClient) MisshodError!void {
         var next = self.pending_s2c_keys orelse return IoError.UnexpectedResponse;
         self.pending_s2c_keys = null;
+        errdefer next.clear();
         next.seq = self.keydata.s2c.seq;
+        try next.activateEpoch(self.keydata.s2c.epoch, misshod.keyActivationTime());
         next.compression.applyPendingAlgorithm();
-        if (self.is_rekeying) try next.compression.activateInflate();
         self.keydata.s2c.clear();
         self.keydata.s2c = next;
+        next.clear();
+        if (self.is_rekeying) try self.keydata.s2c.compression.activateInflate();
         self.inbound_encrypted = true;
     }
 
@@ -422,14 +552,15 @@ pub const Session = struct {
                 self.rand.bytes(&cookie);
                 try pkt.writeBytes(&cookie);
 
-                try pkt.writeU32LenString(Protocol.kex_algo_name); // kex
-                try pkt.writeU32LenString(Key.client_hostkey_algorithms); // hostkey verification
-                try pkt.writeU32LenString(Protocol.enc_algo_name); // enc c2s
-                try pkt.writeU32LenString(Protocol.enc_algo_name); // enc s2c
-                try pkt.writeU32LenString(Protocol.mac_algo_name); // mac c2s
-                try pkt.writeU32LenString(Protocol.mac_algo_name); // mac s2c
-                try pkt.writeU32LenString(Protocol.compression_algorithms); // compression c2s
-                try pkt.writeU32LenString(Protocol.compression_algorithms); // compression s2c
+                const offers = Protocol.localAlgorithmOffers(Key.client_hostkey_algorithms);
+                try pkt.writeU32LenString(offers.kex);
+                try pkt.writeU32LenString(offers.host_key);
+                try pkt.writeU32LenString(offers.encryption_c2s);
+                try pkt.writeU32LenString(offers.encryption_s2c);
+                try pkt.writeU32LenString(offers.mac_c2s);
+                try pkt.writeU32LenString(offers.mac_s2c);
+                try pkt.writeU32LenString(offers.compression_c2s);
+                try pkt.writeU32LenString(offers.compression_s2c);
                 try pkt.writeU32LenString(""); // lang c2s
                 try pkt.writeU32LenString(""); // lang s2c
 
@@ -440,7 +571,7 @@ pub const Session = struct {
                 self.kex_hash_order = self.kex_hash_order.check(.I_C);
                 self.kex_hasher.writeU32LenString(pkt.active());
 
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 if (self.pending_server_kexinit) |server_kexinit| {
                     self.kex_hash_order = self.kex_hash_order.check(.I_S);
                     self.kex_hasher.writeU32LenString(server_kexinit);
@@ -454,16 +585,20 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .EcdhInitWrite => {
+                errdefer self.clearKexState();
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT));
 
                 var seed: [Protocol.kex_algo.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &seed);
                 self.rand.bytes(&seed);
+                self.clearEphemeralKeyPair();
                 self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generateDeterministic(seed) catch unreachable;
+                self.ecdh_ephem_keypair_active = true;
                 var q_c = self.ecdh_ephem_keypair.public_key;
                 try pkt.writeU32LenString(&q_c);
 
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.EcdhReply);
             },
             .EcdhReply => {
@@ -471,7 +606,7 @@ pub const Session = struct {
             },
             .CheckHostKey => {
                 if (self.is_rekeying) {
-                    // Skip host key check during re-key, already trusted
+                    // bindVerifiedHostKey already matched this key to the accepted identity.
                     self.setSessionState(.NewKeysRead);
                     self.setIoSessionState(.ReadPktHdr);
                 } else {
@@ -487,13 +622,10 @@ pub const Session = struct {
                             break :blk fp;
                         },
                     } }, .Idle);
-                    self.setSessionState(.CheckHostKeyCompleted);
+                    self.setSessionState(.HostKeyDecision);
                 }
             },
-            .CheckHostKeyCompleted => {
-                self.setSessionState(.NewKeysRead);
-                self.setIoSessionState(.ReadPktHdr);
-            },
+            .HostKeyDecision, .HostKeyRejected => {},
             .NewKeysRead => {
                 //std.debug.assert(false);
                 // FIXME explain why empty
@@ -503,11 +635,13 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
-                misshod.requestWrite(wrapped, .Idle);
-                try self.activatePendingC2sKeys();
+                try misshod.requestWrite(wrapped, .Idle);
+                try self.activatePendingC2sKeys(misshod);
                 if (self.is_rekeying) {
+                    const resume_state = self.rekey_resume_state orelse .ChannelActive;
                     self.is_rekeying = false;
-                    self.setSessionState(.ChannelActive);
+                    self.rekey_resume_state = null;
+                    self.setSessionState(resume_state);
                 } else {
                     self.setSessionState(.AuthServReq);
                 }
@@ -517,7 +651,7 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_SERVICE_REQUEST));
                 try pkt.writeU32LenString("ssh-userauth");
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.AuthServRsp);
             },
             .AuthServRsp => {
@@ -541,10 +675,9 @@ pub const Session = struct {
                 try pkt.writeU32LenString("ssh-connection");
                 try pkt.writeU32LenString("none");
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
-                self.commitAuthRequest(misshod, .None, wrapped);
+                try self.commitAuthRequest(misshod, .None, wrapped);
             },
             .GetPrivateKeyCompleted => {
-                TRACE(.Debug, "self.privkey_ascii = {any}", .{self.privkey_ascii});
                 if (self.privkey_ascii != null) {
                     self.setSessionState(.PubkeyAuthDecodeKeyPasswordless);
                 } else if (self.lastAuthFailure()) |failure| {
@@ -556,13 +689,13 @@ pub const Session = struct {
             },
             .PubkeyAuthDecodeKeyPasswordless => {
                 if (self.privkey_ascii) |privkey_ascii| { // have private key
+                    errdefer self.clearPrivateKeyInputs();
                     // attempt passwordless
                     if (self.private_key) |*old| {
                         old.clear();
                         self.private_key = null;
                     }
-                    self.private_key = decodeOpenSshPrivateKey(privkey_ascii, null) catch |err| {
-                        // free privkey_ascii
+                    self.private_key = decodeValidatedPrivateKey(privkey_ascii, null) catch |err| {
                         switch (err) {
                             PrivKeyError.InvalidKeyDecrypt => {
                                 // need a passphrase to decode key
@@ -575,6 +708,7 @@ pub const Session = struct {
                             },
                         }
                     };
+                    self.clearPrivateKeyInputs();
                     // key decoded ok, so must have been passwordless
                     self.setSessionState(.PubkeyAuthStart);
                 } else {
@@ -587,6 +721,7 @@ pub const Session = struct {
                 self.setSessionState(.PubkeyAuthReq);
             },
             .PubkeyAuthReq => {
+                defer self.clearPrivateKeyMaterial();
                 try self.ensureAuthMethodAvailable(.PublicKey);
                 // https://datatracker.ietf.org/doc/html/rfc4252#section-7
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
@@ -608,6 +743,7 @@ pub const Session = struct {
                 try pkt.writeU32LenString(typed_pubkey);
 
                 var backing_sigbuffer_buf: [1024]u8 = undefined;
+                defer std.crypto.secureZero(u8, &backing_sigbuffer_buf);
                 var sigbuffer = BufferWriter.init(&backing_sigbuffer_buf, 0);
                 try sigbuffer.writeU32LenString(&self.session_id);
                 try sigbuffer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
@@ -619,12 +755,13 @@ pub const Session = struct {
                 try sigbuffer.writeU32LenString(typed_pubkey);
 
                 var typed_sig: Key.SignatureBlob = .{};
+                defer typed_sig.clear();
                 const sig = try private_key.sign(sig_alg, sigbuffer.active(), &typed_sig);
-                TRACEDUMP(.Debug, "sigbytes", .{}, sig);
+                UNSAFE_TRACEDUMP(.Debug, "sigbytes", .{}, sig);
                 try pkt.writeU32LenString(sig);
 
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
-                self.commitAuthRequest(misshod, .PublicKey, wrapped);
+                try self.commitAuthRequest(misshod, .PublicKey, wrapped);
             },
             .PubkeyAuthDecodeKeyPassword => {
                 // attempt decode with passphrase
@@ -633,15 +770,22 @@ pub const Session = struct {
                     old.clear();
                     self.private_key = null;
                 }
-                self.private_key = decodeOpenSshPrivateKey(self.privkey_ascii.?, self.privkey_passphrase) catch {
-                    self.skipAuthMethod(.PublicKey);
-                    if (self.lastAuthFailure()) |failure| {
-                        try self.continueAuthentication(misshod, failure);
-                    } else {
-                        self.preparePasswordAuth(misshod);
+                self.private_key = decodeValidatedPrivateKey(self.privkey_ascii.?, self.privkey_passphrase) catch |err| {
+                    self.clearPrivateKeyInputs();
+                    switch (err) {
+                        PrivKeyError.InvalidKeyDecrypt => {
+                            self.skipAuthMethod(.PublicKey);
+                            if (self.lastAuthFailure()) |failure| {
+                                try self.continueAuthentication(misshod, failure);
+                            } else {
+                                self.preparePasswordAuth(misshod);
+                            }
+                            return;
+                        },
+                        else => return err,
                     }
-                    return;
                 };
+                self.clearPrivateKeyInputs();
                 // key decode ok, continue with pubkey
                 self.setSessionState(.PubkeyAuthStart);
             },
@@ -650,6 +794,7 @@ pub const Session = struct {
                 self.setSessionState(.PasswordAuthReq);
             },
             .PasswordAuthReq => {
+                defer self.clearAndFreeOptional(&self.auth_passphrase);
                 try self.ensureAuthMethodAvailable(.Password);
                 std.debug.assert(self.auth_passphrase != null);
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
@@ -662,7 +807,7 @@ pub const Session = struct {
                 try pkt.writeBoolean(false);
                 try pkt.writeU32LenString(self.auth_passphrase.?);
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
-                self.commitAuthRequest(misshod, .Password, wrapped);
+                try self.commitAuthRequest(misshod, .Password, wrapped);
             },
             .KeyboardInteractiveAuthStart => {
                 self.setSessionState(.KeyboardInteractiveAuthReq);
@@ -678,9 +823,10 @@ pub const Session = struct {
                 try pkt.writeU32LenString(""); // language tag
                 try pkt.writeU32LenString(""); // submethods
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
-                self.commitAuthRequest(misshod, .KeyboardInteractive, wrapped);
+                try self.commitAuthRequest(misshod, .KeyboardInteractive, wrapped);
             },
             .KeyboardInteractiveInfoRsp => {
+                defer self.clearAndFreeOptional(&self.kbd_interactive_response);
                 // RFC 4256 §3.4 - send response to info request
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_INFO_RESPONSE));
@@ -690,8 +836,7 @@ pub const Session = struct {
                 } else {
                     try pkt.writeU32LenString("");
                 }
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
-                self.clearAndFreeOptional(&self.kbd_interactive_response);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.AuthRsp);
             },
             .AuthMethodQueued => {
@@ -756,15 +901,15 @@ pub const Session = struct {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-5.1
                 try pkt.writeU32LenString(chan.channel_type.name()); // https://datatracker.ietf.org/doc/html/rfc4250#section-4.9.1
                 try pkt.writeU32(chan.local_id); // sender channel
-                try pkt.writeU32(Protocol.MaxChannelDataLen); // initial window size
-                try pkt.writeU32(Protocol.MaxChannelDataLen); // maximum channel data size
+                try pkt.writeU32(self.limits.initial_channel_window);
+                try pkt.writeU32(self.limits.channel_packet_size);
                 if (chan.channel_type.hasTcpipOpenPayload()) {
                     try pkt.writeU32LenString(chan.tcpip_open.host);
                     try pkt.writeU32(chan.tcpip_open.port);
                     try pkt.writeU32LenString(chan.tcpip_open.originator_host);
                     try pkt.writeU32(chan.tcpip_open.originator_port);
                 }
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 self.setSessionState(.ChannelOpenRsp);
             },
             .Open => {
@@ -772,6 +917,7 @@ pub const Session = struct {
                     chan.state = .Data;
                     return;
                 }
+                defer self.clearAndFreeOptional(&self.auto_pty_term);
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
                 try pkt.writeU32(chan.remote_id);
@@ -825,7 +971,7 @@ pub const Session = struct {
                 };
                 try pkt.writeU32LenString(termdata);
 
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 chan.state = .RspWrite;
             },
             .RspWrite => {
@@ -844,6 +990,7 @@ pub const Session = struct {
                         },
                         .AutoExec => {
                             const command = self.auto_exec_command orelse return IoError.UnexpectedResponse;
+                            defer self.clearAndFreeOptional(&self.auto_exec_command);
                             try pkt.writeU32LenString("exec");
                             try pkt.writeBoolean(false); // want reply
                             try pkt.writeU32LenString(command);
@@ -853,7 +1000,7 @@ pub const Session = struct {
                     chan.state = .Connected;
                 }
 
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .Connected => {
                 switch (chan.kind) {
@@ -876,7 +1023,7 @@ pub const Session = struct {
                     try pkt.writeU32(wc[1]); // rows
                     try pkt.writeU32(wc[2]); // width_px
                     try pkt.writeU32(wc[3]); // height_px
-                    misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                    try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                 } else if (chan.needsWindowAdjust()) {
                     // RFC 4254 §5.2 — replenish receive window
                     var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
@@ -884,8 +1031,8 @@ pub const Session = struct {
                     try pkt.writeU32(chan.remote_id);
                     const adjust = chan.windowAdjustAmount();
                     try pkt.writeU32(adjust);
-                    chan.local_window += adjust;
-                    misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                    chan.local_window = chan.local_window_target;
+                    try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
                     chan.state = .DataRx;
                     self.active_channel_id = null;
                 } else {
@@ -939,10 +1086,10 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
                 try pkt.writeU32(chan.remote_id);
                 try pkt.writeU32(chan.local_id);
-                try pkt.writeU32(Protocol.MaxChannelDataLen);
-                try pkt.writeU32(Protocol.MaxChannelDataLen);
+                try pkt.writeU32(self.limits.initial_channel_window);
+                try pkt.writeU32(self.limits.channel_packet_size);
                 chan.state = if (chan.kind == .AgentForward or chan.channel_type == .Session) .Connected else .Data;
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .OpenFailureWrite => {
                 var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
@@ -954,7 +1101,7 @@ pub const Session = struct {
                 const local_id = chan.local_id;
                 self.channel_table.freeChannel(local_id);
                 self.active_channel_id = null;
-                misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
+                try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
             },
             .OpenSent => {
                 self.setIoSessionState(.ReadPktHdr);
@@ -968,7 +1115,7 @@ pub const Session = struct {
             if (chan.write_buf_nbytes > 0) {
                 return &.{};
             } else {
-                return &chan.write_buf;
+                return chan.write_buf[0..chan.max_buffered_data];
             }
         }
         return &.{};
@@ -1034,7 +1181,8 @@ pub const Session = struct {
         bind_address: []const u8,
         bind_port: u32,
     ) MisshodError!void {
-        if (misshod.iostate_wr != .Idle or self.active_channel_id != null or self.pending_global_request != null) {
+        if (self.pending_global_request != null) return IoError.ResourceLimitExceeded;
+        if (misshod.iostate_wr != .Idle or self.active_channel_id != null) {
             return IoError.cannotAcceptWrite;
         }
         if (self.sessionState != .ChannelActive) {
@@ -1063,7 +1211,7 @@ pub const Session = struct {
             .bind_address = stored_bind_address,
             .bind_port = bind_port,
         };
-        misshod.requestWrite(wrapped, .Idle);
+        try misshod.requestWrite(wrapped, .Idle);
     }
 
     pub fn requestRemoteForward(self: *Self, misshod: *MisshodClient, bind_address: []const u8, bind_port: u32) MisshodError!void {
@@ -1083,6 +1231,24 @@ pub const Session = struct {
         self.setIoSessionState(.Idle);
     }
 
+    pub fn acceptHostKey(self: *Self) MisshodError!void {
+        if (self.sessionState != .HostKeyDecision) return IoError.UnexpectedResponse;
+        self.setSessionState(.NewKeysRead);
+        self.setIoSessionState(.ReadPktHdr);
+    }
+
+    pub fn rejectHostKey(self: *Self, misshod: *MisshodClient) MisshodError!void {
+        if (self.sessionState != .HostKeyDecision) return IoError.UnexpectedResponse;
+        var fingerprint: [Protocol.hash_algo.digest_length]u8 = .{0} ** Protocol.hash_algo.digest_length;
+        if (self.hostkey_ks) |hostkey| Protocol.hash_algo.hash(hostkey, &fingerprint, .{});
+        self.setSessionState(.HostKeyRejected);
+        self.setIoSessionState(.Idle);
+        misshod.requestEvent(.{ .EndSession = .{ .HostKeyRejected = .{
+            .raw_key = self.hostkey_ks,
+            .fingerprint = fingerprint,
+        } } }, .Idle);
+    }
+
     pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) MisshodError!void {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
         if (chan.state != .Open) return IoError.UnexpectedResponse;
@@ -1095,30 +1261,30 @@ pub const Session = struct {
     }
 
     pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
-        const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
-        if (chan.eof_sent or chan.eof_pending or chan.close_sent or chan.close_pending or chan.close_received) return IoError.UnexpectedResponse;
-        if (nbytes > chan.write_buf.len) {
-            return IoError.tooBig;
-        }
-        if (chan.write_buf_nbytes != 0 or chan.tx_in_flight_len != 0) return IoError.UnexpectedResponse;
-        chan.write_buf_nbytes = nbytes;
-        self.active_channel_id = channel_id;
-
+        const chan = try self.queueChannelWrite(channel_id, nbytes);
         if (chan.state == .DataRx) {
             self.setSessionState(.ChannelActive);
             self.setIoSessionState(.Idle);
         }
     }
 
-    // Full-duplex: build and send channel data packet directly without going through state machine
-    pub fn directChannelWrite(self: *Self, channel_id: u32, nbytes: usize, misshod: *MisshodClient) MisshodError!void {
+    pub fn queueChannelWrite(self: *Self, channel_id: u32, nbytes: usize) MisshodError!*Channel {
         const chan = self.channel_table.findByLocalId(channel_id) orelse return IoError.UnexpectedResponse;
         if (chan.eof_sent or chan.eof_pending or chan.close_sent or chan.close_pending or chan.close_received) return IoError.UnexpectedResponse;
-        if (nbytes > chan.write_buf.len) {
+        if (nbytes > chan.max_buffered_data) {
             return IoError.tooBig;
         }
+        if (nbytes > self.limits.max_pending_buffered_data -| self.pendingBufferedData())
+            return IoError.ResourceLimitExceeded;
         if (chan.write_buf_nbytes != 0 or chan.tx_in_flight_len != 0) return IoError.UnexpectedResponse;
         chan.write_buf_nbytes = nbytes;
+        self.active_channel_id = channel_id;
+        return chan;
+    }
+
+    // Full-duplex: build and send channel data packet directly without going through state machine
+    pub fn directChannelWrite(self: *Self, channel_id: u32, nbytes: usize, misshod: *MisshodClient) MisshodError!void {
+        const chan = try self.queueChannelWrite(channel_id, nbytes);
         _ = try self.startChannelWrite(chan, misshod, &self.keydata.c2s);
     }
 
@@ -1128,7 +1294,8 @@ pub const Session = struct {
         misshod: *MisshodClient,
         outkeys: *Protocol.KeyDataUni,
     ) MisshodError!bool {
-        if (self.sessionState != .ChannelActive or self.is_rekeying or !chan.remote_id_known or chan.close_pending or
+        if (self.sessionState != .ChannelActive or self.is_rekeying or misshod.local_rekey_pending or
+            !chan.remote_id_known or chan.close_pending or
             chan.tx_in_flight_len != 0 or chan.write_buf_nbytes == 0)
         {
             return false;
@@ -1140,7 +1307,7 @@ pub const Session = struct {
         try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
         try pkt.writeU32(chan.remote_id);
         try pkt.writeU32LenString(chan.write_buf[0..send_len]);
-        misshod.requestWrite(
+        try misshod.requestWrite(
             try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr),
             .{ .ChannelWriteComplete = chan.local_id },
         );
@@ -1187,7 +1354,8 @@ pub const Session = struct {
         misshod: *MisshodClient,
         outkeys: *Protocol.KeyDataUni,
     ) MisshodError!bool {
-        if (self.sessionState != .ChannelActive or self.is_rekeying or !chan.remote_id_known or
+        if (self.sessionState != .ChannelActive or self.is_rekeying or misshod.local_rekey_pending or
+            !chan.remote_id_known or
             misshod.iostate_wr != .Idle or chan.write_buf_nbytes != 0 or
             chan.tx_in_flight_len != 0 or chan.control_in_flight != null)
         {
@@ -1208,7 +1376,7 @@ pub const Session = struct {
             .Close => Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE,
         }));
         try pkt.writeU32(chan.remote_id);
-        misshod.requestWrite(
+        try misshod.requestWrite(
             try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr),
             .{ .ChannelControlComplete = chan.local_id },
         );
@@ -1228,7 +1396,8 @@ pub const Session = struct {
     }
 
     pub fn dispatchDeferredChannelWrite(self: *Self, misshod: *MisshodClient) MisshodError!bool {
-        if (self.sessionState != .ChannelActive or self.is_rekeying or misshod.iostate_wr != .Idle) return false;
+        if (self.sessionState != .ChannelActive or self.is_rekeying or misshod.local_rekey_pending or
+            misshod.iostate_wr != .Idle) return false;
         for (0..MaxChannels) |_| {
             const chan = self.channel_table.findNextDeferredWrite() orelse return false;
             if ((chan.close_received or chan.close_pending) and chan.tx_in_flight_len == 0) {
@@ -1389,7 +1558,7 @@ pub const Session = struct {
         try pkt.writeU32(reason_code);
         try pkt.writeU32LenString(description);
         try pkt.writeU32LenString("");
-        misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.c2s, &pkt, &misshod.iobuf_wr), .Idle);
+        try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.c2s, &pkt, &misshod.iobuf_wr), .Idle);
     }
 
     fn readTcpipOpen(rdr: *BufferReader) MisshodError!TcpipOpen {
@@ -1427,6 +1596,7 @@ pub const Session = struct {
         const remote_id = try rdr.readU32();
         const peer_window = try rdr.readU32();
         const max_packet_size = try rdr.readU32();
+        try self.validatePeerChannel(peer_window, max_packet_size);
 
         if (Protocol.isAgentChannelType(chantype)) {
             if (!self.agent_forwarding_enabled) {
@@ -1539,104 +1709,80 @@ pub const Session = struct {
         var rdr = try misshod.getRecvBuffer(misshod.iobuf_rd[0..buf.len], &self.keydata.s2c);
 
         const msgid = try rdr.readU8();
+        try misshod.accountInboundMessage(msgid);
 
         TRACE(.Debug, "handlePacket msgId={d}", .{msgid});
-        TRACEDUMP(.Debug, "handlePacket", .{}, buf);
+        UNSAFE_TRACEDUMP(.Debug, "handlePacket", .{}, buf);
+
+        if (self.ignore_next_kex_packet) {
+            self.ignore_next_kex_packet = false;
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
 
         switch (msgid) {
             @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT) => {
+                errdefer self.clearKexState();
                 TRACE(.Debug, "{any}", .{@as(Protocol.MsgId, @enumFromInt(msgid))});
 
-                const is_rekey = self.sessionState != .KexInitRead;
-                if (is_rekey) {
-                    if (self.sessionState != .ChannelActive) {
-                        self.setIoSessionState(.ReadPktHdr);
-                        return;
-                    }
+                const initial_kex = self.sessionState == .KexInitRead and !self.is_rekeying and
+                    !self.encrypted and !self.inbound_encrypted;
+                const local_or_simultaneous_rekey = self.sessionState == .KexInitRead and self.is_rekeying;
+                const peer_initiated_rekey = !initial_kex and !local_or_simultaneous_rekey;
+                if (peer_initiated_rekey) {
                     // RFC 4253 §9 - peer-initiated re-keying
                     TRACE(.Info, "Re-keying initiated by peer", .{});
-                    self.resetKexHasherForRekey();
-                    self.is_rekeying = true;
-                    self.clearAndFreeOptional(&self.pending_server_kexinit);
-                    self.pending_server_kexinit = try self.allocator.dupe(u8, rdr.payload[(rdr.off - 1)..]);
+                    try self.startPeerRekey(rdr.payload[(rdr.off - 1)..]);
                 } else {
                     self.kex_hash_order = self.kex_hash_order.check(.I_S);
                     self.kex_hasher.writeU32LenString(rdr.payload[(rdr.off - 1)..]); // from before the msgid
                 }
 
-                // https://datatracker.ietf.org/doc/html/rfc4253#section-7.1
-                const cookie = try rdr.readBytes(16);
-                TRACEDUMP(.Debug, "cookie", .{}, cookie);
-
-                const kex_namelist = try rdr.readU32LenString();
-                if (!nameListContains(kex_namelist, Protocol.kex_algo_name)) {
-                    TRACE(.Info, "No mutual algorithm for kex_algorithms: peer offers '{s}', we need '{s}'", .{ kex_namelist, Protocol.kex_algo_name });
+                // RFC 4253 §7.1: every selection follows the client's order.
+                const peer_kexinit = try Protocol.readKexInit(&rdr);
+                const negotiated = try Protocol.negotiateAlgorithms(
+                    peer_kexinit,
+                    .Client,
+                    Key.client_hostkey_algorithms,
+                );
+                self.selected_hostkey_algorithm = Key.SignatureAlgorithm.fromName(negotiated.host_key) orelse
                     return IoError.AlgorithmNegotiationFailed;
-                }
-                const hostkey_namelist = try rdr.readU32LenString();
-                self.selected_hostkey_algorithm = Key.selectHostKeyAlgorithm(hostkey_namelist, null) orelse {
-                    TRACE(.Info, "No mutual algorithm for server_host_key_algorithms: peer offers '{s}', we need '{s}'", .{ hostkey_namelist, Key.client_hostkey_algorithms });
-                    return IoError.AlgorithmNegotiationFailed;
-                };
-                const required_algos = [_]struct { name: []const u8, required: []const u8 }{
-                    .{ .name = "encryption_algorithms_client_to_server", .required = Protocol.enc_algo_name },
-                    .{ .name = "encryption_algorithms_server_to_client", .required = Protocol.enc_algo_name },
-                    .{ .name = "mac_algorithms_client_to_server", .required = Protocol.mac_algo_name },
-                    .{ .name = "mac_algorithms_server_to_client", .required = Protocol.mac_algo_name },
-                };
+                self.negotiated_compression_c2s = negotiated.compression_c2s;
+                self.negotiated_compression_s2c = negotiated.compression_s2c;
+                self.ignore_next_kex_packet = negotiated.ignore_next_peer_packet;
 
-                for (required_algos) |algo| {
-                    const namelist = try rdr.readU32LenString();
-                    if (!nameListContains(namelist, algo.required)) {
-                        TRACE(.Info, "No mutual algorithm for {s}: peer offers '{s}', we need '{s}'", .{ algo.name, namelist, algo.required });
-                        return IoError.AlgorithmNegotiationFailed;
-                    }
-                }
-
-                const compression_c2s_namelist = try rdr.readU32LenString();
-                const compression_s2c_namelist = try rdr.readU32LenString();
-                const compression_c2s = Protocol.selectCompressionAlgorithm(Protocol.compression_algorithms, compression_c2s_namelist) orelse {
-                    TRACE(.Info, "No mutual algorithm for compression_algorithms_client_to_server: peer offers '{s}', we can use '{s}'", .{ compression_c2s_namelist, Protocol.compression_algorithms });
-                    return IoError.AlgorithmNegotiationFailed;
-                };
-                const compression_s2c = Protocol.selectCompressionAlgorithm(Protocol.compression_algorithms, compression_s2c_namelist) orelse {
-                    TRACE(.Info, "No mutual algorithm for compression_algorithms_server_to_client: peer offers '{s}', we can use '{s}'", .{ compression_s2c_namelist, Protocol.compression_algorithms });
-                    return IoError.AlgorithmNegotiationFailed;
-                };
-                self.negotiated_compression_c2s = compression_c2s;
-                self.negotiated_compression_s2c = compression_s2c;
-
-                _ = try rdr.readU32LenString(); // language c2s
-                _ = try rdr.readU32LenString(); // language s2c
-
-                const first_kex_packet_follows = try rdr.readBoolean();
-                TRACE(.Debug, "first_kex_packet_follows = {any}\n", .{first_kex_packet_follows});
-                _ = try rdr.readU32(); // reserved, ignore
-
-                if (self.sessionState == .KexInitRead or is_rekey) {
-                    self.setSessionState(if (is_rekey) .KexInitWrite else .EcdhInitWrite);
+                if (peer_initiated_rekey) {
+                    self.setSessionState(.KexInitWrite);
+                    self.setIoSessionState(.Idle);
+                } else if (initial_kex or local_or_simultaneous_rekey) {
+                    self.setSessionState(.EcdhInitWrite);
                     self.setIoSessionState(.Idle);
                 } else {
-                    self.setIoSessionState(.ReadPktHdr);
+                    return IoError.UnexpectedResponse;
                 }
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY) => {
                 if (self.sessionState == .EcdhReply) {
+                    errdefer self.clearKexState();
                     TRACE(.Debug, "{any}", .{@as(Protocol.MsgId, @enumFromInt(msgid))});
 
-                    // server's public host key, store so we can ask user to ok it
-                    self.hostkey_ks = try self.allocator.dupe(u8, try rdr.readU32LenString());
-                    TRACEDUMP(.Debug, "hostkey_ks", .{}, self.hostkey_ks.?);
+                    const server_hostkey = try rdr.readU32LenString();
+                    UNSAFE_TRACEDUMP(.Debug, "server_hostkey", .{}, server_hostkey);
 
                     const srv_pub_ephem = try rdr.readU32LenString();
-                    TRACEDUMP(.Debug, "srv_pub_ephem: (len={d})", .{srv_pub_ephem.len}, srv_pub_ephem);
+                    UNSAFE_TRACEDUMP(.Debug, "srv_pub_ephem: (len={d})", .{srv_pub_ephem.len}, srv_pub_ephem);
+                    if (srv_pub_ephem.len != Protocol.kex_algo.public_length) {
+                        return IoError.UnexpectedResponse;
+                    }
 
                     // In form U32LenString("ssh-ed25519"), U32LenString(hash)
                     const sig_exch_hash = try rdr.readU32LenString();
-                    TRACEDUMP(.Debug, "sig_exch_hash: (len={d})", .{sig_exch_hash.len}, sig_exch_hash);
+                    defer std.crypto.secureZero(u8, @constCast(sig_exch_hash));
+                    UNSAFE_TRACEDUMP(.Debug, "sig_exch_hash: (len={d})", .{sig_exch_hash.len}, sig_exch_hash);
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
 
                     self.kex_hash_order = self.kex_hash_order.check(.K_S);
-                    self.kex_hasher.writeU32LenString(self.hostkey_ks.?);
+                    self.kex_hasher.writeU32LenString(server_hostkey);
 
                     self.kex_hash_order = self.kex_hash_order.check(.Q_C);
                     self.kex_hasher.writeU32LenString(&self.ecdh_ephem_keypair.public_key);
@@ -1645,9 +1791,15 @@ pub const Session = struct {
                     self.kex_hasher.writeU32LenString(srv_pub_ephem);
 
                     // generate shared secret
-                    @memcpy(&self.shared_secret_k, &try Protocol.kex_algo.scalarmult(self.ecdh_ephem_keypair.secret_key, srv_pub_ephem[0..self.ecdh_ephem_keypair.secret_key.len].*));
+                    var shared_secret = try Protocol.kex_algo.scalarmult(
+                        self.ecdh_ephem_keypair.secret_key,
+                        srv_pub_ephem[0..Protocol.kex_algo.public_length].*,
+                    );
+                    defer std.crypto.secureZero(u8, &shared_secret);
+                    @memcpy(&self.shared_secret_k, &shared_secret);
+                    self.clearEphemeralKeyPair();
 
-                    TRACEDUMP(.Debug, "shared secret len={d}", .{self.shared_secret_k.len}, &self.shared_secret_k);
+                    UNSAFE_TRACEDUMP(.Debug, "shared secret len={d}", .{self.shared_secret_k.len}, &self.shared_secret_k);
 
                     self.kex_hash_order = self.kex_hash_order.check(.K);
                     self.kex_hasher.writeMpint(&self.shared_secret_k);
@@ -1655,17 +1807,25 @@ pub const Session = struct {
                     // Produce H/session_id/key exchange hash
                     // Both sides now have this
                     var kexhash: [Protocol.hash_algo.digest_length]u8 = undefined; // session_id, H
+                    defer std.crypto.secureZero(u8, &kexhash);
                     self.kex_hasher.final(&kexhash, null);
-                    TRACEDUMP(.Debug, "kexhash: (len={d})", .{kexhash.len}, &kexhash);
+                    UNSAFE_TRACEDUMP(.Debug, "kexhash: (len={d})", .{kexhash.len}, &kexhash);
 
                     const selected_sig_alg = self.selected_hostkey_algorithm orelse return IoError.UnexpectedResponse;
                     const sig_alg = try Key.signatureAlgorithm(sig_exch_hash);
                     if (sig_alg != selected_sig_alg) return IoError.AlgorithmNegotiationFailed;
-                    const pubkey = try Key.parsePublicKeyBlob(self.hostkey_ks.?);
+                    const pubkey = try Key.parsePublicKeyBlob(server_hostkey);
                     if (pubkey.algorithm() != selected_sig_alg.keyAlgorithm()) return IoError.AlgorithmNegotiationFailed;
                     try Key.verifySignature(pubkey, sig_exch_hash, &kexhash);
 
+                    // Only a signature-verified key reaches initial trust policy or rekey binding.
+                    try self.bindVerifiedHostKey(server_hostkey);
                     try self.installExchangeKeys(kexhash);
+                    self.clearKexState();
+                    std.crypto.secureZero(u8, &misshod.iobuf_rd);
+                    std.crypto.secureZero(u8, &misshod.iobuf_decompressed);
+                    misshod.rd_nbytes = 0;
+                    misshod.rd_off = 0;
 
                     self.setSessionState(.CheckHostKey);
                     self.setIoSessionState(.Idle);
@@ -1675,7 +1835,7 @@ pub const Session = struct {
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS) => {
                 if (self.sessionState == .NewKeysRead) {
-                    try self.activatePendingS2cKeys();
+                    try self.activatePendingS2cKeys(misshod);
                     self.setSessionState(.NewKeysWrite);
                     self.setIoSessionState(.Idle);
                 } else {
@@ -1693,12 +1853,15 @@ pub const Session = struct {
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_BANNER) => {
                 // RFC 4252 §5.4 - banner message before auth completes
                 const banner = try rdr.readU32LenString();
-                TRACE(.Debug, "Server banner '{s}'", .{util.chomp(banner)});
+                TRACE(.Debug, "Server banner len={d}", .{util.chomp(banner).len});
                 _ = try rdr.readU32LenString(); // language tag
                 misshod.requestEvent(.{ .Banner = banner }, .ReadPktHdr);
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS) => {
                 if (self.current_auth_method == null) return IoError.UnexpectedResponse;
+                self.clearPrivateKeyMaterial();
+                self.clearAndFreeOptional(&self.auth_passphrase);
+                self.clearAndFreeOptional(&self.kbd_interactive_response);
                 try self.activateDelayedCompression();
                 self.setIoSessionState(.Idle);
                 self.setSessionState(.ChannelOpenReq);
@@ -1749,6 +1912,7 @@ pub const Session = struct {
                 const sender = try rdr.readU32(); // sender channel
                 const peer_window = try rdr.readU32(); // initial window size
                 const max_packet_size = try rdr.readU32(); // maximum packet size
+                try self.validatePeerChannel(peer_window, max_packet_size);
                 if (self.channel_table.findByLocalId(recipient)) |chan| {
                     chan.remote_id = sender;
                     chan.remote_id_known = true;
@@ -1808,7 +1972,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
                 const s = try rdr.readU32LenString();
-                chan.consumeLocalWindow(@intCast(s.len));
+                try chan.consumeLocalWindow(s.len);
                 switch (chan.kind) {
                     .Session => misshod.requestEvent(.{ .RxData = s }, .Idle),
                     .AgentForward => misshod.requestEvent(.{ .AgentData = .{ .channel = chan.local_id, .data = s } }, .Idle),
@@ -1833,7 +1997,7 @@ pub const Session = struct {
                 }
                 const data_type = try rdr.readU32();
                 const s = try rdr.readU32LenString();
-                chan.consumeLocalWindow(@intCast(s.len));
+                try chan.consumeLocalWindow(s.len);
                 misshod.requestEvent(.{ .RxExtendedData = .{ .data_type = data_type, .data = s } }, .Idle);
                 chan.state = .Data;
                 self.active_channel_id = chan.local_id;
@@ -1844,7 +2008,7 @@ pub const Session = struct {
                 const reason_code = try rdr.readU32();
                 const description = try rdr.readU32LenString();
                 _ = try rdr.readU32LenString(); // language tag
-                TRACE(.Info, "SSH_MSG_DISCONNECT reason={d} '{s}'", .{ reason_code, description });
+                TRACE(.Info, "SSH_MSG_DISCONNECT reason={d} description_len={d}", .{ reason_code, description.len });
                 misshod.requestEvent(.{ .EndSession = .{ .ServerDisconnect = .{
                     .code = reason_code,
                     .description = description,
@@ -1905,9 +2069,9 @@ pub const Session = struct {
                 const message = try rdr.readU32LenString();
                 _ = try rdr.readU32LenString(); // language tag
                 if (always_display) {
-                    TRACE(.Info, "SSH_MSG_DEBUG: '{s}'", .{message});
+                    TRACE(.Info, "SSH_MSG_DEBUG message_len={d}", .{message.len});
                 } else {
-                    TRACE(.Debug, "SSH_MSG_DEBUG: '{s}'", .{message});
+                    TRACE(.Debug, "SSH_MSG_DEBUG message_len={d}", .{message.len});
                 }
                 self.setIoSessionState(.ReadPktHdr);
             },
@@ -1916,7 +2080,7 @@ pub const Session = struct {
                 const channelnum = try rdr.readU32();
                 if (self.channel_table.findByLocalId(channelnum)) |chan| {
                     const bytes_to_add = try rdr.readU32();
-                    chan.peer_window +|= bytes_to_add;
+                    try chan.adjustPeerWindow(bytes_to_add, self.limits.max_channel_window);
                     if (chan.write_buf_nbytes > 0) {
                         self.active_channel_id = chan.local_id;
                         self.setSessionState(.ChannelActive);
@@ -1936,14 +2100,6 @@ pub const Session = struct {
         }
     }
 };
-
-fn nameListContains(namelist: []const u8, target: []const u8) bool {
-    var iter = util.NameListTokenizer.init(namelist);
-    while (iter.next()) |name| {
-        if (std.mem.eql(u8, name, target)) return true;
-    }
-    return false;
-}
 
 // Helper: build an unencrypted SSH packet in the provided buffer.
 // Returns the total packet length (header + payload + padding).
@@ -1968,11 +2124,11 @@ fn unencryptedPayload(packet: []const u8) []const u8 {
     return packet[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
 }
 
-fn decryptFirstBlockForTest(packet: []u8, keys: *Protocol.KeyDataUni) void {
+fn decryptFirstBlockForTest(packet: []u8, keys: *Protocol.KeyDataUni) !void {
     var encrypted_block: [Protocol.AesCtrT.block_size]u8 = undefined;
     @memcpy(&encrypted_block, packet[0..Protocol.AesCtrT.block_size]);
-    keys.aesctr.encrypt(&encrypted_block, packet[0..Protocol.AesCtrT.block_size]);
-    keys.seq +%= 1;
+    try keys.aesctr.encrypt(&encrypted_block, packet[0..Protocol.AesCtrT.block_size]);
+    keys.seq += 1;
 }
 
 fn consumeProducedChannelDataForTest(m: *MisshodClient, destination: []u8, offset: usize) !usize {
@@ -1996,21 +2152,123 @@ fn buildAuthFailurePacket(m: *MisshodClient, methods: []const u8, partial_succes
 }
 
 fn writeKexInitPayload(writer: *BufferWriter) !void {
+    try writeKexInitPayloadWithGuess(
+        writer,
+        Protocol.kex_algorithms,
+        Protocol.srv_hostkey_algo_name,
+        false,
+    );
+}
+
+fn writeKexInitPayloadWithGuess(
+    writer: *BufferWriter,
+    kex_algorithms: []const u8,
+    host_key_algorithms: []const u8,
+    first_kex_packet_follows: bool,
+) !void {
     try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
     const cookie: [16]u8 = .{0x5a} ** 16;
     try writer.writeBytes(&cookie);
-    try writer.writeU32LenString(Protocol.kex_algo_name);
-    try writer.writeU32LenString(Protocol.srv_hostkey_algo_name);
-    try writer.writeU32LenString(Protocol.enc_algo_name);
-    try writer.writeU32LenString(Protocol.enc_algo_name);
-    try writer.writeU32LenString(Protocol.mac_algo_name);
-    try writer.writeU32LenString(Protocol.mac_algo_name);
+    try writer.writeU32LenString(kex_algorithms);
+    try writer.writeU32LenString(host_key_algorithms);
+    try writer.writeU32LenString(Protocol.encryption_algorithms);
+    try writer.writeU32LenString(Protocol.encryption_algorithms);
+    try writer.writeU32LenString(Protocol.mac_algorithms);
+    try writer.writeU32LenString(Protocol.mac_algorithms);
     try writer.writeU32LenString(Protocol.compression_algorithms);
     try writer.writeU32LenString(Protocol.compression_algorithms);
     try writer.writeU32LenString("");
     try writer.writeU32LenString("");
-    try writer.writeBoolean(false);
+    try writer.writeBoolean(first_kex_packet_follows);
     try writer.writeU32(0);
+}
+
+test "client ignores exactly one packet after an incorrect KEX guess" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var kexinit_backing: [512]u8 = undefined;
+    var kexinit = BufferWriter.init(&kexinit_backing, 0);
+    try writeKexInitPayloadWithGuess(
+        &kexinit,
+        "unsupported-kex,curve25519-sha256",
+        "rsa-sha2-256,ssh-ed25519",
+        true,
+    );
+    const kexinit_packet_len = buildUnencryptedPacket(&m.iobuf_rd, kexinit.active());
+    m.session.kex_hash_order = .I_C;
+    m.session.setSessionState(.KexInitRead);
+    try m.session.handlePacket(m.iobuf_rd[0..kexinit_packet_len], &m);
+    try std.testing.expect(m.session.ignore_next_kex_packet);
+
+    const guessed_packet_len = buildUnencryptedPacket(
+        &m.iobuf_rd,
+        &.{@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY)},
+    );
+    m.session.setSessionState(.EcdhReply);
+    try m.session.handlePacket(m.iobuf_rd[0..guessed_packet_len], &m);
+    try std.testing.expect(!m.session.ignore_next_kex_packet);
+    try std.testing.expectEqual(SessionState.EcdhReply, m.session.sessionState);
+    try std.testing.expectError(
+        BufferError.ReaderOutOfDataErr,
+        m.session.handlePacket(m.iobuf_rd[0..guessed_packet_len], &m),
+    );
+}
+
+test "client rejects malformed ECDH reply public key lengths" {
+    const public_length = Protocol.kex_algo.public_length;
+    const malformed_lengths = [_]usize{ 0, public_length - 1, public_length + 1 };
+    const public_key: [public_length + 1]u8 = .{0x42} ** (public_length + 1);
+
+    for (malformed_lengths) |length| {
+        var prng = std.Random.DefaultPrng.init(42);
+        var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+        defer m.deinit();
+
+        var payload_backing: [128]u8 = undefined;
+        var payload = BufferWriter.init(&payload_backing, 0);
+        try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
+        try payload.writeU32LenString("");
+        try payload.writeU32LenString(public_key[0..length]);
+        try payload.writeU32LenString("");
+
+        const packet_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+        m.session.setSessionState(.EcdhReply);
+        try std.testing.expectError(
+            IoError.UnexpectedResponse,
+            m.session.handlePacket(m.iobuf_rd[0..packet_len], &m),
+        );
+        try std.testing.expect(!m.session.ecdh_ephem_keypair_active);
+        try std.testing.expect(!m.session.kex_hasher.active);
+        for (m.session.shared_secret_k) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    }
+}
+
+test "client rejects truncated ECDH reply public key data" {
+    const public_length = Protocol.kex_algo.public_length;
+    const truncated_public_key: [public_length - 1]u8 = .{0x42} ** (public_length - 1);
+
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
+    try payload.writeU32LenString("");
+    try payload.writeU32(public_length);
+    try payload.writeBytes(&truncated_public_key);
+
+    const packet_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+    m.session.setSessionState(.EcdhReply);
+    try std.testing.expectError(
+        BufferError.ReaderOutOfDataErr,
+        m.session.handlePacket(m.iobuf_rd[0..packet_len], &m),
+    );
+    try std.testing.expect(!m.session.ecdh_ephem_keypair_active);
+    try std.testing.expect(!m.session.kex_hasher.active);
+    for (m.session.shared_secret_k) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 fn expectQueuedAuthMethodStarted(m: *MisshodClient, expected_method: AuthMethod) !void {
@@ -2356,6 +2614,21 @@ test "rekey hashes retained exact client and server versions" {
     try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
+test "client rekey cannot switch the accepted host identity" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+    session.hostkey_ks = try std.testing.allocator.dupe(u8, "accepted-host-key");
+    session.is_rekeying = true;
+
+    try session.bindVerifiedHostKey("accepted-host-key");
+    try std.testing.expectError(
+        IoError.HostKeyChanged,
+        session.bindVerifiedHostKey("different-host-key"),
+    );
+    try std.testing.expectEqualStrings("accepted-host-key", session.hostkey_ks.?);
+}
+
 test "server initiated client rekey sends and hashes client KEXINIT before server KEXINIT" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -2400,6 +2673,52 @@ test "server initiated client rekey sends and hashes client KEXINIT before serve
         @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT),
         unencryptedPayload(ecdh_packet)[0],
     );
+}
+
+test "simultaneous client local and server rekey uses one exact KEXINIT pair" {
+    var prng = std.Random.DefaultPrng.init(142);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+    try m.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
+    m.session.encrypted = true;
+    m.session.inbound_encrypted = true;
+    m.session.startLocalRekey();
+    m.session.encrypted = false;
+    m.session.inbound_encrypted = false;
+
+    try m.session.advanceSession(&m);
+    const local_packet = try m.peek(Protocol.MaxSSHPacket);
+    const local_payload = unencryptedPayload(local_packet);
+    var local_payload_copy: [512]u8 = undefined;
+    @memcpy(local_payload_copy[0..local_payload.len], local_payload);
+    const local_payload_len = local_payload.len;
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT), local_payload[0]);
+    try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
+    try m.consumed(local_packet.len);
+
+    var peer_payload_buf: [512]u8 = undefined;
+    var peer_payload = BufferWriter.init(&peer_payload_buf, 0);
+    try writeKexInitPayload(&peer_payload);
+    const peer_packet_len = buildUnencryptedPacket(&m.iobuf_rd, peer_payload.active());
+    try m.session.handlePacket(m.iobuf_rd[0..peer_packet_len], &m);
+
+    try std.testing.expect(m.session.is_rekeying);
+    try std.testing.expectEqual(SessionState.EcdhInitWrite, m.session.sessionState);
+    try std.testing.expect(m.session.pending_server_kexinit == null);
+    try std.testing.expectEqual(Protocol.KexHashOrder.I_S, m.session.kex_hash_order);
+
+    var expected_hasher = Hasher(Protocol.hash_algo).init();
+    expected_hasher.writeU32LenString(m.session.client_version.?);
+    expected_hasher.writeU32LenString(m.session.server_version.?);
+    expected_hasher.writeU32LenString(local_payload_copy[0..local_payload_len]);
+    expected_hasher.writeU32LenString(peer_payload.active());
+    var expected: [Protocol.hash_algo.digest_length]u8 = undefined;
+    expected_hasher.final(&expected, null);
+    var actual: [Protocol.hash_algo.digest_length]u8 = undefined;
+    m.session.kex_hasher.final(&actual, null);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }
 
 test "client rekey gates deferred channel traffic until NEWKEYS completes" {
@@ -2523,8 +2842,15 @@ test "client rekey activates inbound and outbound keys at NEWKEYS boundaries" {
     const new_secret: [Protocol.kex_algo.shared_length]u8 = .{0x50} ** Protocol.kex_algo.shared_length;
     m.session.session_id = session_id;
     try m.session.keydata.genKeys(old_hash, old_secret, session_id);
+    m.session.keydata.c2s.epoch = 3;
+    m.session.keydata.c2s.encrypted_bytes = 700;
+    m.session.keydata.c2s.encrypted_packets = 7;
+    m.session.keydata.s2c.epoch = 4;
+    m.session.keydata.s2c.encrypted_bytes = 800;
+    m.session.keydata.s2c.encrypted_packets = 8;
     m.session.encrypted = true;
     m.session.inbound_encrypted = true;
+    try m.initializeDeadlines(100);
     m.session.is_rekeying = true;
     m.session.shared_secret_k = new_secret;
     try m.session.installExchangeKeys(new_hash);
@@ -2548,13 +2874,19 @@ test "client rekey activates inbound and outbound keys at NEWKEYS boundaries" {
         &server_packet_buf,
     );
     @memcpy(m.iobuf_rd[0..wrapped_server_newkeys.len], wrapped_server_newkeys);
-    decryptFirstBlockForTest(m.iobuf_rd[0..wrapped_server_newkeys.len], &m.session.keydata.s2c);
+    try decryptFirstBlockForTest(m.iobuf_rd[0..wrapped_server_newkeys.len], &m.session.keydata.s2c);
     m.session.setSessionState(.NewKeysRead);
     try m.session.handlePacket(m.iobuf_rd[0..wrapped_server_newkeys.len], &m);
 
     try std.testing.expectEqualSlices(u8, &old_c2s.key, &m.session.keydata.c2s.key);
     try std.testing.expectEqualSlices(u8, &new_s2c_key, &m.session.keydata.s2c.key);
     try std.testing.expectEqual(@as(u32, 1), m.session.keydata.s2c.seq);
+    try std.testing.expectEqual(@as(u64, 5), m.session.keydata.s2c.epoch);
+    try std.testing.expectEqual(@as(u64, 0), m.session.keydata.s2c.encrypted_bytes);
+    try std.testing.expectEqual(@as(u64, 0), m.session.keydata.s2c.encrypted_packets);
+    try std.testing.expectEqual(@as(?u64, 100), m.session.keydata.s2c.activated_at_monotonic_tick);
+    try std.testing.expectEqual(@as(u64, 3), m.session.keydata.c2s.epoch);
+    try std.testing.expectEqual(@as(u64, 7), m.session.keydata.c2s.encrypted_packets);
     try std.testing.expect(m.session.pending_c2s_keys != null);
     try std.testing.expect(m.session.pending_s2c_keys == null);
 
@@ -2562,6 +2894,10 @@ test "client rekey activates inbound and outbound keys at NEWKEYS boundaries" {
     const client_newkeys = try m.peek(Protocol.MaxSSHPacket);
     try std.testing.expectEqualSlices(u8, &new_c2s_key, &m.session.keydata.c2s.key);
     try std.testing.expectEqual(@as(u32, 1), m.session.keydata.c2s.seq);
+    try std.testing.expectEqual(@as(u64, 4), m.session.keydata.c2s.epoch);
+    try std.testing.expectEqual(@as(u64, 0), m.session.keydata.c2s.encrypted_bytes);
+    try std.testing.expectEqual(@as(u64, 0), m.session.keydata.c2s.encrypted_packets);
+    try std.testing.expectEqual(@as(?u64, 100), m.session.keydata.c2s.activated_at_monotonic_tick);
     try std.testing.expect(m.session.pending_c2s_keys == null);
 
     var verifier_prng = std.Random.DefaultPrng.init(7);
@@ -2576,7 +2912,7 @@ test "client rekey activates inbound and outbound keys at NEWKEYS boundaries" {
     old_c2s = .{ .seq = 0 };
     verifier.session.inbound_encrypted = true;
     @memcpy(verifier.iobuf_rd[0..client_newkeys.len], client_newkeys);
-    decryptFirstBlockForTest(verifier.iobuf_rd[0..client_newkeys.len], &verifier.session.keydata.c2s);
+    try decryptFirstBlockForTest(verifier.iobuf_rd[0..client_newkeys.len], &verifier.session.keydata.c2s);
     var rdr = try verifier.getRecvBuffer(
         verifier.iobuf_rd[0..client_newkeys.len],
         &verifier.session.keydata.c2s,
@@ -2659,6 +2995,10 @@ test "requestRemoteForward writes tcpip-forward global request" {
 
     try m.requestRemoteForward("127.0.0.1", 0);
     try std.testing.expect(m.session.pending_global_request != null);
+    try std.testing.expectError(
+        IoError.ResourceLimitExceeded,
+        m.cancelRemoteForward("127.0.0.1", 0),
+    );
 
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
@@ -3033,6 +3373,78 @@ test "client receives exactly advertised maximum channel data" {
     try std.testing.expectEqual(@as(u32, 0), chan.local_window);
 }
 
+test "client runtime channel buffer pending and peer limits enforce boundaries" {
+    const limits = Misshod.ResourceLimits{
+        .initial_channel_window = 100,
+        .max_channel_window = 100,
+        .channel_packet_size = 50,
+        .max_peer_packet_size = 50,
+        .max_channel_buffered_data = 8,
+        .max_pending_buffered_data = 12,
+    };
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
+    defer session.deinit();
+
+    try session.validatePeerChannel(99, 49);
+    try session.validatePeerChannel(100, 50);
+    try std.testing.expectError(IoError.InvalidChannelParameters, session.validatePeerChannel(101, 50));
+    try std.testing.expectError(IoError.InvalidChannelParameters, session.validatePeerChannel(100, 51));
+
+    const first = session.channel_table.allocChannel(1, 100, 50).?;
+    const second = session.channel_table.allocChannel(2, 100, 50).?;
+    try std.testing.expectEqual(@as(usize, 8), (try session.getChannelWriteBuffer(first.local_id)).len);
+    try std.testing.expectError(IoError.tooBig, session.channelWriteComplete(first.local_id, 9));
+    try session.channelWriteComplete(first.local_id, 8);
+    try std.testing.expectError(IoError.ResourceLimitExceeded, session.channelWriteComplete(second.local_id, 5));
+    try session.channelWriteComplete(second.local_id, 4);
+    try std.testing.expectEqual(@as(usize, 12), session.pendingBufferedData());
+}
+
+test "client rejects channel data above packet and receive window limits" {
+    const limits = Misshod.ResourceLimits{
+        .initial_channel_window = 8,
+        .max_channel_window = 8,
+        .channel_packet_size = 4,
+        .max_peer_packet_size = 4,
+        .max_channel_buffered_data = 4,
+        .max_pending_buffered_data = 4,
+    };
+    var prng = std.Random.DefaultPrng.init(42);
+
+    var packet_client = try MisshodClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
+    defer packet_client.deinit();
+    const packet_chan = packet_client.session.channel_table.allocChannel(42, 8, 4).?;
+    packet_chan.state = .DataRx;
+    var payload_backing: [64]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(packet_chan.local_id);
+    try payload.writeU32LenString("12345");
+    const packet_len = buildUnencryptedPacket(&packet_client.iobuf_rd, payload.active());
+    try std.testing.expectError(
+        error.ChannelPacketTooLarge,
+        packet_client.session.handlePacket(packet_client.iobuf_rd[0..packet_len], &packet_client),
+    );
+    try std.testing.expectEqual(@as(u32, 8), packet_chan.local_window);
+
+    var window_client = try MisshodClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
+    defer window_client.deinit();
+    const window_chan = window_client.session.channel_table.allocChannel(42, 8, 4).?;
+    window_chan.state = .DataRx;
+    window_chan.local_window = 3;
+    payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(window_chan.local_id);
+    try payload.writeU32LenString("1234");
+    const window_len = buildUnencryptedPacket(&window_client.iobuf_rd, payload.active());
+    try std.testing.expectError(
+        error.ReceiveWindowExceeded,
+        window_client.session.handlePacket(window_client.iobuf_rd[0..window_len], &window_client),
+    );
+    try std.testing.expectEqual(@as(u32, 3), window_chan.local_window);
+}
+
 test "handlePacket: SSH_MSG_CHANNEL_CLOSE when not yet sent triggers close reply" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -3114,6 +3526,33 @@ test "handlePacket: SSH_MSG_USERAUTH_BANNER surfaces banner event" {
     }
 }
 
+test "clearing a borrowed plaintext event releases packet storage" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_BANNER));
+    try payload.writeU32LenString("borrowed-sensitive-banner");
+    try payload.writeU32LenString("en");
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const event = try m.getNextEvent();
+    const code = switch (event) {
+        .Event => |code| code,
+        else => return error.TestUnexpectedResult,
+    };
+    switch (code) {
+        .Banner => |banner| try std.testing.expectEqualStrings("borrowed-sensitive-banner", banner),
+        else => return error.TestUnexpectedResult,
+    }
+    try m.clearEvent(code);
+    for (m.iobuf_rd) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (m.iobuf_decompressed) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+}
+
 test "client session deinit zeros sensitive fields" {
     var prng = std.Random.DefaultPrng.init(42);
     var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
@@ -3123,6 +3562,8 @@ test "client session deinit zeros sensitive fields" {
     try session.setAuthPassphrase("my-auth-password");
     @memset(&session.shared_secret_k, 0xAA);
     @memset(&session.session_id, 0xBB);
+    @memset(std.mem.asBytes(&session.ecdh_ephem_keypair), 0xCC);
+    session.ecdh_ephem_keypair_active = true;
 
     session.deinit();
 
@@ -3132,6 +3573,9 @@ test "client session deinit zeros sensitive fields" {
     for (session.shared_secret_k) |b| try std.testing.expectEqual(@as(u8, 0), b);
     for (session.session_id) |b| try std.testing.expectEqual(@as(u8, 0), b);
     try std.testing.expect(session.private_key == null);
+    try std.testing.expect(!session.ecdh_ephem_keypair_active);
+    try std.testing.expect(!session.kex_hasher.active);
+    for (std.mem.asBytes(&session.ecdh_ephem_keypair)) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 
 test "setPrivateKey replaces previous key" {
@@ -3142,6 +3586,48 @@ test "setPrivateKey replaces previous key" {
     try session.setPrivateKey("first-key");
     try session.setPrivateKey("second-key");
     try std.testing.expectEqualStrings("second-key", session.privkey_ascii.?);
+}
+
+test "client auth inputs are released after packet construction and decode errors" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.setAuthPassphrase("packet-password");
+    m.session.encrypted = false;
+    m.session.setSessionState(.PasswordAuthReq);
+    try m.session.advanceSession(&m);
+    try std.testing.expect(m.session.auth_passphrase == null);
+    const packet = try m.peek(Protocol.MaxSSHPacket);
+    try m.consumed(packet.len);
+    for (m.iobuf_wr) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    try m.setPrivateKey("not-an-openssh-key");
+    try m.setPrivateKeyPassphrase("wrong-passphrase");
+    m.iostate_wr = .Idle;
+    m.session.setSessionState(.PubkeyAuthDecodeKeyPassword);
+    try std.testing.expectError(PrivKeyError.BadPrivKey, m.session.advanceSession(&m));
+    try std.testing.expect(m.session.privkey_ascii == null);
+    try std.testing.expect(m.session.privkey_passphrase == null);
+    try std.testing.expect(m.session.private_key == null);
+}
+
+test "successful public-key authentication packet releases copied and decoded key material" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.setPrivateKey(@import("privkey.zig").testkey_valid);
+    m.session.encrypted = false;
+    m.session.setSessionState(.PubkeyAuthDecodeKeyPasswordless);
+    try m.session.advanceSession(&m);
+    try std.testing.expect(m.session.privkey_ascii == null);
+    try std.testing.expect(m.session.private_key != null);
+
+    m.session.setSessionState(.PubkeyAuthReq);
+    try m.session.advanceSession(&m);
+    try std.testing.expect(m.session.private_key == null);
+    try std.testing.expect(m.session.privkey_passphrase == null);
 }
 
 test "client channel_close_sent starts false" {
@@ -3797,16 +4283,16 @@ test "setKeyboardInteractiveResponse stores response" {
 }
 
 test "nameListContains finds algorithm in list" {
-    try std.testing.expect(nameListContains("aes256-ctr,aes128-ctr,aes256-cbc", "aes256-ctr"));
-    try std.testing.expect(nameListContains("aes256-ctr,aes128-ctr,aes256-cbc", "aes128-ctr"));
-    try std.testing.expect(nameListContains("aes256-ctr,aes128-ctr,aes256-cbc", "aes256-cbc"));
-    try std.testing.expect(nameListContains("aes256-ctr", "aes256-ctr"));
+    try std.testing.expect(Protocol.nameListContains("aes256-ctr,aes128-ctr,aes256-cbc", "aes256-ctr"));
+    try std.testing.expect(Protocol.nameListContains("aes256-ctr,aes128-ctr,aes256-cbc", "aes128-ctr"));
+    try std.testing.expect(Protocol.nameListContains("aes256-ctr,aes128-ctr,aes256-cbc", "aes256-cbc"));
+    try std.testing.expect(Protocol.nameListContains("aes256-ctr", "aes256-ctr"));
 }
 
 test "nameListContains rejects missing algorithm" {
-    try std.testing.expect(!nameListContains("aes128-ctr,aes256-cbc", "aes256-ctr"));
-    try std.testing.expect(!nameListContains("", "aes256-ctr"));
-    try std.testing.expect(!nameListContains("aes256-ct", "aes256-ctr"));
+    try std.testing.expect(!Protocol.nameListContains("aes128-ctr,aes256-cbc", "aes256-ctr"));
+    try std.testing.expect(!Protocol.nameListContains("", "aes256-ctr"));
+    try std.testing.expect(!Protocol.nameListContains("aes256-ct", "aes256-ctr"));
 }
 
 test "is_rekeying starts false" {

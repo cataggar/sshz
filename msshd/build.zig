@@ -37,6 +37,21 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const auth_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/auth.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    auth_test_mod.addImport("misshod", misshod_dep.module("misshod"));
+    auth_test_mod.linkSystemLibrary("z", .{});
+    const auth_tests = b.addTest(.{
+        .root_module = auth_test_mod,
+    });
+    const run_auth_tests = b.addRunArtifact(auth_tests);
+
+    const test_step = b.step("test", "Run msshd tests");
+    test_step.dependOn(&run_auth_tests.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
 

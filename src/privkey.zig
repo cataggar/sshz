@@ -2,7 +2,7 @@ const std = @import("std");
 const util = @import("util.zig");
 const crypto = std.crypto;
 const TRACE = util.trace;
-const TRACEDUMP = util.tracedump;
+const UNSAFE_TRACEDUMP = util.unsafeTracedump;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const BufferReader = @import("buffer.zig").BufferReader;
 const BufferError = @import("buffer.zig").BufferError;
@@ -34,7 +34,7 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
         }
     }
     if (b64_slice_opt) |b64_slice| {
-        TRACEDUMP(.Debug, "b64", .{}, b64_slice);
+        UNSAFE_TRACEDUMP(.Debug, "b64", .{}, b64_slice);
         var decoder = std.base64.Base64DecoderWithIgnore.init(std.base64.standard_alphabet_chars, '=', "\n");
         const decoded_size = decoder.calcSizeUpperBound(b64_slice.len);
         if (decoded_size > keydata_bin_buf.len) {
@@ -47,14 +47,18 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
     }
 }
 
+/// Returns caller-owned key material that must be cleared after use.
 pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8) PrivKeyError!Key.PrivateKey {
+    // Input text and the optional passphrase are borrowed; this function owns and
+    // scrubs all decoded, KDF, and decrypted scratch that it creates.
     var keydata_bin_buf: [8192]u8 = undefined;
+    defer crypto.secureZero(u8, &keydata_bin_buf);
     const bin = try decodeAsciiToBinary(keydata_ascii, &keydata_bin_buf);
-    TRACEDUMP(.Debug, "raw len={d}", .{bin.len}, bin);
+    UNSAFE_TRACEDUMP(.Debug, "raw len={d}", .{bin.len}, bin);
 
     // http://dnaeon.github.io/openssh-private-key-binary-format/
     const AuthMagic = "openssh-key-v1\x00";
-    if (!std.mem.eql(u8, AuthMagic, bin[0..AuthMagic.len])) {
+    if (bin.len < AuthMagic.len or !std.mem.eql(u8, AuthMagic, bin[0..AuthMagic.len])) {
         return PrivKeyError.BadPrivKey; // Not magical enough
     }
 
@@ -72,13 +76,13 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
     TRACE(.Debug, "ciphername={s} kdfname={s} n_keys={d}\n", .{ ciphername, kdfname, n_keys });
 
     const pubkey = try buffer.readU32LenString();
-    TRACEDUMP(.Debug, "pubkey", .{}, pubkey);
+    UNSAFE_TRACEDUMP(.Debug, "pubkey", .{}, pubkey);
 
     var kbuffer = BufferReader.init(pubkey);
     const pkey_algo = try kbuffer.readU32LenString();
     TRACE(.Debug, "pkey_algo={s}\n", .{pkey_algo});
     const pkey_blob = try kbuffer.readU32LenString();
-    TRACEDUMP(.Debug, "pkey_blob", .{}, pkey_blob);
+    UNSAFE_TRACEDUMP(.Debug, "pkey_blob", .{}, pkey_blob);
 
     const enc_section_off = buffer.off + 4 + AuthMagic.len; // current position is before u32 length field, then data blob
     const enc_section = try buffer.readU32LenString();
@@ -89,7 +93,7 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
                 var buffer_kdfopt = BufferReader.init(kdfoptions_section);
                 const salt = try buffer_kdfopt.readU32LenString();
                 const rounds = try buffer_kdfopt.readU32();
-                TRACEDUMP(.Debug, "salt rounds={d}", .{rounds}, salt);
+                UNSAFE_TRACEDUMP(.Debug, "salt rounds={d}", .{rounds}, salt);
                 if (salt.len != 16) {
                     return PrivKeyError.BadPrivKey;
                 }
@@ -97,16 +101,20 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
                 const enc_algo = crypto.core.aes.Aes256;
                 const AesCtrT = AesCtr(enc_algo);
                 var hash: [AesCtrT.key_size + AesCtrT.iv_size]u8 = undefined;
+                defer crypto.secureZero(u8, &hash);
                 // https://github.com/openssh/openssh-portable/blob/826483d51a9fee60703298bbf839d9ce37943474/sshkey.c#L2880
                 // need zig 0.14.0 for this https://github.com/ziglang/zig/pull/22027
                 try crypto.pwhash.bcrypt.opensshKdf(passphrase, salt[0..16], &hash, rounds);
-                TRACEDUMP(.Debug, "bcrypt hash", .{}, &hash);
+                UNSAFE_TRACEDUMP(.Debug, "bcrypt hash", .{}, &hash);
                 // https://www.thedigitalcatonline.com/blog/2021/06/03/public-key-cryptography-openssh-private-keys/#a-poorly-documented-format-2ea8
                 var aesctr = AesCtrT.init(hash[AesCtrT.key_size..].*, hash[0..AesCtrT.key_size].*);
+                defer aesctr.clear();
                 var dec: [8192]u8 = undefined;
+                defer crypto.secureZero(u8, &dec);
                 if (enc_section.len > dec.len) return PrivKeyError.PrivKeyOutofSpace;
-                aesctr.encrypt(enc_section, dec[0..enc_section.len]);
-                TRACEDUMP(.Debug, "dec", .{}, dec[0..enc_section.len]);
+                aesctr.encrypt(enc_section, dec[0..enc_section.len]) catch
+                    return PrivKeyError.InvalidKeyDecrypt;
+                UNSAFE_TRACEDUMP(.Debug, "dec", .{}, dec[0..enc_section.len]);
                 // copy decrypted area over original encrypted
                 @memcpy(keydata_bin_buf[enc_section_off .. enc_section_off + enc_section.len], dec[0..enc_section.len]);
             } else {
@@ -121,13 +129,12 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
         }
     }
 
-    TRACEDUMP(.Debug, "enc_section", .{}, enc_section);
+    UNSAFE_TRACEDUMP(.Debug, "enc_section", .{}, enc_section);
     var encbuffer = BufferReader.init(enc_section);
 
     const checkint1 = try encbuffer.readU32();
     const checkint2 = try encbuffer.readU32();
 
-    TRACE(.Debug, "checkint1={d} checkint2={d}\n", .{ checkint1, checkint2 });
     if (checkint1 != checkint2) { // should be same, proving key decryption worked
         return PrivKeyError.InvalidKeyDecrypt;
     }
@@ -139,11 +146,11 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
     TRACE(.Debug, "key_algo={s}\n", .{key_algo});
 
     var private_key = try parsePrivateSectionKey(key_algo, &encbuffer);
+    errdefer private_key.clear();
 
     var private_pubkey_blob: Key.Blob = .{};
     const generated_pubkey = try private_key.publicBlob(&private_pubkey_blob);
     if (!std.mem.eql(u8, generated_pubkey, pubkey)) {
-        private_key.clear();
         return PrivKeyError.BadPrivKey;
     }
 
@@ -151,11 +158,16 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
 }
 
 pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, privkey_blob: *[std.crypto.sign.Ed25519.SecretKey.encoded_length]u8, pubkey_blob: *[std.crypto.sign.Ed25519.PublicKey.encoded_length]u8) PrivKeyError!void {
+    crypto.secureZero(u8, privkey_blob);
+    crypto.secureZero(u8, pubkey_blob);
+    errdefer crypto.secureZero(u8, privkey_blob);
+    errdefer crypto.secureZero(u8, pubkey_blob);
+
     var private_key = try decodeOpenSshPrivateKey(keydata_ascii, passphrase_opt);
     defer private_key.clear();
 
     switch (private_key) {
-        .Ed25519 => |key| {
+        .Ed25519 => |*key| {
             @memcpy(privkey_blob, &key.secret);
             @memcpy(pubkey_blob, &key.public);
         },
@@ -167,8 +179,8 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
     if (std.mem.eql(u8, key_algo, Key.ed25519_name)) {
         const key_blob_pub = try encbuffer.readU32LenString();
         const key_blob_prv = try encbuffer.readU32LenString();
-        TRACEDUMP(.Debug, "ed25519 key_blob_pub", .{}, key_blob_pub);
-        TRACEDUMP(.Debug, "ed25519 key_blob_prv", .{}, key_blob_prv);
+        UNSAFE_TRACEDUMP(.Debug, "ed25519 key_blob_pub", .{}, key_blob_pub);
+        UNSAFE_TRACEDUMP(.Debug, "ed25519 key_blob_prv", .{}, key_blob_prv);
         if (key_blob_pub.len != std.crypto.sign.Ed25519.PublicKey.encoded_length or
             key_blob_prv.len != std.crypto.sign.Ed25519.SecretKey.encoded_length)
         {
@@ -188,9 +200,12 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
             return PrivKeyError.BadPrivKey;
         }
         const secret_mpint = try encbuffer.readU32LenString();
-        const secret_scalar = try mpintToFixed(std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.encoded_length, secret_mpint);
-        const secret_key = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(secret_scalar) catch return PrivKeyError.BadPrivKey;
-        const keypair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return PrivKeyError.BadPrivKey;
+        var secret_scalar = try mpintToFixed(std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.encoded_length, secret_mpint);
+        defer crypto.secureZero(u8, &secret_scalar);
+        var secret_key = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(secret_scalar) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+        var keypair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&keypair));
         if (!std.mem.eql(u8, &keypair.public_key.toUncompressedSec1(), sec1)) return PrivKeyError.BadPrivKey;
         return .{ .EcdsaP256 = .{
             .public_sec1 = sec1[0..std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length].*,
@@ -199,14 +214,15 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
     }
 
     if (std.mem.eql(u8, key_algo, Key.rsa_key_name)) {
-        var rsa: Key.RsaPrivateKey = .{};
-        try rsa.n.set(try encbuffer.readU32LenString());
-        try rsa.e.set(try encbuffer.readU32LenString());
-        try rsa.d.set(try encbuffer.readU32LenString());
-        try rsa.iqmp.set(try encbuffer.readU32LenString());
-        try rsa.p.set(try encbuffer.readU32LenString());
-        try rsa.q.set(try encbuffer.readU32LenString());
-        return .{ .Rsa = rsa };
+        var private_key: Key.PrivateKey = .{ .Rsa = .{} };
+        errdefer private_key.clear();
+        try private_key.Rsa.n.set(try encbuffer.readU32LenString());
+        try private_key.Rsa.e.set(try encbuffer.readU32LenString());
+        try private_key.Rsa.d.set(try encbuffer.readU32LenString());
+        try private_key.Rsa.iqmp.set(try encbuffer.readU32LenString());
+        try private_key.Rsa.p.set(try encbuffer.readU32LenString());
+        try private_key.Rsa.q.set(try encbuffer.readU32LenString());
+        return private_key;
     }
 
     return PrivKeyError.UnsupportedPrivKey;
@@ -302,14 +318,18 @@ pub const testkey_rsa_2048 = "-----BEGIN OPENSSH PRIVATE KEY-----\n" ++
 
 test "decodepriv" {
     var blob: [std.crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
+    defer crypto.secureZero(u8, &blob);
     var pubblob: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
+    defer crypto.secureZero(u8, &pubblob);
 
     try std.testing.expectError(PrivKeyError.BadPrivKey, decodePrivKey(testkey_invalid_bad_preamble, null, &blob, &pubblob));
     try std.testing.expectError(PrivKeyError.BadPrivKey, decodePrivKey(testkey_invalid_missing_footer, null, &blob, &pubblob));
     try std.testing.expectError(PrivKeyError.BadPrivKey, decodePrivKey(testkey_invalid_bad_base64, null, &blob, &pubblob));
     try decodePrivKey(testkey_encrypted_valid_passworded, testkey_encrypted_valid_password, &blob, &pubblob);
-    try std.testing.expectError(PrivKeyError.InvalidKeyDecrypt, decodePrivKey(testkey_encrypted_valid_passworded, "notpassword", &blob, &pubblob));
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 168, 158, 23, 77, 212, 94, 57, 255, 157, 6, 173, 128, 17, 109, 67, 232, 3, 126, 106, 1, 93, 9, 70, 135, 50, 35, 207, 108, 76, 128, 251, 24, 189, 27, 142, 8, 84, 46, 86, 64, 66, 99, 249, 172, 207, 208, 211, 134, 21, 193, 250, 85, 48, 57, 251, 81, 133, 110, 66, 16, 244, 86, 130, 249 }));
+    try std.testing.expectError(PrivKeyError.InvalidKeyDecrypt, decodePrivKey(testkey_encrypted_valid_passworded, "notpassword", &blob, &pubblob));
+    try std.testing.expectEqualSlices(u8, &(.{0} ** blob.len), &blob);
+    try std.testing.expectEqualSlices(u8, &(.{0} ** pubblob.len), &pubblob);
     try decodePrivKey(testkey_valid, null, &blob, &pubblob);
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 166, 119, 186, 89, 114, 101, 152, 133, 196, 14, 211, 238, 206, 143, 73, 223, 41, 101, 45, 196, 132, 150, 240, 240, 41, 82, 229, 54, 152, 193, 40, 220, 232, 131, 168, 235, 233, 3, 218, 50, 159, 159, 165, 94, 166, 155, 49, 203, 223, 47, 9, 101, 69, 137, 215, 186, 3, 175, 96, 21, 112, 247, 116, 245 }));
 }
@@ -331,6 +351,7 @@ test "decode OpenSSH private key algorithms and sign/verify" {
         const public_key = try Key.parsePublicKeyBlob(blob);
 
         var sig_blob: Key.SignatureBlob = .{};
+        defer sig_blob.clear();
         const sig = try private_key.sign(private_key.defaultSignatureAlgorithm(), "misshod message", &sig_blob);
         try Key.verifySignature(public_key, sig, "misshod message");
         try std.testing.expectError(Key.KeyError.InvalidSignature, Key.verifySignature(public_key, sig, "tampered message"));

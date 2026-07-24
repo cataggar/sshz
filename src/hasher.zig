@@ -9,6 +9,7 @@ pub fn Hasher(hash_algo: anytype) type {
         comptime digest_length: usize = hash_algo.digest_length,
         h: hash_algo,
         msg_len: usize = 0,
+        active: bool = true,
 
         pub fn init() Self {
             return Self{
@@ -17,10 +18,19 @@ pub fn Hasher(hash_algo: anytype) type {
             };
         }
 
+        pub fn clear(self: *Self) void {
+            std.crypto.secureZero(u8, std.mem.asBytes(&self.h));
+            self.msg_len = 0;
+            self.active = false;
+        }
+
         // if digest is smaller than hash, truncate it
         // if digest if bigger than hash, extend https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
         pub fn final(self: *Self, digest: []u8, extension: ?[]u8) void {
+            std.debug.assert(self.active);
+            defer self.clear();
             var tmpdigest: [hash_algo.digest_length]u8 = undefined;
+            defer std.crypto.secureZero(u8, &tmpdigest);
             self.h.final(&tmpdigest);
 
             if (digest.len == hash_algo.digest_length) { // asked for exact length
@@ -40,9 +50,11 @@ pub fn Hasher(hash_algo: anytype) type {
                         outer: while (true) {
                             // create new hash of digest + ext
                             var exthasher = hash_algo.init(.{});
+                            defer std.crypto.secureZero(u8, std.mem.asBytes(&exthasher));
                             exthasher.update(ext);
                             exthasher.update(digest[0..digest_off]);
                             var exthash_digest: [hash_algo.digest_length]u8 = undefined;
+                            defer std.crypto.secureZero(u8, &exthash_digest);
                             exthasher.final(&exthash_digest);
                             // write new hash into digest
                             if (remaining_len <= hash_algo.digest_length) {
@@ -67,22 +79,26 @@ pub fn Hasher(hash_algo: anytype) type {
         }
 
         pub fn writeU8(self: *Self, v: u8) void {
+            std.debug.assert(self.active);
             self.h.update(&[1]u8{v});
             self.msg_len += 1;
         }
 
         pub fn writeBoolean(self: *Self, v: bool) void {
+            std.debug.assert(self.active);
             self.h.update(&[1]u8{if (v) 1 else 0});
             self.msg_len += 1;
         }
 
         pub fn writeU32(self: *Self, v: u32) void {
+            std.debug.assert(self.active);
             const net_v = std.mem.nativeTo(u32, v, targetEndian);
             self.h.update(std.mem.asBytes(&net_v));
             self.msg_len += 4;
         }
 
         pub fn writeBytes(self: *Self, v: []const u8) void {
+            std.debug.assert(self.active);
             self.h.update(v);
             self.msg_len += v.len;
         }
@@ -130,4 +146,6 @@ test "hasher" {
     hasher.writeU8('c');
     hasher.final(&digest, null);
     try std.testing.expect(std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
+    try std.testing.expect(!hasher.active);
+    try std.testing.expectEqual(@as(usize, 0), hasher.msg_len);
 }

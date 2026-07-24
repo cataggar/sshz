@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_options = @import("misshod_build_options");
 const BufferReader = @import("buffer.zig").BufferReader;
 const BufferWriter = @import("buffer.zig").BufferWriter;
 
@@ -10,6 +11,8 @@ const TraceLevel = enum {
 
 const trace_level: TraceLevel = .Info;
 
+pub const unsafe_secret_tracing = build_options.unsafe_secret_tracing;
+
 pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
     if (builtin.os.tag != .freestanding) {
         if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
@@ -18,11 +21,13 @@ pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
     }
 }
 
-pub fn tracedump(level: TraceLevel, comptime fmt: []const u8, args: anytype, data: []const u8) void {
-    if (builtin.os.tag != .freestanding) {
-        if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
-            std.debug.print(fmt ++ "\n", args);
-            dumpStderr(data);
+pub inline fn unsafeTracedump(level: TraceLevel, comptime fmt: []const u8, args: anytype, data: []const u8) void {
+    if (comptime unsafe_secret_tracing) {
+        if (builtin.os.tag != .freestanding) {
+            if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
+                std.debug.print(fmt ++ "\n", args);
+                dumpStderr(data);
+            }
         }
     }
 }
