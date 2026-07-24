@@ -101,10 +101,33 @@ pub const KexHashOrder = enum { // https://datatracker.ietf.org/doc/html/rfc5656
     }
 };
 
-pub const MaxSSHPacket = 4096; // Can be smaller https://datatracker.ietf.org/doc/html/rfc4253#section-5.3
+// RFC 4253 §6.1 requires support for uncompressed payloads of at least 32768 bytes.
+// This internal bound includes packet framing, maximum padding, and the MAC.
+pub const MaxSSHPacket = 35000;
 pub const MaxPayload = (MaxSSHPacket - (sizeof_PktHdr + 255 + mac_algo.key_length));
-// Max channel data: MaxPayload minus channel data framing (msgid:1 + channel:4 + string_len:4)
-pub const MaxChannelDataLen = MaxPayload - 9;
+pub const ChannelDataFramingLen = 1 + 4 + 4;
+pub const ChannelExtendedDataFramingLen = 1 + 4 + 4 + 4;
+
+// zlib's documented compressBound formula plus conservative Z_SYNC_FLUSH room.
+pub fn zlibSyncFlushBound(input_len: usize) usize {
+    return input_len +
+        (input_len >> 12) +
+        (input_len >> 14) +
+        (input_len >> 25) +
+        32;
+}
+
+fn maxChannelDataLen() usize {
+    var data_len = MaxPayload - ChannelExtendedDataFramingLen;
+    while (zlibSyncFlushBound(data_len + ChannelExtendedDataFramingLen) > MaxPayload) {
+        data_len -= 1;
+    }
+    return data_len;
+}
+
+// Logical/decompressed channel bytes guaranteed to fit both DATA and
+// EXTENDED_DATA after worst-case delayed-zlib expansion.
+pub const MaxChannelDataLen = maxChannelDataLen();
 pub const MaxIVLen = 20; // number of bytes to generate for IVs
 pub const MaxKeyLen = 64; // number of bytes to generate for keys
 pub const MaxIdentificationLineLen = 255;
@@ -178,6 +201,8 @@ pub const IoSessionState = union(enum) {
     VersionReadLine,
     VersionReadLineChar: []const u8,
     VersionReadLineCompletion: []const u8,
+    ChannelWriteComplete: u32,
+    ChannelControlComplete: u32,
     ReadPktHdr,
     ReadPktBody: []const u8,
     ReadPktCompletion: []const u8,
@@ -558,11 +583,15 @@ test "MaxPayload is reasonable" {
     try std.testing.expect(MaxPayload < MaxSSHPacket);
 }
 
-test "MaxChannelDataLen accounts for framing overhead" {
-    // Channel data framing: msgid(1) + channel(4) + string_len(4) = 9 bytes
-    try std.testing.expectEqual(MaxPayload - 9, MaxChannelDataLen);
+test "MaxChannelDataLen accounts for extended framing and zlib expansion" {
+    try std.testing.expect(
+        zlibSyncFlushBound(MaxChannelDataLen + ChannelExtendedDataFramingLen) <= MaxPayload,
+    );
+    try std.testing.expect(
+        zlibSyncFlushBound(MaxChannelDataLen + 1 + ChannelExtendedDataFramingLen) > MaxPayload,
+    );
     try std.testing.expect(MaxChannelDataLen > 0);
-    try std.testing.expect(MaxChannelDataLen > 64); // must be larger than old hardcoded value
+    try std.testing.expect(MaxChannelDataLen >= 32768);
 }
 
 test "agent forwarding channel type aliases" {
@@ -599,6 +628,52 @@ test "zlib openssh compression streams round trip flushed packets" {
     const compressed2 = try compressor.compressPayload(payload2, &compressed);
     const decompressed2 = try decompressor.decompressPayload(compressed2, &decompressed);
     try std.testing.expectEqualStrings(payload2, decompressed2);
+}
+
+fn incompressibleTestByte(index: usize) u8 {
+    var value: u32 = @intCast(index);
+    value = value *% 1664525 +% 1013904223;
+    return @truncate(value >> 24);
+}
+
+fn expectExactBoundCompressedChannelPayload(extended: bool) !void {
+    var logical_data: [MaxChannelDataLen]u8 = undefined;
+    for (&logical_data, 0..) |*byte, index| byte.* = incompressibleTestByte(index);
+
+    var payload_backing: [MaxPayload]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(if (extended) MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA else MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(7);
+    if (extended) try payload.writeU32(1);
+    try payload.writeU32LenString(&logical_data);
+
+    var sender = KeyDataUni{ .seq = 0, .compression = .{ .algorithm = .ZlibOpenSsh } };
+    defer sender.clear();
+    try sender.compression.activateDeflate();
+    var prng = std.Random.DefaultPrng.init(42);
+    var rand = prng.random();
+    var packet_buf: [MaxSSHPacket]u8 = undefined;
+    const packet = try wrapPayload(&rand, false, &sender, payload.active(), &packet_buf);
+
+    const hdr = readPktHdr(packet[0..sizeof_PktHdr]);
+    const compressed_len: usize = @intCast(hdr.packet_length - hdr.padding_length - 1);
+    var receiver = CompressionState{ .algorithm = .ZlibOpenSsh };
+    defer receiver.deinit();
+    try receiver.activateInflate();
+    var decompressed: [MaxPayload]u8 = undefined;
+    const decoded = try receiver.decompressPayload(
+        packet[sizeof_PktHdr .. sizeof_PktHdr + compressed_len],
+        &decompressed,
+    );
+    try std.testing.expectEqualSlices(u8, payload.active(), decoded);
+}
+
+test "exact advertised DATA bound is encodable with incompressible zlib" {
+    try expectExactBoundCompressedChannelPayload(false);
+}
+
+test "exact advertised EXTENDED_DATA bound is encodable with incompressible zlib" {
+    try expectExactBoundCompressedChannelPayload(true);
 }
 
 test "zlib openssh decompression rejects invalid data" {

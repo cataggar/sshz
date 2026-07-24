@@ -606,8 +606,16 @@ pub fn MisshodImpl(role: Role) type {
                 // entire block has been consumed by caller
                 switch (self.iostate_wr) {
                     .Active => |iotype| {
-                        self.session.setIoSessionState(iotype.next_state);
                         self.iostate_wr = .Idle;
+                        switch (iotype.next_state) {
+                            .ChannelWriteComplete => |channel_id| {
+                                try self.session.completeChannelWrite(channel_id, self);
+                            },
+                            .ChannelControlComplete => |channel_id| {
+                                try self.session.completeChannelControl(channel_id, self);
+                            },
+                            else => self.session.setIoSessionState(iotype.next_state),
+                        }
                         try self.advance();
                     },
                     else => unreachable,
@@ -731,7 +739,10 @@ pub fn MisshodImpl(role: Role) type {
                         .Server => self.session.setIoSessionState(.VersionWrite),
                     }
                 },
+                .ChannelWriteComplete => return IoError.UnexpectedResponse,
+                .ChannelControlComplete => return IoError.UnexpectedResponse,
                 .ReadPktHdr => {
+                    _ = try self.session.dispatchDeferredChannelWrite(self);
                     if (self.session.inbound_encrypted) {
                         self.requestRead(0, Protocol.AesCtrT.block_size, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.AesCtrT.block_size] });
                     } else {
@@ -814,6 +825,8 @@ pub fn MisshodImpl(role: Role) type {
                 .ReadPktHdr, .ReadPktBody => self.iostate_rd == .Idle,
                 // Write-requiring states need write side idle
                 .VersionWrite => self.iostate_wr == .Idle,
+                .ChannelWriteComplete => false,
+                .ChannelControlComplete => false,
                 // Processing states
                 .VersionReadLineCompletion => true, // just sets next ioSessionState
                 .ReadPktCompletion => self.iostate_wr == .Idle, // handlePacket may event/write
@@ -866,15 +879,11 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
-            if (self.iostate_wr == .Idle and self.iostate_rd != .Idle) {
+            if (self.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
+            if (self.iostate_rd != .Idle) {
                 try self.session.directChannelWrite(channel_id, nbytes, self);
             } else {
-                self.iostate_rd = .Idle;
-                self.iostate_wr = .Idle;
-                try self.advance();
                 try self.session.channelWriteComplete(channel_id, nbytes);
-                self.iostate_rd = .Idle;
-                self.iostate_wr = .Idle;
                 try self.advance();
             }
         }
@@ -1079,14 +1088,12 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
-            try self.session.sendChannelEof(channel_id);
-            self.iostate_wr = .Idle;
+            try self.session.sendChannelEof(channel_id, self);
             try self.advance();
         }
 
         pub fn sendChannelClose(self: *Self, channel_id: u32) MisshodError!void {
-            try self.session.sendChannelClose(channel_id);
-            self.iostate_wr = .Idle;
+            try self.session.sendChannelClose(channel_id, self);
             try self.advance();
         }
 
@@ -2039,7 +2046,13 @@ test "ReadyToConsumeAndProduce struct fields" {
     }
 }
 
-test "full handshake round-trip then channel data exchange" {
+fn largeChannelTestByte(packet_index: u8, byte_index: usize) u8 {
+    var value: u32 = @intCast(byte_index);
+    value = value *% 1664525 +% 1013904223 +% packet_index;
+    return @truncate(value >> 24);
+}
+
+test "full handshake round-trip handles multiple large compressed channel packets" {
     const privkey = @import("privkey.zig");
 
     var cprng = std.Random.DefaultPrng.init(10);
@@ -2051,21 +2064,22 @@ test "full handshake round-trip then channel data exchange" {
     defer server.deinit();
 
     var c2s_buf: [16384]u8 = undefined;
-    var s2c_buf: [16384]u8 = undefined;
+    var s2c_buf: [Protocol.MaxSSHPacket]u8 = undefined;
     var c2s_len: usize = 0;
     var s2c_len: usize = 0;
 
     var connected_client = false;
     var connected_server = false;
-    var server_sent_data = false;
-    var client_rx_data: bool = false;
+    var server_packets_sent: u8 = 0;
+    var client_packets_received: u8 = 0;
+    const packet_lengths = [_]usize{ 12_000, 6_000 };
 
     const Endpoint = enum { client_ep, server_ep };
     const endpoints = [_]Endpoint{ .client_ep, .server_ep };
 
     var steps: usize = 0;
     while (steps < 1000) : (steps += 1) {
-        if (client_rx_data) break;
+        if (client_packets_received == packet_lengths.len) break;
 
         for (endpoints) |ep| {
             if (ep == .client_ep) {
@@ -2097,7 +2111,16 @@ test "full handshake round-trip then channel data exchange" {
                             client.clearEvent(.Connected) catch {};
                         },
                         .RxData => |data| {
-                            if (data.len > 0) client_rx_data = true;
+                            const packet_index: usize = client_packets_received;
+                            try std.testing.expect(packet_index < packet_lengths.len);
+                            try std.testing.expectEqual(packet_lengths[packet_index], data.len);
+                            for (data, 0..) |byte, byte_index| {
+                                try std.testing.expectEqual(
+                                    largeChannelTestByte(@intCast(packet_index), byte_index),
+                                    byte,
+                                );
+                            }
+                            client_packets_received += 1;
                             client.clearEvent(.{ .RxData = data }) catch {};
                         },
                         .EndSession => break,
@@ -2139,14 +2162,16 @@ test "full handshake round-trip then channel data exchange" {
                     },
                 }
 
-                // After server connects and event loop is clear, send channel data
-                if (connected_server and !server_sent_data and server.iostate_wr == .Idle) {
+                if (connected_server and server_packets_sent < packet_lengths.len and server.iostate_wr == .Idle and s2c_len == 0) {
                     const buf = server.getChannelWriteBuffer(0) catch continue;
-                    if (buf.len > 0) {
-                        const msg = "hello from server";
-                        @memcpy(buf[0..msg.len], msg);
-                        server.channelWriteComplete(0, msg.len) catch continue;
-                        server_sent_data = true;
+                    const packet_index: usize = server_packets_sent;
+                    const packet_len = packet_lengths[packet_index];
+                    if (buf.len >= packet_len) {
+                        for (buf[0..packet_len], 0..) |*byte, byte_index| {
+                            byte.* = largeChannelTestByte(@intCast(packet_index), byte_index);
+                        }
+                        server.channelWriteComplete(0, packet_len) catch continue;
+                        server_packets_sent += 1;
                     }
                 }
             }
@@ -2155,7 +2180,7 @@ test "full handshake round-trip then channel data exchange" {
 
     try std.testing.expect(connected_client);
     try std.testing.expect(connected_server);
-    try std.testing.expect(client_rx_data);
+    try std.testing.expectEqual(@as(u8, packet_lengths.len), client_packets_received);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.c2s.compression.algorithm);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.s2c.compression.algorithm);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, server.session.keydata.c2s.compression.algorithm);

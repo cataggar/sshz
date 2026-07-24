@@ -66,17 +66,27 @@ pub const ChannelKind = enum {
     AgentForward,
 };
 
+pub const ChannelControl = enum {
+    Eof,
+    Close,
+};
+
 pub const Channel = struct {
     const Self = @This();
 
     kind: ChannelKind,
     local_id: u32,
     remote_id: u32,
+    remote_id_known: bool,
     peer_window: u32,
     remote_max_packet_size: u32,
     local_window: u32,
     write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     write_buf_nbytes: usize,
+    tx_in_flight_len: usize,
+    eof_pending: bool,
+    close_pending: bool,
+    control_in_flight: ?ChannelControl,
     eof_sent: bool,
     eof_received: bool,
     close_sent: bool,
@@ -89,18 +99,30 @@ pub const Channel = struct {
     state: ChannelState,
 
     pub fn init(local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
-        return Self.initKind(.Session, local_id, remote_id, peer_window, remote_max_packet_size);
+        return Self.initKind(.Session, local_id, remote_id, true, peer_window, remote_max_packet_size);
     }
 
-    pub fn initKind(kind: ChannelKind, local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
+    pub fn initKind(
+        kind: ChannelKind,
+        local_id: u32,
+        remote_id: u32,
+        remote_id_known: bool,
+        peer_window: u32,
+        remote_max_packet_size: u32,
+    ) Self {
         return Self{
             .kind = kind,
             .local_id = local_id,
             .remote_id = remote_id,
+            .remote_id_known = remote_id_known,
             .peer_window = peer_window,
             .remote_max_packet_size = remote_max_packet_size,
-            .local_window = Protocol.MaxPayload,
+            .local_window = Protocol.MaxChannelDataLen,
             .write_buf_nbytes = 0,
+            .tx_in_flight_len = 0,
+            .eof_pending = false,
+            .close_pending = false,
+            .control_in_flight = null,
             .eof_sent = false,
             .eof_received = false,
             .close_sent = false,
@@ -118,6 +140,22 @@ pub const Channel = struct {
         std.crypto.secureZero(u8, &self.write_buf);
     }
 
+    pub fn consumeWriteBuffer(self: *Self, sent: usize) void {
+        std.debug.assert(sent <= self.write_buf_nbytes);
+        const remaining = self.write_buf_nbytes - sent;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.write_buf[0..remaining], self.write_buf[sent..self.write_buf_nbytes]);
+        }
+        std.crypto.secureZero(u8, self.write_buf[remaining..self.write_buf_nbytes]);
+        self.write_buf_nbytes = remaining;
+    }
+
+    pub fn discardWriteBuffer(self: *Self) void {
+        std.crypto.secureZero(u8, self.write_buf[0..self.write_buf_nbytes]);
+        self.write_buf_nbytes = 0;
+        self.tx_in_flight_len = 0;
+    }
+
     /// Decrement local_window by the amount of data received.
     pub fn consumeLocalWindow(self: *Self, len: u32) void {
         self.local_window -|= len; // saturating subtract
@@ -125,12 +163,12 @@ pub const Channel = struct {
 
     /// Returns true if local_window has dropped below the replenish threshold.
     pub fn needsWindowAdjust(self: *const Self) bool {
-        return self.local_window < Protocol.MaxPayload / 2;
+        return self.local_window < Protocol.MaxChannelDataLen / 2;
     }
 
-    /// Returns the number of bytes to add to bring local_window back to MaxPayload.
+    /// Returns the number of bytes to add to restore the advertised receive window.
     pub fn windowAdjustAmount(self: *const Self) u32 {
-        return Protocol.MaxPayload - self.local_window;
+        return @as(u32, @intCast(Protocol.MaxChannelDataLen)) - self.local_window;
     }
 };
 
@@ -142,14 +180,39 @@ pub const ChannelTable = struct {
     last_serviced_slot: usize = 0,
 
     pub fn allocChannel(self: *Self, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
-        return self.allocChannelKind(.Session, remote_id, peer_window, remote_max_packet_size);
+        return self.allocChannelKindKnown(.Session, remote_id, true, peer_window, remote_max_packet_size);
     }
 
-    pub fn allocChannelKind(self: *Self, kind: ChannelKind, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
+    pub fn allocOutboundChannel(self: *Self) ?*Channel {
+        return self.allocChannelKindKnown(.Session, 0, false, 0, 0);
+    }
+
+    pub fn allocOutboundChannelKind(self: *Self, kind: ChannelKind) ?*Channel {
+        return self.allocChannelKindKnown(kind, 0, false, 0, 0);
+    }
+
+    pub fn allocChannelKind(
+        self: *Self,
+        kind: ChannelKind,
+        remote_id: u32,
+        peer_window: u32,
+        remote_max_packet_size: u32,
+    ) ?*Channel {
+        return self.allocChannelKindKnown(kind, remote_id, true, peer_window, remote_max_packet_size);
+    }
+
+    fn allocChannelKindKnown(
+        self: *Self,
+        kind: ChannelKind,
+        remote_id: u32,
+        remote_id_known: bool,
+        peer_window: u32,
+        remote_max_packet_size: u32,
+    ) ?*Channel {
         const local_id = self.next_local_id;
         for (&self.channels) |*slot| {
             if (slot.* == null) {
-                slot.* = Channel.initKind(kind, local_id, remote_id, peer_window, remote_max_packet_size);
+                slot.* = Channel.initKind(kind, local_id, remote_id, remote_id_known, peer_window, remote_max_packet_size);
                 self.next_local_id +%= 1;
                 return &(slot.*.?);
             }
@@ -221,7 +284,31 @@ pub const ChannelTable = struct {
         while (i < MaxChannels) : (i += 1) {
             const slot_idx = (self.last_serviced_slot + 1 + i) % MaxChannels;
             if (self.channels[slot_idx]) |*ch| {
-                if (isRunnable(ch.state)) {
+                const tx_ready = ch.remote_id_known and ch.write_buf_nbytes > 0 and ch.tx_in_flight_len == 0 and ch.peer_window > 0;
+                const control_ready = ch.remote_id_known and ch.write_buf_nbytes == 0 and ch.tx_in_flight_len == 0 and
+                    ch.control_in_flight == null and
+                    ((ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
+                const terminal_close_ready = ch.remote_id_known and ch.tx_in_flight_len == 0 and ch.close_pending and !ch.close_sent;
+                if (tx_ready or control_ready or terminal_close_ready or isRunnable(ch.state)) {
+                    self.last_serviced_slot = slot_idx;
+                    return ch;
+                }
+            }
+        }
+        return null;
+    }
+
+    pub fn findNextDeferredWrite(self: *Self) ?*Channel {
+        var i: usize = 0;
+        while (i < MaxChannels) : (i += 1) {
+            const slot_idx = (self.last_serviced_slot + 1 + i) % MaxChannels;
+            if (self.channels[slot_idx]) |*ch| {
+                const tx_ready = ch.remote_id_known and ch.write_buf_nbytes > 0 and ch.tx_in_flight_len == 0 and ch.peer_window > 0;
+                const control_ready = ch.remote_id_known and ch.write_buf_nbytes == 0 and ch.tx_in_flight_len == 0 and
+                    ch.control_in_flight == null and
+                    ((ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
+                const terminal_close_ready = ch.remote_id_known and ch.tx_in_flight_len == 0 and ch.close_pending and !ch.close_sent;
+                if (tx_ready or control_ready or terminal_close_ready or (ch.close_received and !ch.close_sent)) {
                     self.last_serviced_slot = slot_idx;
                     return ch;
                 }
@@ -291,7 +378,7 @@ test "Channel init sets default values" {
     try std.testing.expectEqual(@as(u32, 42), ch.remote_id);
     try std.testing.expectEqual(@as(u32, 65535), ch.peer_window);
     try std.testing.expectEqual(@as(u32, 32768), ch.remote_max_packet_size);
-    try std.testing.expectEqual(Protocol.MaxPayload, ch.local_window);
+    try std.testing.expectEqual(Protocol.MaxChannelDataLen, ch.local_window);
     try std.testing.expectEqual(@as(usize, 0), ch.write_buf_nbytes);
     try std.testing.expect(!ch.eof_sent);
     try std.testing.expect(!ch.eof_received);
@@ -466,29 +553,29 @@ test "consumeLocalWindow saturates at zero" {
     try std.testing.expectEqual(@as(u32, 0), ch.local_window);
 }
 
-test "needsWindowAdjust triggers below half MaxPayload" {
+test "needsWindowAdjust triggers below half advertised window" {
     var ch = Channel.init(0, 1, 32768, 32768);
     // At full window — no adjust needed
     try std.testing.expect(!ch.needsWindowAdjust());
 
     // Just above threshold — no adjust
-    ch.local_window = Protocol.MaxPayload / 2;
+    ch.local_window = Protocol.MaxChannelDataLen / 2;
     try std.testing.expect(!ch.needsWindowAdjust());
 
     // Below threshold — adjust needed
-    ch.local_window = Protocol.MaxPayload / 2 - 1;
+    ch.local_window = Protocol.MaxChannelDataLen / 2 - 1;
     try std.testing.expect(ch.needsWindowAdjust());
 }
 
-test "windowAdjustAmount replenishes to MaxPayload" {
+test "windowAdjustAmount replenishes advertised window" {
     var ch = Channel.init(0, 1, 32768, 32768);
     ch.local_window = 100;
     const adjust = ch.windowAdjustAmount();
-    try std.testing.expectEqual(Protocol.MaxPayload - 100, adjust);
+    try std.testing.expectEqual(Protocol.MaxChannelDataLen - 100, adjust);
 
-    // After applying the adjust, window should be MaxPayload
+    // After applying the adjust, window should match the advertised window.
     ch.local_window += adjust;
-    try std.testing.expectEqual(Protocol.MaxPayload, ch.local_window);
+    try std.testing.expectEqual(Protocol.MaxChannelDataLen, ch.local_window);
 }
 
 test "EofWrite is a runnable state" {
