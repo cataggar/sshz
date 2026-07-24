@@ -9,6 +9,7 @@ const PrivKeyError = @import("privkey.zig").PrivKeyError;
 const Key = @import("key.zig");
 const Protocol = @import("protocol.zig");
 const BufferReader = @import("buffer.zig").BufferReader;
+const Hasher = @import("hasher.zig").Hasher;
 
 pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError || PrivKeyError || Key.KeyError;
 
@@ -33,10 +34,99 @@ pub const DisconnectReason = struct {
     description: []const u8,
 };
 
+pub const AuthMethod = enum {
+    None,
+    PublicKey,
+    Password,
+    KeyboardInteractive,
+
+    pub fn name(self: AuthMethod) []const u8 {
+        return switch (self) {
+            .None => "none",
+            .PublicKey => "publickey",
+            .Password => "password",
+            .KeyboardInteractive => "keyboard-interactive",
+        };
+    }
+
+    pub fn fromName(method_name: []const u8) ?AuthMethod {
+        inline for (std.meta.tags(AuthMethod)) |method| {
+            if (std.mem.eql(u8, method_name, method.name())) return method;
+        }
+        return null;
+    }
+};
+
+pub const AuthFailureInfo = struct {
+    pub const MaxSupportedMethods = std.meta.tags(AuthMethod).len;
+    pub const MaxUnsupportedMethodsLen = 128;
+
+    attempted_method: AuthMethod,
+    supported_methods: [MaxSupportedMethods]AuthMethod = .{.None} ** MaxSupportedMethods,
+    supported_methods_len: u8 = 0,
+    unsupported_methods: [MaxUnsupportedMethodsLen]u8 = .{0} ** MaxUnsupportedMethodsLen,
+    unsupported_methods_len: u8 = 0,
+    partial_success: bool,
+    auth_stage: u8,
+
+    pub fn parse(
+        attempted_method: AuthMethod,
+        method_names: []const u8,
+        partial_success: bool,
+        auth_stage: u8,
+    ) AuthFailureInfo {
+        var info: AuthFailureInfo = .{
+            .attempted_method = attempted_method,
+            .partial_success = partial_success,
+            .auth_stage = auth_stage,
+        };
+        var iter = std.mem.splitSequence(u8, method_names, ",");
+        while (iter.next()) |name| {
+            if (name.len == 0) continue;
+            if (AuthMethod.fromName(name)) |method| {
+                if (!info.hasMethod(method) and info.supported_methods_len < MaxSupportedMethods) {
+                    info.supported_methods[info.supported_methods_len] = method;
+                    info.supported_methods_len += 1;
+                }
+            } else {
+                info.appendUnsupportedMethod(name);
+            }
+        }
+        return info;
+    }
+
+    pub fn supportedMethods(self: *const AuthFailureInfo) []const AuthMethod {
+        return self.supported_methods[0..self.supported_methods_len];
+    }
+
+    pub fn unsupportedMethodNames(self: *const AuthFailureInfo) []const u8 {
+        return self.unsupported_methods[0..self.unsupported_methods_len];
+    }
+
+    pub fn hasMethod(self: *const AuthFailureInfo, method: AuthMethod) bool {
+        for (self.supportedMethods()) |supported| {
+            if (supported == method) return true;
+        }
+        return false;
+    }
+
+    fn appendUnsupportedMethod(self: *AuthFailureInfo, name: []const u8) void {
+        var offset: usize = self.unsupported_methods_len;
+        if (offset != 0) {
+            if (offset + 1 >= self.unsupported_methods.len) return;
+            self.unsupported_methods[offset] = ',';
+            offset += 1;
+        }
+        const copy_len = @min(name.len, self.unsupported_methods.len - offset);
+        @memcpy(self.unsupported_methods[offset .. offset + copy_len], name[0..copy_len]);
+        self.unsupported_methods_len = @intCast(offset + copy_len);
+    }
+};
+
 pub const EndSessionReason = union(enum) {
     Disconnect,
     ServerDisconnect: DisconnectReason,
-    AuthFailure,
+    AuthFailure: AuthFailureInfo,
 };
 
 pub const Role = enum {
@@ -75,7 +165,9 @@ pub const HostKeyInfo = struct {
 };
 
 pub const MisshodClientEventCodes = union(enum) {
+    ServerIdentification: []const u8,
     CheckHostKey: HostKeyInfo,
+    AuthMethodStarted: AuthMethod,
     GetPrivateKey,
     GetKeyPassphrase,
     GetAuthPassphrase,
@@ -514,8 +606,16 @@ pub fn MisshodImpl(role: Role) type {
                 // entire block has been consumed by caller
                 switch (self.iostate_wr) {
                     .Active => |iotype| {
-                        self.session.setIoSessionState(iotype.next_state);
                         self.iostate_wr = .Idle;
+                        switch (iotype.next_state) {
+                            .ChannelWriteComplete => |channel_id| {
+                                try self.session.completeChannelWrite(channel_id, self);
+                            },
+                            .ChannelControlComplete => |channel_id| {
+                                try self.session.completeChannelControl(channel_id, self);
+                            },
+                            else => self.session.setIoSessionState(iotype.next_state),
+                        }
                         try self.advance();
                     },
                     else => unreachable,
@@ -534,7 +634,7 @@ pub fn MisshodImpl(role: Role) type {
             if (pkt_len > iobuf.len) return IoError.InvalidPacketSize;
             const payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
 
-            if (!self.session.encrypted) {
+            if (!self.session.inbound_encrypted) {
                 const decompressed = try inkeys.compression.decompressPayload(payload, &self.iobuf_decompressed);
                 return BufferReader.init(decompressed);
             } else {
@@ -603,40 +703,54 @@ pub fn MisshodImpl(role: Role) type {
                     self.requestRead(0, 1, .{ .VersionReadLineChar = self.iobuf_rd[0..1] });
                 },
                 .VersionReadLineChar => |buf| {
-                    if (buf.len + 1 > self.iobuf_rd.len) {
-                        return IoError.noEOLFound;
-                    } else {
-                        if (buf.len >= 2) {
-                            if (buf[buf.len - 2] == '\r' and buf[buf.len - 1] == '\n') {
-                                self.session.setIoSessionState(.{ .VersionReadLineCompletion = buf });
-                                return;
-                            }
-                        }
-                        // read next char
-                        self.requestRead(buf.len, 1, .{ .VersionReadLineChar = self.iobuf_rd[0 .. buf.len + 1] });
+                    if (buf.len >= 1 and buf[buf.len - 1] == '\n') {
+                        self.session.setIoSessionState(.{ .VersionReadLineCompletion = buf });
+                        return;
                     }
+                    if (buf.len >= Protocol.MaxIdentificationLineLen) return IoError.noEOLFound;
+                    self.requestRead(buf.len, 1, .{ .VersionReadLineChar = self.iobuf_rd[0 .. buf.len + 1] });
                 },
                 .VersionReadLineCompletion => |buf| {
-                    TRACE(.Debug, "RX: version '{s}'", .{util.chomp(buf)});
+                    const terminator_len: usize = if (buf.len >= 2 and buf[buf.len - 2] == '\r') 2 else 1;
+                    const version = buf[0 .. buf.len - terminator_len];
+                    if (!std.mem.startsWith(u8, version, "SSH-")) {
+                        if (comptime role == .Server) return IoError.UnexpectedResponse;
+                        self.session.pre_identification_lines += 1;
+                        if (self.session.pre_identification_lines > Protocol.MaxPreIdentificationLines) {
+                            return IoError.UnexpectedResponse;
+                        }
+                        self.session.setIoSessionState(.VersionReadLine);
+                        return;
+                    }
+
+                    if (!Protocol.isValidIdentification(version)) return IoError.UnexpectedResponse;
+                    TRACE(.Debug, "RX: version '{s}'", .{version});
+                    try self.session.setPeerProtocolVersion(version);
                     switch (role) {
                         .Client => self.session.kex_hash_order = self.session.kex_hash_order.check(.V_S),
                         .Server => self.session.kex_hash_order = self.session.kex_hash_order.check(.V_C),
                     }
-                    self.session.kex_hasher.writeU32LenString(util.chomp(buf));
+                    self.session.kex_hasher.writeU32LenString(version);
                     switch (role) {
-                        .Client => self.session.setIoSessionState(.Idle),
+                        .Client => {
+                            self.session.setIoSessionState(.Idle);
+                            self.requestEvent(.{ .ServerIdentification = self.session.server_version.? }, .Idle);
+                        },
                         .Server => self.session.setIoSessionState(.VersionWrite),
                     }
                 },
+                .ChannelWriteComplete => return IoError.UnexpectedResponse,
+                .ChannelControlComplete => return IoError.UnexpectedResponse,
                 .ReadPktHdr => {
-                    if (self.session.encrypted) {
+                    _ = try self.session.dispatchDeferredChannelWrite(self);
+                    if (self.session.inbound_encrypted) {
                         self.requestRead(0, Protocol.AesCtrT.block_size, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.AesCtrT.block_size] });
                     } else {
                         self.requestRead(0, Protocol.sizeof_PktHdr, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.sizeof_PktHdr] });
                     }
                 },
                 .ReadPktBody => |buf| {
-                    if (self.session.encrypted) {
+                    if (self.session.inbound_encrypted) {
                         // https://datatracker.ietf.org/doc/html/rfc4253#section-6
                         // grab first encrypted block from writebuf
                         var firstblock_encbuf: [Protocol.AesCtrT.block_size]u8 = undefined;
@@ -711,6 +825,8 @@ pub fn MisshodImpl(role: Role) type {
                 .ReadPktHdr, .ReadPktBody => self.iostate_rd == .Idle,
                 // Write-requiring states need write side idle
                 .VersionWrite => self.iostate_wr == .Idle,
+                .ChannelWriteComplete => false,
+                .ChannelControlComplete => false,
                 // Processing states
                 .VersionReadLineCompletion => true, // just sets next ioSessionState
                 .ReadPktCompletion => self.iostate_wr == .Idle, // handlePacket may event/write
@@ -747,6 +863,13 @@ pub fn MisshodImpl(role: Role) type {
             try self.session.setAuthPassphrase(data);
         }
 
+        pub fn setTryNoneAuth(self: *Self, enabled: bool) MisshodError!void {
+            return switch (role) {
+                .Client => self.session.setTryNoneAuth(enabled),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
         pub fn isActive(self: *Self) bool {
             return self.session.isActive();
         }
@@ -756,15 +879,11 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
-            if (self.iostate_wr == .Idle and self.iostate_rd != .Idle) {
+            if (self.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
+            if (self.iostate_rd != .Idle) {
                 try self.session.directChannelWrite(channel_id, nbytes, self);
             } else {
-                self.iostate_rd = .Idle;
-                self.iostate_wr = .Idle;
-                try self.advance();
                 try self.session.channelWriteComplete(channel_id, nbytes);
-                self.iostate_rd = .Idle;
-                self.iostate_wr = .Idle;
                 try self.advance();
             }
         }
@@ -969,14 +1088,12 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
-            try self.session.sendChannelEof(channel_id);
-            self.iostate_wr = .Idle;
+            try self.session.sendChannelEof(channel_id, self);
             try self.advance();
         }
 
         pub fn sendChannelClose(self: *Self, channel_id: u32) MisshodError!void {
-            try self.session.sendChannelClose(channel_id);
-            self.iostate_wr = .Idle;
+            try self.session.sendChannelClose(channel_id, self);
             try self.advance();
         }
 
@@ -1002,9 +1119,37 @@ pub fn MisshodImpl(role: Role) type {
     };
 }
 
+fn feedClientIdentificationBytes(client: *MisshodClient, bytes: []const u8) !void {
+    for (bytes) |byte| {
+        const evt = try client.getNextEvent();
+        const can_consume = switch (evt) {
+            .ReadyToConsume => |n| n,
+            .ReadyToConsumeAndProduce => |sizes| sizes.consume,
+            else => return error.TestUnexpectedResult,
+        };
+        try std.testing.expect(can_consume > 0);
+        try client.write(&.{byte});
+    }
+}
+
+fn startClientIdentificationRead(client: *MisshodClient) !void {
+    const initial = try client.getNextEvent();
+    switch (initial) {
+        .ReadyToProduce => {},
+        else => return error.TestUnexpectedResult,
+    }
+    const client_identification = try client.peek(Protocol.MaxIdentificationLineLen);
+    try client.consumed(client_identification.len);
+}
+
 test "EndSessionReason tagged union" {
     const reason_disconnect: EndSessionReason = .Disconnect;
-    const reason_auth: EndSessionReason = .AuthFailure;
+    const reason_auth: EndSessionReason = .{ .AuthFailure = AuthFailureInfo.parse(
+        .Password,
+        "keyboard-interactive",
+        true,
+        2,
+    ) };
     const reason_server: EndSessionReason = .{ .ServerDisconnect = .{
         .code = 11,
         .description = "test disconnect",
@@ -1016,7 +1161,16 @@ test "EndSessionReason tagged union" {
     }
 
     switch (reason_auth) {
-        .AuthFailure => {},
+        .AuthFailure => |failure| {
+            try std.testing.expectEqual(AuthMethod.Password, failure.attempted_method);
+            try std.testing.expectEqualSlices(
+                AuthMethod,
+                &.{.KeyboardInteractive},
+                failure.supportedMethods(),
+            );
+            try std.testing.expect(failure.partial_success);
+            try std.testing.expectEqual(@as(u8, 2), failure.auth_stage);
+        },
         else => return error.TestUnexpectedResult,
     }
 
@@ -1027,6 +1181,209 @@ test "EndSessionReason tagged union" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "AuthFailureInfo public API is value-owned for apk2" {
+    var method_names = "publickey,gssapi-with-mic,password".*;
+    const failure = AuthFailureInfo.parse(.None, &method_names, true, 3);
+    @memset(&method_names, 'x');
+
+    try std.testing.expectEqual(AuthMethod.None, failure.attempted_method);
+    try std.testing.expectEqualSlices(
+        AuthMethod,
+        &.{ .PublicKey, .Password },
+        failure.supportedMethods(),
+    );
+    try std.testing.expectEqual(@as(u8, 2), failure.supported_methods_len);
+    try std.testing.expectEqualStrings("gssapi-with-mic", failure.unsupportedMethodNames());
+    try std.testing.expectEqual(@as(u8, "gssapi-with-mic".len), failure.unsupported_methods_len);
+    try std.testing.expectEqual(@as(usize, 128), failure.unsupported_methods.len);
+    try std.testing.expect(failure.partial_success);
+    try std.testing.expectEqual(@as(u8, 3), failure.auth_stage);
+
+    var long_unsupported: [AuthFailureInfo.MaxUnsupportedMethodsLen + 16]u8 = undefined;
+    @memset(&long_unsupported, 'u');
+    const bounded = AuthFailureInfo.parse(.Password, &long_unsupported, false, 1);
+    try std.testing.expectEqual(
+        @as(usize, AuthFailureInfo.MaxUnsupportedMethodsLen),
+        bounded.unsupportedMethodNames().len,
+    );
+}
+
+test "client retains exact server identification after RFC preamble" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+
+    const initial = try client.getNextEvent();
+    switch (initial) {
+        .ReadyToProduce => {},
+        else => return error.TestUnexpectedResult,
+    }
+    const client_identification = try client.peek(Protocol.MaxIdentificationLineLen);
+    try std.testing.expectEqualStrings(Protocol.version ++ "\r\n", client_identification);
+    try client.consumed(client_identification.len);
+
+    try feedClientIdentificationBytes(&client, "NOTICE exact spaces  \r\n");
+    try feedClientIdentificationBytes(&client, "SSH-2.0-test_server exact café  \r\n");
+
+    const evt = try client.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .ServerIdentification => |identification| {
+                try std.testing.expectEqualStrings("SSH-2.0-test_server exact café  ", identification);
+                try std.testing.expectEqualStrings(identification, client.session.server_version.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), client.session.pre_identification_lines);
+}
+
+test "client accepts 255 byte pre-identification and identification lines" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    try startClientIdentificationRead(&client);
+
+    var preamble: [Protocol.MaxIdentificationLineLen]u8 = undefined;
+    @memset(&preamble, 'p');
+    preamble[preamble.len - 2] = '\r';
+    preamble[preamble.len - 1] = '\n';
+    try feedClientIdentificationBytes(&client, &preamble);
+
+    var identification: [Protocol.MaxIdentificationLineLen]u8 = undefined;
+    @memset(&identification, 's');
+    const prefix = "SSH-2.0-";
+    @memcpy(identification[0..prefix.len], prefix);
+    identification[identification.len - 2] = '\r';
+    identification[identification.len - 1] = '\n';
+    try feedClientIdentificationBytes(&client, &identification);
+
+    const evt = try client.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .ServerIdentification => |server_identification| {
+                try std.testing.expectEqual(
+                    Protocol.MaxIdentificationLineLen - 2,
+                    server_identification.len,
+                );
+                try std.testing.expectEqualStrings(
+                    identification[0 .. identification.len - 2],
+                    server_identification,
+                );
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectEqual(@as(usize, 1), client.session.pre_identification_lines);
+}
+
+test "client accepts and hashes exact 255 byte LF-only SSH 1.99 identification" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    try startClientIdentificationRead(&client);
+
+    var identification: [Protocol.MaxIdentificationLineLen]u8 = undefined;
+    @memset(&identification, 's');
+    const prefix = "SSH-1.99-";
+    @memcpy(identification[0..prefix.len], prefix);
+    identification[identification.len - 1] = '\n';
+    try feedClientIdentificationBytes(&client, &identification);
+
+    const exact = identification[0 .. identification.len - 1];
+    const evt = try client.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .ServerIdentification => |server_identification| {
+                try std.testing.expectEqualStrings(exact, server_identification);
+                try std.testing.expectEqualStrings(exact, client.session.server_version.?);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var expected_hasher = Hasher(Protocol.hash_algo).init();
+    expected_hasher.writeU32LenString(Protocol.version);
+    expected_hasher.writeU32LenString(exact);
+    var expected: [Protocol.hash_algo.digest_length]u8 = undefined;
+    expected_hasher.final(&expected, null);
+    var actual: [Protocol.hash_algo.digest_length]u8 = undefined;
+    client.session.kex_hasher.final(&actual, null);
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "client rejects identification line whose CRLF would exceed 255 bytes" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    try startClientIdentificationRead(&client);
+
+    var overlong: [Protocol.MaxIdentificationLineLen + 1]u8 = undefined;
+    @memset(&overlong, 'x');
+    overlong[overlong.len - 2] = '\r';
+    overlong[overlong.len - 1] = '\n';
+    try feedClientIdentificationBytes(&client, overlong[0 .. Protocol.MaxIdentificationLineLen - 1]);
+    try std.testing.expectError(
+        IoError.noEOLFound,
+        client.write(overlong[Protocol.MaxIdentificationLineLen - 1 .. Protocol.MaxIdentificationLineLen]),
+    );
+}
+
+test "client rejects unterminated 255 byte identification line" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    try startClientIdentificationRead(&client);
+
+    var unterminated: [Protocol.MaxIdentificationLineLen]u8 = undefined;
+    @memset(&unterminated, 'x');
+    try feedClientIdentificationBytes(&client, unterminated[0 .. unterminated.len - 1]);
+    try std.testing.expectError(
+        IoError.noEOLFound,
+        client.write(unterminated[unterminated.len - 1 ..]),
+    );
+}
+
+test "client rejects malformed SSH identification grammar and bytes" {
+    const malformed = [_][]const u8{
+        "SSH-2.0-\r\n",
+        "SSH-2.0- comment-without-software\r\n",
+        "SSH-two.server\r\n",
+        "SSH-2.0-server\x01comment\r\n",
+        "SSH-2.0-server\x7fcomment\r\n",
+        "SSH-2.0-server\x80comment\r\n",
+    };
+
+    for (malformed) |line| {
+        var prng = std.Random.DefaultPrng.init(42);
+        var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+        defer client.deinit();
+        try startClientIdentificationRead(&client);
+        try std.testing.expectError(
+            IoError.UnexpectedResponse,
+            feedClientIdentificationBytes(&client, line),
+        );
+    }
+}
+
+test "client bounds pre-identification lines" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+
+    _ = try client.getNextEvent();
+    const client_identification = try client.peek(Protocol.MaxIdentificationLineLen);
+    try client.consumed(client_identification.len);
+    client.session.pre_identification_lines = Protocol.MaxPreIdentificationLines;
+
+    const line = "one-too-many\r\n";
+    try feedClientIdentificationBytes(&client, line[0 .. line.len - 1]);
+    try std.testing.expectError(IoError.UnexpectedResponse, client.write(line[line.len - 1 ..]));
 }
 
 test "MisshodClientEventCodes Banner variant" {
@@ -1164,6 +1521,7 @@ test "client-server full handshake round-trip" {
 
     var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
+    try client.setTryNoneAuth(true);
     var server = try MisshodServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
     defer server.deinit();
 
@@ -1173,6 +1531,10 @@ test "client-server full handshake round-trip" {
     var s2c_len: usize = 0;
 
     var connected_client = false;
+    var event_order: usize = 0;
+    var identification_order: ?usize = null;
+    var host_key_order: ?usize = null;
+    var auth_order: ?usize = null;
 
     const Endpoint = enum { client_ep, server_ep };
     const endpoints = [_]Endpoint{ .client_ep, .server_ep };
@@ -1214,7 +1576,19 @@ test "client-server full handshake round-trip" {
                         }
                     },
                     .Event => |code| switch (code) {
+                        .ServerIdentification => {
+                            identification_order = event_order;
+                            event_order += 1;
+                            client.clearEvent(code) catch {};
+                        },
+                        .AuthMethodStarted => {
+                            auth_order = event_order;
+                            event_order += 1;
+                            client.clearEvent(code) catch {};
+                        },
                         .CheckHostKey => {
+                            host_key_order = event_order;
+                            event_order += 1;
                             client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {};
                         },
                         .GetPrivateKey => {
@@ -1283,6 +1657,8 @@ test "client-server full handshake round-trip" {
     }
 
     try std.testing.expect(connected_client);
+    try std.testing.expect(identification_order.? < host_key_order.?);
+    try std.testing.expect(host_key_order.? < auth_order.?);
 }
 
 test "HostKeyInfo fingerprint computation" {
@@ -1670,7 +2046,13 @@ test "ReadyToConsumeAndProduce struct fields" {
     }
 }
 
-test "full handshake round-trip then channel data exchange" {
+fn largeChannelTestByte(packet_index: u8, byte_index: usize) u8 {
+    var value: u32 = @intCast(byte_index);
+    value = value *% 1664525 +% 1013904223 +% packet_index;
+    return @truncate(value >> 24);
+}
+
+test "full handshake round-trip handles multiple large compressed channel packets" {
     const privkey = @import("privkey.zig");
 
     var cprng = std.Random.DefaultPrng.init(10);
@@ -1682,21 +2064,22 @@ test "full handshake round-trip then channel data exchange" {
     defer server.deinit();
 
     var c2s_buf: [16384]u8 = undefined;
-    var s2c_buf: [16384]u8 = undefined;
+    var s2c_buf: [Protocol.MaxSSHPacket]u8 = undefined;
     var c2s_len: usize = 0;
     var s2c_len: usize = 0;
 
     var connected_client = false;
     var connected_server = false;
-    var server_sent_data = false;
-    var client_rx_data: bool = false;
+    var server_packets_sent: u8 = 0;
+    var client_packets_received: u8 = 0;
+    const packet_lengths = [_]usize{ 12_000, 6_000 };
 
     const Endpoint = enum { client_ep, server_ep };
     const endpoints = [_]Endpoint{ .client_ep, .server_ep };
 
     var steps: usize = 0;
     while (steps < 1000) : (steps += 1) {
-        if (client_rx_data) break;
+        if (client_packets_received == packet_lengths.len) break;
 
         for (endpoints) |ep| {
             if (ep == .client_ep) {
@@ -1728,7 +2111,16 @@ test "full handshake round-trip then channel data exchange" {
                             client.clearEvent(.Connected) catch {};
                         },
                         .RxData => |data| {
-                            if (data.len > 0) client_rx_data = true;
+                            const packet_index: usize = client_packets_received;
+                            try std.testing.expect(packet_index < packet_lengths.len);
+                            try std.testing.expectEqual(packet_lengths[packet_index], data.len);
+                            for (data, 0..) |byte, byte_index| {
+                                try std.testing.expectEqual(
+                                    largeChannelTestByte(@intCast(packet_index), byte_index),
+                                    byte,
+                                );
+                            }
+                            client_packets_received += 1;
                             client.clearEvent(.{ .RxData = data }) catch {};
                         },
                         .EndSession => break,
@@ -1770,14 +2162,16 @@ test "full handshake round-trip then channel data exchange" {
                     },
                 }
 
-                // After server connects and event loop is clear, send channel data
-                if (connected_server and !server_sent_data and server.iostate_wr == .Idle) {
+                if (connected_server and server_packets_sent < packet_lengths.len and server.iostate_wr == .Idle and s2c_len == 0) {
                     const buf = server.getChannelWriteBuffer(0) catch continue;
-                    if (buf.len > 0) {
-                        const msg = "hello from server";
-                        @memcpy(buf[0..msg.len], msg);
-                        server.channelWriteComplete(0, msg.len) catch continue;
-                        server_sent_data = true;
+                    const packet_index: usize = server_packets_sent;
+                    const packet_len = packet_lengths[packet_index];
+                    if (buf.len >= packet_len) {
+                        for (buf[0..packet_len], 0..) |*byte, byte_index| {
+                            byte.* = largeChannelTestByte(@intCast(packet_index), byte_index);
+                        }
+                        server.channelWriteComplete(0, packet_len) catch continue;
+                        server_packets_sent += 1;
                     }
                 }
             }
@@ -1786,7 +2180,7 @@ test "full handshake round-trip then channel data exchange" {
 
     try std.testing.expect(connected_client);
     try std.testing.expect(connected_server);
-    try std.testing.expect(client_rx_data);
+    try std.testing.expectEqual(@as(u8, packet_lengths.len), client_packets_received);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.c2s.compression.algorithm);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.s2c.compression.algorithm);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, server.session.keydata.c2s.compression.algorithm);
