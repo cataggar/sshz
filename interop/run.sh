@@ -404,8 +404,11 @@ banner=misshod-dropbear-auth-banner
 authorized_fixture_keys=passwordless-ed25519,encrypted-ed25519
 EOF
 
+        # Dropbear rejects locked accounts before public-key authorization.
+        # The empty password only unlocks this ephemeral account; -s keeps
+        # password authentication disabled for the isolated server.
         "${ROOT_CMD[@]}" "$USERADD_BIN" --home-dir "$DROPBEAR_HOME" --shell /bin/sh \
-            --no-create-home --user-group "$DROPBEAR_USER"
+            --no-create-home --user-group --password '' "$DROPBEAR_USER"
         DROPBEAR_USER_CREATED=1
         "${ROOT_CMD[@]}" chown -R "$DROPBEAR_USER:$DROPBEAR_USER" "$DROPBEAR_HOME"
 
