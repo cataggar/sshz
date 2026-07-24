@@ -8,6 +8,61 @@ on:
   workflow_dispatch:
 
 jobs:
+  stress:
+    name: Required deterministic stress
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout misshod
+        uses: actions/checkout@v5
+        with:
+          path: misshod
+      - name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="0.16.0"
+          archive="zig-x86_64-linux-${version}.tar.xz"
+          zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          echo "${zig_dir}" >> "${GITHUB_PATH}"
+          "${zig_dir}/zig" version
+      - name: Install resource measurement tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y time
+      - name: Run deterministic stress acceptance
+        working-directory: misshod
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/misshod-stress-safe"
+          /usr/bin/time \
+            -f "resource elapsed_seconds=%e max_rss_kib=%M exit=%x" \
+            -o "${RUNNER_TEMP}/misshod-stress-safe/resource.txt" \
+            zig build stress -Doptimize=ReleaseSafe -- --seed 1751547392 \
+            2>&1 | tee "${RUNNER_TEMP}/misshod-stress-safe/stress.log"
+          cat "${RUNNER_TEMP}/misshod-stress-safe/resource.txt"
+          elapsed="$(sed -n 's/.*elapsed_seconds=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/misshod-stress-safe/resource.txt")"
+          rss="$(sed -n 's/.*max_rss_kib=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/misshod-stress-safe/resource.txt")"
+          awk -v value="$elapsed" 'BEGIN { exit !(value <= 600) }' || {
+            echo "stress elapsed-time budget exceeded: ${elapsed}s > 600s" >&2
+            exit 1
+          }
+          if (( rss > 1048576 )); then
+            echo "stress RSS budget exceeded: ${rss} KiB > 1048576 KiB" >&2
+            exit 1
+          fi
+      - name: Upload safe stress failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-failure-logs
+          path: ${{ runner.temp }}/misshod-stress-safe/
+          if-no-files-found: ignore
+          retention-days: 7
+
   test:
     strategy:
       matrix:
@@ -43,6 +98,13 @@ jobs:
       - name: Build test
         run: zig build test
         working-directory: misshod
+      - name: Bounded malformed-input corpus (Debug and ReleaseSafe)
+        if: runner.os == 'Linux'
+        timeout-minutes: 3
+        run: |
+          zig build malformed -Doptimize=Debug --test-timeout 30s --seed 0
+          zig build malformed -Doptimize=ReleaseSafe --test-timeout 30s --seed 0
+        working-directory: misshod
       - name: Build lib
         run: zig build
         working-directory: misshod
@@ -56,9 +118,21 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libssh-dev openssh-client openssh-server pkg-config
+          sudo apt-get install -y dropbear-bin gcc libssh-dev openssh-client openssh-server pkg-config
           sudo mkdir -p /run/sshd
       - name: Interop test
         if: runner.os == 'Linux'
         run: zig build interop
         working-directory: misshod
+        env:
+          MSSH_INTEROP_ARTIFACTS: ${{ runner.temp }}/misshod-interop
+          MSSH_INTEROP_REQUIRE_DROPBEAR: "1"
+          MSSH_INTEROP_REQUIRE_LIBSSH: "1"
+      - name: Upload interop failure logs
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-failure-logs
+          path: ${{ runner.temp }}/misshod-interop/logs/
+          if-no-files-found: ignore
+          retention-days: 7

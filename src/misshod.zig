@@ -1,17 +1,22 @@
 const std = @import("std");
 const util = @import("util.zig");
 const TRACE = util.trace;
-const TRACEDUMP = util.tracedump;
+const UNSAFE_TRACEDUMP = util.unsafeTracedump;
 const ClientSession = @import("client_session.zig").Session;
+const ClientSessionState = @import("client_session.zig").SessionState;
 const ServerSession = @import("server_session.zig").Session;
-const BufferError = @import("buffer.zig").BufferError;
+const ServerSessionState = @import("server_session.zig").SessionState;
+pub const BufferError = @import("buffer.zig").BufferError;
+pub const BufferReader = @import("buffer.zig").BufferReader;
+pub const BufferWriter = @import("buffer.zig").BufferWriter;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
 const Key = @import("key.zig");
 const Protocol = @import("protocol.zig");
-const BufferReader = @import("buffer.zig").BufferReader;
 const Hasher = @import("hasher.zig").Hasher;
+const Channel = @import("channel.zig");
 
-pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError || PrivKeyError || Key.KeyError;
+pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError ||
+    ResourceLimitConfigError || Channel.ChannelError || DeadlineError || PrivKeyError || Key.KeyError;
 
 pub const IoError = error{
     cannotAcceptWrite,
@@ -25,9 +30,381 @@ pub const IoError = error{
     tooBig,
     UnimplementedService,
     AlgorithmNegotiationFailed,
+    HostKeyChanged,
     NotReady,
     tooManyChannels,
+    UnsupportedMessage,
+    ResourceLimitExceeded,
+    TooManyAuthAttempts,
+    TooManyPreAuthPackets,
+    TooMuchPreAuthWork,
+    TooManyKeyExchanges,
+    RekeyTooFrequent,
+    InvalidChannelParameters,
+    KeyLifetimeExceeded,
+    SessionTerminated,
 };
+
+pub const ResourceLimitConfigError = error{
+    PacketLimitExceedsCapacity,
+    PayloadLimitExceedsCapacity,
+    InvalidPacketPayloadLimits,
+    ChannelLimitExceedsCapacity,
+    InvalidChannelWindowLimits,
+    InvalidPeerPacketLimit,
+    BufferedDataLimitExceedsCapacity,
+    InvalidPendingDataLimit,
+    IdentificationLimitExceedsCapacity,
+    InvalidPreAuthLimit,
+    InvalidAuthAttemptLimit,
+    InvalidKeyExchangeLimit,
+    InvalidKeyLifetimeLimit,
+    GlobalRequestLimitExceedsCapacity,
+    DecompressionLimitExceedsCapacity,
+    InvalidDeadlineLimit,
+};
+
+pub const DeadlineError = error{
+    DeadlinesAlreadyInitialized,
+    DeadlinesNotInitialized,
+    NonMonotonicTime,
+};
+
+pub const TimeoutOutcome = enum {
+    Handshake,
+    Authentication,
+    Idle,
+    TotalSession,
+};
+
+pub const DeadlineLimits = struct {
+    handshake: ?u64 = null,
+    authentication: ?u64 = null,
+    idle: ?u64 = null,
+    total_session: ?u64 = null,
+};
+
+pub const KeyLifetimeLimits = struct {
+    rekey_after_encrypted_bytes: u64 = 1024 * 1024 * 1024,
+    rekey_after_encrypted_packets: u64 = 1 << 30,
+    rekey_after_monotonic_ticks: ?u64 = null,
+};
+
+pub const ResourceCapacities = struct {
+    pub const packet_size: usize = Protocol.MaxSSHPacket;
+    pub const payload_size: usize = Protocol.MaxPayload;
+    pub const channels: u8 = Channel.MaxChannels;
+    pub const channel_window: u32 = std.math.maxInt(u32);
+    pub const channel_packet_size: u32 = Protocol.MaxChannelDataLen;
+    pub const channel_buffered_data: usize = Protocol.MaxChannelDataLen;
+    pub const pending_buffered_data: usize = Channel.MaxPendingChannelData;
+    pub const identification_lines: u16 = Protocol.MaxPreIdentificationLines;
+    pub const identification_bytes: usize =
+        Protocol.MaxIdentificationLineLen * (Protocol.MaxPreIdentificationLines + 1);
+    pub const pre_auth_packets: u32 = 1_000_000;
+    pub const pre_auth_work: u32 = 1_000_000;
+    pub const server_auth_attempts: u16 = 1024;
+    pub const key_exchanges: u16 = 1024;
+    pub const rekey_spacing_packets: u32 = 1_000_000;
+    pub const encrypted_bytes_per_key: u64 = Protocol.AesCtrT.max_bytes_per_key;
+    pub const packets_per_sequence: u64 = std.math.maxInt(u32);
+    pub const rekey_reserve_packets: u64 = 5;
+    pub const rekey_after_encrypted_bytes: u64 = 1024 * 1024 * 1024;
+    pub const rekey_after_encrypted_packets: u64 = 1 << 30;
+    pub const outstanding_global_requests: u8 = 1;
+    pub const decompressed_payload_size: usize = Protocol.MaxPayload;
+};
+
+pub const ResourceLimits = struct {
+    max_packet_size: usize = ResourceCapacities.packet_size,
+    max_payload_size: usize = ResourceCapacities.payload_size,
+    max_channels: u8 = ResourceCapacities.channels,
+    initial_channel_window: u32 = Protocol.MaxChannelDataLen,
+    max_channel_window: u32 = ResourceCapacities.channel_window,
+    channel_packet_size: u32 = Protocol.MaxChannelDataLen,
+    max_peer_packet_size: u32 = Protocol.MaxChannelDataLen,
+    max_channel_buffered_data: usize = ResourceCapacities.channel_buffered_data,
+    max_pending_buffered_data: usize = ResourceCapacities.pending_buffered_data,
+    max_identification_lines: u16 = Protocol.MaxPreIdentificationLines,
+    max_identification_bytes: usize = ResourceCapacities.identification_bytes,
+    max_pre_auth_packets: u32 = 256,
+    max_pre_auth_work: u32 = 1024,
+    max_server_auth_attempts: u16 = 8,
+    max_key_exchanges: u16 = 8,
+    min_packets_between_rekeys: u32 = 0,
+    max_outstanding_global_requests: u8 = 1,
+    max_decompressed_payload_size: usize = ResourceCapacities.decompressed_payload_size,
+    deadlines: DeadlineLimits = .{},
+    key_lifetime: KeyLifetimeLimits = .{},
+
+    pub fn validate(self: ResourceLimits) ResourceLimitConfigError!void {
+        if (self.max_packet_size == 0 or self.max_packet_size > ResourceCapacities.packet_size)
+            return error.PacketLimitExceedsCapacity;
+        if (self.max_payload_size == 0 or self.max_payload_size > ResourceCapacities.payload_size)
+            return error.PayloadLimitExceedsCapacity;
+        const framing_overhead = Protocol.sizeof_PktHdr + 4 + Protocol.mac_algo.key_length;
+        if (self.max_packet_size <= framing_overhead or
+            self.max_payload_size > self.max_packet_size - framing_overhead)
+            return error.InvalidPacketPayloadLimits;
+        if (self.max_channels == 0 or self.max_channels > ResourceCapacities.channels)
+            return error.ChannelLimitExceedsCapacity;
+        if (self.initial_channel_window == 0 or self.initial_channel_window > self.max_channel_window)
+            return error.InvalidChannelWindowLimits;
+        if (self.channel_packet_size == 0 or
+            self.channel_packet_size > ResourceCapacities.channel_packet_size or
+            self.channel_packet_size > self.initial_channel_window)
+            return error.InvalidPeerPacketLimit;
+        if (self.max_peer_packet_size == 0 or self.max_peer_packet_size > ResourceCapacities.channel_packet_size)
+            return error.InvalidPeerPacketLimit;
+        if (self.max_channel_buffered_data == 0 or
+            self.max_channel_buffered_data > ResourceCapacities.channel_buffered_data)
+            return error.BufferedDataLimitExceedsCapacity;
+        if (self.max_pending_buffered_data < self.max_channel_buffered_data or
+            self.max_pending_buffered_data > ResourceCapacities.pending_buffered_data)
+            return error.InvalidPendingDataLimit;
+        if (self.max_identification_lines > ResourceCapacities.identification_lines or
+            self.max_identification_bytes == 0 or
+            self.max_identification_bytes > ResourceCapacities.identification_bytes)
+            return error.IdentificationLimitExceedsCapacity;
+        if (self.max_pre_auth_packets == 0 or self.max_pre_auth_packets > ResourceCapacities.pre_auth_packets or
+            self.max_pre_auth_work == 0 or self.max_pre_auth_work > ResourceCapacities.pre_auth_work)
+            return error.InvalidPreAuthLimit;
+        if (self.max_server_auth_attempts == 0 or
+            self.max_server_auth_attempts > ResourceCapacities.server_auth_attempts)
+            return error.InvalidAuthAttemptLimit;
+        if (self.max_key_exchanges == 0 or
+            self.max_key_exchanges > ResourceCapacities.key_exchanges or
+            self.min_packets_between_rekeys > ResourceCapacities.rekey_spacing_packets)
+            return error.InvalidKeyExchangeLimit;
+        const byte_reserve = std.math.mul(
+            u64,
+            self.max_packet_size,
+            ResourceCapacities.rekey_reserve_packets,
+        ) catch return error.InvalidKeyLifetimeLimit;
+        if (self.key_lifetime.rekey_after_encrypted_bytes == 0 or
+            self.key_lifetime.rekey_after_encrypted_bytes >
+                ResourceCapacities.rekey_after_encrypted_bytes or
+            self.key_lifetime.rekey_after_encrypted_bytes >
+                ResourceCapacities.encrypted_bytes_per_key - byte_reserve or
+            self.key_lifetime.rekey_after_encrypted_packets == 0 or
+            self.key_lifetime.rekey_after_encrypted_packets >
+                ResourceCapacities.rekey_after_encrypted_packets or
+            self.key_lifetime.rekey_after_encrypted_packets >
+                ResourceCapacities.packets_per_sequence - ResourceCapacities.rekey_reserve_packets)
+            return error.InvalidKeyLifetimeLimit;
+        if (self.key_lifetime.rekey_after_monotonic_ticks) |duration| {
+            if (duration == 0) return error.InvalidKeyLifetimeLimit;
+        }
+        if (self.max_outstanding_global_requests == 0 or
+            self.max_outstanding_global_requests > ResourceCapacities.outstanding_global_requests)
+            return error.GlobalRequestLimitExceedsCapacity;
+        if (self.max_decompressed_payload_size == 0 or
+            self.max_decompressed_payload_size > ResourceCapacities.decompressed_payload_size or
+            self.max_decompressed_payload_size > self.max_payload_size or
+            self.channel_packet_size > self.max_decompressed_payload_size -| Protocol.ChannelExtendedDataFramingLen)
+            return error.DecompressionLimitExceedsCapacity;
+        if (Protocol.zlibSyncFlushBound(self.channel_packet_size + Protocol.ChannelExtendedDataFramingLen) >
+            self.max_payload_size)
+            return error.InvalidPeerPacketLimit;
+        inline for (std.meta.fields(DeadlineLimits)) |field| {
+            if (@field(self.deadlines, field.name)) |duration| {
+                if (duration == 0) return error.InvalidDeadlineLimit;
+            }
+        }
+    }
+
+    pub fn channelLimits(self: ResourceLimits) Channel.ChannelLimits {
+        return .{
+            .max_channels = self.max_channels,
+            .initial_window = self.initial_channel_window,
+            .max_window = self.max_channel_window,
+            .packet_size = self.channel_packet_size,
+            .max_buffered_data = self.max_channel_buffered_data,
+        };
+    }
+};
+
+pub const KeyEpochStatus = struct {
+    epoch: u64,
+    encrypted_bytes: u64,
+    encrypted_packets: u64,
+    next_sequence_number: u32,
+    activated_at_monotonic_tick: ?u64,
+    age_monotonic_ticks: ?u64,
+};
+
+pub const KeyLifetimeStatus = struct {
+    inbound: KeyEpochStatus,
+    outbound: KeyEpochStatus,
+    local_rekey_pending: bool,
+    rekey_in_progress: bool,
+};
+
+pub const IdentificationInputError = error{
+    noEOLFound,
+    UnexpectedResponse,
+};
+
+pub const PacketInputError = error{
+    notEnoughData,
+    InvalidPacketSize,
+    InvalidMac,
+};
+
+pub const MessageInputError = BufferError || error{
+    UnsupportedMessage,
+};
+
+pub const EcdhInputError = BufferError || error{
+    UnexpectedResponse,
+};
+
+pub const MacInputError = error{
+    InvalidMac,
+};
+
+pub const TransportLimits = struct {
+    pub const packet_header_len = Protocol.sizeof_PktHdr;
+    pub const max_packet_len = Protocol.MaxSSHPacket;
+    pub const max_payload_len = Protocol.MaxPayload;
+    pub const max_identification_line_len = Protocol.MaxIdentificationLineLen;
+    pub const cipher_block_len = Protocol.AesCtrT.block_size;
+    pub const mac_len = Protocol.mac_algo.key_length;
+    pub const ecdh_public_key_len = Protocol.kex_algo.public_length;
+};
+
+pub const CompressionAlgorithm = Protocol.CompressionAlgorithm;
+pub const CompressionState = Protocol.CompressionState;
+
+pub const PacketFrame = struct {
+    packet_len: usize,
+    payload_offset: usize,
+    payload_len: usize,
+    padding_len: u8,
+    mac_offset: ?usize,
+};
+
+pub fn inspectIdentificationLine(line: []const u8) IdentificationInputError![]const u8 {
+    if (line.len == 0 or line.len > Protocol.MaxIdentificationLineLen or line[line.len - 1] != '\n') {
+        return error.noEOLFound;
+    }
+    const terminator_len: usize = if (line.len >= 2 and line[line.len - 2] == '\r') 2 else 1;
+    const identification = line[0 .. line.len - terminator_len];
+    if (!Protocol.isValidIdentification(identification)) return error.UnexpectedResponse;
+    return identification;
+}
+
+pub fn inspectPacketHeader(packet: []const u8, encrypted: bool) PacketInputError!PacketFrame {
+    return inspectPacketHeaderWithLimits(
+        packet,
+        encrypted,
+        Protocol.MaxSSHPacket,
+        Protocol.MaxPayload,
+    );
+}
+
+fn inspectPacketHeaderWithLimits(
+    packet: []const u8,
+    encrypted: bool,
+    max_packet_size: usize,
+    max_payload_size: usize,
+) PacketInputError!PacketFrame {
+    if (packet.len < Protocol.sizeof_PktHdr) return error.notEnoughData;
+
+    const hdr = Protocol.readPktHdr(packet[0..Protocol.sizeof_PktHdr]);
+    if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
+        return error.InvalidPacketSize;
+    }
+
+    const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
+    if (payload_len > max_payload_size) return error.InvalidPacketSize;
+    const packet_len: usize = 4 + @as(usize, hdr.packet_length);
+    const wire_len = packet_len + if (encrypted) @as(usize, Protocol.mac_algo.key_length) else 0;
+    if (wire_len > max_packet_size) return error.InvalidPacketSize;
+    if (encrypted and packet_len % Protocol.AesCtrT.block_size != 0) {
+        return error.InvalidPacketSize;
+    }
+
+    return .{
+        .packet_len = packet_len,
+        .payload_offset = Protocol.sizeof_PktHdr,
+        .payload_len = payload_len,
+        .padding_len = hdr.padding_length,
+        .mac_offset = if (encrypted) packet_len else null,
+    };
+}
+
+pub fn inspectPacket(packet: []const u8, encrypted: bool) PacketInputError!PacketFrame {
+    return inspectPacketWithLimits(packet, encrypted, Protocol.MaxSSHPacket, Protocol.MaxPayload);
+}
+
+fn inspectPacketWithLimits(
+    packet: []const u8,
+    encrypted: bool,
+    max_packet_size: usize,
+    max_payload_size: usize,
+) PacketInputError!PacketFrame {
+    const frame = try inspectPacketHeaderWithLimits(packet, encrypted, max_packet_size, max_payload_size);
+    if (packet.len < frame.packet_len) return error.notEnoughData;
+
+    if (encrypted) {
+        const expected_len = frame.packet_len + Protocol.mac_algo.key_length;
+        if (packet.len < expected_len) return error.InvalidMac;
+        if (packet.len != expected_len) return error.InvalidPacketSize;
+    } else if (packet.len != frame.packet_len) {
+        return error.InvalidPacketSize;
+    }
+    return frame;
+}
+
+pub fn inspectMessageFraming(payload: []const u8) MessageInputError!void {
+    var reader = BufferReader.init(payload);
+    const message_id = try reader.readU8();
+    inline for (std.meta.tags(Protocol.MsgId)) |known| {
+        if (message_id == @intFromEnum(known)) return;
+    }
+    return error.UnsupportedMessage;
+}
+
+pub fn inspectEcdhPublicKeyString(encoded: []const u8) EcdhInputError!void {
+    var reader = BufferReader.init(encoded);
+    const public_key = try reader.readU32LenString();
+    if (public_key.len != Protocol.kex_algo.public_length or reader.off != reader.payload.len) {
+        return error.UnexpectedResponse;
+    }
+}
+
+pub fn exerciseEcdhReplyPublicKey(public_key: []const u8, allocator: std.mem.Allocator) MisshodError!void {
+    var prng = std.Random.DefaultPrng.init(0x60);
+    var client = try MisshodClient.init(prng.random(), "malformed-corpus", allocator);
+    defer client.deinit();
+
+    var payload_backing: [128]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
+    try payload.writeU32LenString("");
+    try payload.writeU32LenString(public_key);
+    try payload.writeU32LenString("");
+
+    var packet_random = prng.random();
+    const packet = try Protocol.wrapPayload(
+        &packet_random,
+        false,
+        &client.session.keydata.s2c,
+        payload.active(),
+        &client.iobuf_rd,
+    );
+    client.session.setSessionState(.EcdhReply);
+    try client.session.handlePacket(packet, &client);
+}
+
+pub fn verifyPacketMac(calculated: [Protocol.mac_algo.key_length]u8, received: []const u8) MacInputError!void {
+    const mac_length = Protocol.mac_algo.key_length;
+    if (received.len != mac_length) return error.InvalidMac;
+    if (!std.crypto.timing_safe.eql([mac_length]u8, calculated, received[0..mac_length].*)) {
+        return error.InvalidMac;
+    }
+}
 
 pub const DisconnectReason = struct {
     code: u32,
@@ -127,6 +504,7 @@ pub const EndSessionReason = union(enum) {
     Disconnect,
     ServerDisconnect: DisconnectReason,
     AuthFailure: AuthFailureInfo,
+    HostKeyRejected: HostKeyInfo,
 };
 
 pub const Role = enum {
@@ -248,11 +626,13 @@ pub const ExtendedData = struct {
     data: []const u8,
 };
 
-pub const UserCredentialsPasswordOrPubkey = union(enum) {
+pub const UserAuthAttempt = union(enum) {
     Password: []const u8,
     Pubkey: PublicKeyIdentity,
     KeyboardInteractive: []const u8, // submethods
 };
+
+pub const UserCredentialsPasswordOrPubkey = UserAuthAttempt;
 
 pub const PublicKeyIdentity = struct {
     algorithm: []const u8,
@@ -261,8 +641,26 @@ pub const PublicKeyIdentity = struct {
 
 pub const UserCredentials = struct {
     username: []const u8,
-    auth: ?UserCredentialsPasswordOrPubkey, // null for "none" auth
+    auth: ?UserAuthAttempt, // null for "none" auth
+
+    pub fn method(self: UserCredentials) AuthMethod {
+        const attempt = self.auth orelse return .None;
+        return switch (attempt) {
+            .Password => .Password,
+            .Pubkey => .PublicKey,
+            .KeyboardInteractive => .KeyboardInteractive,
+        };
+    }
 };
+
+pub const AuthorizationDecision = enum {
+    Deny,
+    Allow,
+};
+
+pub fn validateUserPublicKeyBlob(blob: []const u8) MisshodError!void {
+    _ = try Key.parsePublicKeyBlob(blob);
+}
 
 pub const ChannelRequestType = union(enum) {
     Shell,
@@ -357,6 +755,22 @@ pub fn IoState(role: Role) type {
 pub const MisshodClient = MisshodImpl(.Client);
 pub const MisshodServer = MisshodImpl(.Server);
 
+const DeadlinePhase = enum {
+    Handshake,
+    Authentication,
+    Active,
+};
+
+const DeadlineState = struct {
+    initialized: bool = false,
+    started_at: u64 = 0,
+    phase_started_at: u64 = 0,
+    last_activity_at: u64 = 0,
+    last_observed_at: u64 = 0,
+    phase: DeadlinePhase = .Handshake,
+    timeout: ?TimeoutOutcome = null,
+};
+
 pub fn MisshodImpl(role: Role) type {
     return struct {
         const Self = @This();
@@ -365,36 +779,378 @@ pub fn MisshodImpl(role: Role) type {
         iostate_rd: IoState(role),
         iostate_wr: IoState(role),
 
-        // full-duplex: separate read and write buffers
-        iobuf_rd: [Protocol.MaxSSHPacket]u8 = undefined,
-        iobuf_wr: [Protocol.MaxSSHPacket]u8 = undefined,
-        iobuf_decompressed: [Protocol.MaxPayload]u8 = undefined,
+        // Session-owned packet storage. Event slices borrow these buffers and
+        // remain valid only until the event is cleared or another API call
+        // documented to release the event is made.
+        iobuf_rd: [Protocol.MaxSSHPacket]u8 = .{0} ** Protocol.MaxSSHPacket,
+        iobuf_wr: [Protocol.MaxSSHPacket]u8 = .{0} ** Protocol.MaxSSHPacket,
+        iobuf_decompressed: [Protocol.MaxPayload]u8 = .{0} ** Protocol.MaxPayload,
         rd_nbytes: usize,
         rd_off: usize,
         wr_nbytes: usize,
         wr_off: usize,
+        limits: ResourceLimits,
+        identification_bytes: usize,
+        pre_auth_packets: u32,
+        pre_auth_work: u32,
+        server_auth_attempts: u16,
+        key_exchanges: u16,
+        packets_received: u64,
+        last_kex_packet: ?u64,
+        deadline_state: DeadlineState,
+        local_rekey_pending: bool,
+        terminated: bool,
 
         pub fn init(rand: std.Random, username: []const u8, allocator: std.mem.Allocator) !Self {
+            return initWithLimits(rand, username, allocator, .{});
+        }
+
+        pub fn initWithLimits(
+            rand: std.Random,
+            username: []const u8,
+            allocator: std.mem.Allocator,
+            limits: ResourceLimits,
+        ) !Self {
+            try limits.validate();
             return Self{
-                .session = try sessionType(role).init(rand, username, allocator),
+                .session = try sessionType(role).initWithLimits(rand, username, allocator, limits),
                 .rd_nbytes = 0,
                 .rd_off = 0,
                 .wr_nbytes = 0,
                 .wr_off = 0,
                 .iostate_rd = .Idle,
                 .iostate_wr = .Idle,
+                .limits = limits,
+                .identification_bytes = 0,
+                .pre_auth_packets = 0,
+                .pre_auth_work = 0,
+                .server_auth_attempts = 0,
+                .key_exchanges = 0,
+                .packets_received = 0,
+                .last_kex_packet = null,
+                .deadline_state = .{},
+                .local_rekey_pending = false,
+                .terminated = false,
             };
         }
 
         pub fn deinit(self: *Self) void {
+            self.terminated = true;
+            self.iostate_rd = .Idle;
+            self.iostate_wr = .Idle;
+            self.local_rekey_pending = false;
             self.session.deinit();
             std.crypto.secureZero(u8, &self.iobuf_rd);
             std.crypto.secureZero(u8, &self.iobuf_wr);
             std.crypto.secureZero(u8, &self.iobuf_decompressed);
+            self.rd_nbytes = 0;
+            self.rd_off = 0;
+            self.wr_nbytes = 0;
+            self.wr_off = 0;
+        }
+
+        fn currentDeadlinePhase(self: *const Self) DeadlinePhase {
+            return switch (role) {
+                .Client => switch (self.session.sessionState) {
+                    .AuthServReq,
+                    .AuthServRsp,
+                    .AuthStart,
+                    .NoneAuthReq,
+                    .GetPrivateKeyCompleted,
+                    .PubkeyAuthDecodeKeyPasswordless,
+                    .PubkeyAuthDecodeKeyPassword,
+                    .PubkeyAuthStart,
+                    .PubkeyAuthReq,
+                    .AuthMethodQueued,
+                    .AuthRsp,
+                    .PasswordAuthStart,
+                    .PasswordAuthReq,
+                    .KeyboardInteractiveAuthStart,
+                    .KeyboardInteractiveAuthReq,
+                    .KeyboardInteractiveInfoRsp,
+                    => .Authentication,
+                    .ChannelOpenReq, .ChannelOpenRsp, .ChannelActive => .Active,
+                    else => .Handshake,
+                },
+                .Server => switch (self.session.sessionState) {
+                    .AuthRead,
+                    .AuthRspServReqSuccess,
+                    .CheckUserPasswordAuth,
+                    .UserAuthDenied,
+                    .UserAuthAccepted,
+                    .AuthPkAllowed,
+                    => .Authentication,
+                    .Authenticated, .ChannelActive => .Active,
+                    else => .Handshake,
+                },
+            };
+        }
+
+        fn observeMonotonic(self: *Self, now: u64) DeadlineError!void {
+            if (!self.deadline_state.initialized) return error.DeadlinesNotInitialized;
+            if (now < self.deadline_state.last_observed_at) return error.NonMonotonicTime;
+            self.deadline_state.last_observed_at = now;
+        }
+
+        pub fn initializeDeadlines(self: *Self, now: u64) DeadlineError!void {
+            if (self.deadline_state.initialized) return error.DeadlinesAlreadyInitialized;
+            const phase = self.currentDeadlinePhase();
+            self.deadline_state = .{
+                .initialized = true,
+                .started_at = now,
+                .phase_started_at = now,
+                .last_activity_at = now,
+                .last_observed_at = now,
+                .phase = phase,
+            };
+            if (self.session.inbound_encrypted) {
+                const inkeys = self.inboundKeyData();
+                if (inkeys.activated_at_monotonic_tick == null)
+                    inkeys.activated_at_monotonic_tick = now;
+            }
+            if (self.session.encrypted) {
+                const outkeys = self.outboundKeyData();
+                if (outkeys.activated_at_monotonic_tick == null)
+                    outkeys.activated_at_monotonic_tick = now;
+            }
+        }
+
+        pub fn noteActivity(self: *Self, now: u64) DeadlineError!void {
+            try self.observeMonotonic(now);
+            self.deadline_state.last_activity_at = now;
+        }
+
+        fn expired(now: u64, since: u64, limit: ?u64) bool {
+            return if (limit) |duration| now - since >= duration else false;
+        }
+
+        pub fn checkDeadlines(self: *Self, now: u64) DeadlineError!?TimeoutOutcome {
+            try self.observeMonotonic(now);
+            if (self.deadline_state.timeout) |outcome| return outcome;
+
+            if (expired(now, self.deadline_state.started_at, self.limits.deadlines.total_session))
+                return .TotalSession;
+            if (expired(now, self.deadline_state.last_activity_at, self.limits.deadlines.idle))
+                return .Idle;
+
+            const phase = self.currentDeadlinePhase();
+            if (phase != self.deadline_state.phase) {
+                self.deadline_state.phase = phase;
+                self.deadline_state.phase_started_at = now;
+            }
+            const phase_limit = switch (phase) {
+                .Handshake => self.limits.deadlines.handshake,
+                .Authentication => self.limits.deadlines.authentication,
+                .Active => null,
+            };
+            if (expired(now, self.deadline_state.phase_started_at, phase_limit)) {
+                return switch (phase) {
+                    .Handshake => .Handshake,
+                    .Authentication => .Authentication,
+                    .Active => unreachable,
+                };
+            }
+            return null;
+        }
+
+        pub fn tick(self: *Self, now: u64) DeadlineError!?TimeoutOutcome {
+            const outcome = try self.checkDeadlines(now);
+            if (outcome) |timed_out| {
+                self.deadline_state.timeout = timed_out;
+                self.failClosed();
+            } else {
+                self.updateLocalRekeyPending(now);
+                _ = self.maybeStartLocalRekey();
+            }
+            return outcome;
+        }
+
+        pub fn timeoutOutcome(self: *const Self) ?TimeoutOutcome {
+            return self.deadline_state.timeout;
+        }
+
+        fn inboundKeyData(self: *Self) *Protocol.KeyDataUni {
+            return switch (role) {
+                .Client => &self.session.keydata.s2c,
+                .Server => &self.session.keydata.c2s,
+            };
+        }
+
+        fn outboundKeyData(self: *Self) *Protocol.KeyDataUni {
+            return switch (role) {
+                .Client => &self.session.keydata.c2s,
+                .Server => &self.session.keydata.s2c,
+            };
+        }
+
+        pub fn keyActivationTime(self: *const Self) ?u64 {
+            return if (self.deadline_state.initialized)
+                self.deadline_state.last_observed_at
+            else
+                null;
+        }
+
+        fn keyUsageDue(self: *const Self, keys: *const Protocol.KeyDataUni, now: ?u64) bool {
+            if (keys.epoch == 0) return false;
+            if (keys.encrypted_bytes >= self.limits.key_lifetime.rekey_after_encrypted_bytes or
+                keys.encrypted_packets >= self.limits.key_lifetime.rekey_after_encrypted_packets)
+                return true;
+            const age_limit = self.limits.key_lifetime.rekey_after_monotonic_ticks orelse return false;
+            const activated_at = keys.activated_at_monotonic_tick orelse return false;
+            const current = now orelse return false;
+            return current - activated_at >= age_limit;
+        }
+
+        fn updateLocalRekeyPending(self: *Self, now: ?u64) void {
+            if (self.session.is_rekeying) {
+                self.local_rekey_pending = false;
+                return;
+            }
+            if (self.keyUsageDue(self.inboundKeyData(), now) or
+                self.keyUsageDue(self.outboundKeyData(), now))
+                self.local_rekey_pending = true;
+        }
+
+        fn maybeStartLocalRekey(self: *Self) bool {
+            if (!self.local_rekey_pending or self.session.is_rekeying or
+                !self.session.encrypted or !self.session.inbound_encrypted or
+                self.iostate_rd != .Idle or self.iostate_wr != .Idle)
+                return false;
+            switch (self.session.ioSessionState) {
+                .Idle, .ReadPktHdr => {},
+                else => return false,
+            }
+            self.session.startLocalRekey();
+            self.local_rekey_pending = false;
+            return true;
+        }
+
+        fn epochStatus(self: *const Self, keys: *const Protocol.KeyDataUni) KeyEpochStatus {
+            const age = if (self.deadline_state.initialized and
+                keys.activated_at_monotonic_tick != null)
+                self.deadline_state.last_observed_at - keys.activated_at_monotonic_tick.?
+            else
+                null;
+            return .{
+                .epoch = keys.epoch,
+                .encrypted_bytes = keys.encrypted_bytes,
+                .encrypted_packets = keys.encrypted_packets,
+                .next_sequence_number = keys.seq,
+                .activated_at_monotonic_tick = keys.activated_at_monotonic_tick,
+                .age_monotonic_ticks = age,
+            };
+        }
+
+        pub fn keyLifetimeStatus(self: *const Self) KeyLifetimeStatus {
+            const inbound = switch (role) {
+                .Client => &self.session.keydata.s2c,
+                .Server => &self.session.keydata.c2s,
+            };
+            const outbound = switch (role) {
+                .Client => &self.session.keydata.c2s,
+                .Server => &self.session.keydata.s2c,
+            };
+            return .{
+                .inbound = self.epochStatus(inbound),
+                .outbound = self.epochStatus(outbound),
+                .local_rekey_pending = self.local_rekey_pending,
+                .rekey_in_progress = self.session.is_rekeying,
+            };
+        }
+
+        fn gateApplicationInitiation(self: *Self) MisshodError!void {
+            self.updateLocalRekeyPending(null);
+            _ = self.maybeStartLocalRekey();
+            if (self.local_rekey_pending or self.session.is_rekeying) return IoError.NotReady;
+        }
+
+        fn latchKeyLifetimeError(self: *Self, err: MisshodError) void {
+            if (err == IoError.KeyLifetimeExceeded) self.failClosed();
+        }
+
+        fn failClosed(self: *Self) void {
+            if (self.terminated) return;
+            self.terminated = true;
+            self.iostate_rd = .Idle;
+            self.iostate_wr = .Idle;
+            self.rd_nbytes = 0;
+            self.rd_off = 0;
+            self.wr_nbytes = 0;
+            self.wr_off = 0;
+            self.local_rekey_pending = false;
+            std.crypto.secureZero(u8, &self.iobuf_rd);
+            std.crypto.secureZero(u8, &self.iobuf_wr);
+            std.crypto.secureZero(u8, &self.iobuf_decompressed);
+            self.session.failClosed();
+        }
+
+        fn scrubReceiveBuffers(self: *Self) void {
+            std.crypto.secureZero(u8, &self.iobuf_rd);
+            std.crypto.secureZero(u8, &self.iobuf_decompressed);
+            self.rd_nbytes = 0;
+            self.rd_off = 0;
+        }
+
+        pub fn accountInboundMessage(self: *Self, msgid: u8) MisshodError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            if (self.packets_received == std.math.maxInt(u64)) {
+                self.failClosed();
+                return IoError.ResourceLimitExceeded;
+            }
+            self.packets_received += 1;
+
+            if (self.currentDeadlinePhase() != .Active) {
+                if (self.pre_auth_packets >= self.limits.max_pre_auth_packets) {
+                    self.failClosed();
+                    return IoError.TooManyPreAuthPackets;
+                }
+                self.pre_auth_packets += 1;
+                const work: u32 = switch (msgid) {
+                    @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT),
+                    @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT),
+                    @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY),
+                    => 8,
+                    @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => 4,
+                    else => 1,
+                };
+                if (work > self.limits.max_pre_auth_work -| self.pre_auth_work) {
+                    self.failClosed();
+                    return IoError.TooMuchPreAuthWork;
+                }
+                self.pre_auth_work += work;
+            }
+
+            if (msgid == @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT)) {
+                if (self.key_exchanges >= self.limits.max_key_exchanges) {
+                    self.failClosed();
+                    return IoError.TooManyKeyExchanges;
+                }
+                if (self.last_kex_packet) |last| {
+                    if (self.packets_received - last <= self.limits.min_packets_between_rekeys) {
+                        self.failClosed();
+                        return IoError.RekeyTooFrequent;
+                    }
+                }
+                self.key_exchanges += 1;
+                self.last_kex_packet = self.packets_received;
+            }
+
+            if (comptime role == .Server) {
+                if (msgid == @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)) {
+                    if (self.server_auth_attempts >= self.limits.max_server_auth_attempts) {
+                        self.failClosed();
+                        return IoError.TooManyAuthAttempts;
+                    }
+                    self.server_auth_attempts += 1;
+                }
+            }
         }
 
         // for session use
-        pub fn requestWrite(self: *Self, wbuf: []const u8, next_state: Protocol.IoSessionState) void {
+        pub fn requestWrite(self: *Self, wbuf: []const u8, next_state: Protocol.IoSessionState) MisshodError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            if (wbuf.len == 0 or wbuf.len > self.limits.max_packet_size)
+                return IoError.ResourceLimitExceeded;
             std.debug.assert(self.iostate_wr == .Idle);
             std.debug.assert(&wbuf[0] == &self.iobuf_wr[0]);
             self.wr_nbytes = wbuf.len;
@@ -407,6 +1163,7 @@ pub fn MisshodImpl(role: Role) type {
 
         // for session use
         pub fn requestRead(self: *Self, offset: usize, nbytes: usize, next_state: Protocol.IoSessionState) void {
+            if (offset == 0) self.scrubReceiveBuffers();
             self.rd_nbytes = 0;
             self.rd_off = offset;
             self.iostate_rd = .{ .Active = .{
@@ -423,6 +1180,34 @@ pub fn MisshodImpl(role: Role) type {
             } };
         }
 
+        /// Resolves and clears the current server UserAuth event in one step.
+        /// Allow accepts a public-key probe with PK_OK, but only accepts a signed
+        /// public-key request as authentication. All other outcomes remain denied.
+        pub fn decideUserAuth(self: *Self, decision: AuthorizationDecision) MisshodError!void {
+            switch (role) {
+                .Client => return IoError.UnimplementedService,
+                .Server => {
+                    switch (self.iostate_wr) {
+                        .Active => |iotype| switch (iotype.action) {
+                            .Eventing => |event_code| switch (event_code) {
+                                .UserAuth => {
+                                    try self.session.decideAuthorization(decision);
+                                    try self.clearEvent(event_code);
+                                    return;
+                                },
+                                else => {},
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                    return IoError.UnexpectedResponse;
+                },
+            }
+        }
+
+        /// Compatibility API for setting the current server UserAuth decision.
+        /// The application must subsequently clear the UserAuth event.
         pub fn grantAccess(self: *Self, allow: bool) MisshodError!void {
             switch (role) {
                 .Client => return IoError.UnimplementedService, // FIXME something more tailored
@@ -431,23 +1216,34 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn clearEvent(self: *Self, clearEventCode: eventCodeType(role)) MisshodError!void {
-            TRACE(.Debug, "clearEvent clearEventCode={any}", .{clearEventCode});
-            TRACE(.Debug, "clearEvent iostate_wr={any}", .{self.iostate_wr});
+            TRACE(.Debug, "clearEvent tag={s}", .{@tagName(clearEventCode)});
 
             switch (self.iostate_wr) {
                 .Active => |iotype| {
                     switch (iotype.action) {
                         .Eventing => |eventCode| {
                             if (@intFromEnum(eventCode) == @intFromEnum(clearEventCode)) {
+                                if (comptime role == .Client) {
+                                    switch (eventCode) {
+                                        .CheckHostKey => return IoError.badClearEvent,
+                                        else => {},
+                                    }
+                                }
                                 if (comptime role == .Server) {
                                     switch (eventCode) {
                                         .TcpipForward, .CancelTcpipForward => return IoError.badClearEvent,
+                                        .UserAuth => {
+                                            if (self.session.sessionState == .CheckUserPasswordAuth) {
+                                                try self.session.decideAuthorization(.Deny);
+                                            }
+                                        },
                                         else => {},
                                     }
                                 }
                                 // event succesfully cleared
                                 self.session.setIoSessionState(iotype.next_state);
                                 self.iostate_wr = .Idle;
+                                self.scrubReceiveBuffers();
                                 try self.advance();
                                 return;
                             }
@@ -462,6 +1258,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn getNextEvent(self: *Self) MisshodError!MisshodEvent(role) {
+            if (self.terminated) return IoError.SessionTerminated;
             // if eventing, send an event
             switch (self.iostate_wr) {
                 .Active => |iotype| {
@@ -532,6 +1329,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn write(self: *Self, wbuf: []const u8) MisshodError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             TRACE(.Debug, "misshod.write len={d} .rd_nbytes={d}", .{ wbuf.len, self.rd_nbytes });
             switch (self.iostate_rd) {
                 .Active => |iotype| {
@@ -559,6 +1357,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn peek(self: *Self, nbytes: usize) MisshodError![]const u8 {
+            if (self.terminated) return IoError.SessionTerminated;
             TRACE(.Debug, "peek nbytes={d} .wr_off={d} .wr_nbytes={d}", .{ nbytes, self.wr_off, self.wr_nbytes });
             // sanity check
             switch (self.iostate_wr) {
@@ -581,6 +1380,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn consumed(self: *Self, nbytes: usize) MisshodError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             TRACE(.Debug, "consumed nbytes={d} wr_off={d} .wr_nbytes={d}", .{ nbytes, self.wr_off, self.wr_nbytes });
 
             const bytes_remaining = self.wr_nbytes - self.wr_off;
@@ -607,12 +1407,21 @@ pub fn MisshodImpl(role: Role) type {
                 switch (self.iostate_wr) {
                     .Active => |iotype| {
                         self.iostate_wr = .Idle;
+                        std.crypto.secureZero(u8, self.iobuf_wr[0..self.wr_nbytes]);
+                        self.wr_nbytes = 0;
+                        self.wr_off = 0;
                         switch (iotype.next_state) {
                             .ChannelWriteComplete => |channel_id| {
-                                try self.session.completeChannelWrite(channel_id, self);
+                                self.session.completeChannelWrite(channel_id, self) catch |err| {
+                                    self.failClosed();
+                                    return err;
+                                };
                             },
                             .ChannelControlComplete => |channel_id| {
-                                try self.session.completeChannelControl(channel_id, self);
+                                self.session.completeChannelControl(channel_id, self) catch |err| {
+                                    self.failClosed();
+                                    return err;
+                                };
                             },
                             else => self.session.setIoSessionState(iotype.next_state),
                         }
@@ -624,57 +1433,65 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn getRecvBuffer(self: *Self, iobuf: []u8, inkeys: *Protocol.KeyDataUni) MisshodError!BufferReader {
-            const hdr = Protocol.readPktHdr(iobuf[0..Protocol.sizeof_PktHdr]);
-            if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
-                return IoError.InvalidPacketSize;
-            }
-            const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
-            if (payload_len > Protocol.MaxPayload) return IoError.InvalidPacketSize;
-            const pkt_len = Protocol.sizeof_PktHdr + payload_len + hdr.padding_length;
-            if (pkt_len > iobuf.len) return IoError.InvalidPacketSize;
+            const frame = try inspectPacketWithLimits(
+                iobuf,
+                self.session.inbound_encrypted,
+                self.limits.max_packet_size,
+                self.limits.max_payload_size,
+            );
+            const payload_len = frame.payload_len;
+            const pkt_len = frame.packet_len;
             const payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
 
             if (!self.session.inbound_encrypted) {
-                const decompressed = try inkeys.compression.decompressPayload(payload, &self.iobuf_decompressed);
+                const decompressed = try inkeys.compression.decompressPayload(
+                    payload,
+                    self.iobuf_decompressed[0..self.limits.max_decompressed_payload_size],
+                );
                 return BufferReader.init(decompressed);
             } else {
-                TRACEDUMP(.Debug, "all buf", .{}, iobuf);
+                UNSAFE_TRACEDUMP(.Debug, "all buf", .{}, iobuf);
                 if (pkt_len > Protocol.AesCtrT.block_size) { // if there's more to be decrypted after first block
                     const remaining_pkt_bytes = pkt_len - Protocol.AesCtrT.block_size;
                     var dec: [Protocol.MaxSSHPacket]u8 = undefined;
-                    inkeys.aesctr.encrypt(iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes], dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes]); // use same offset into dec for simplicity
+                    defer std.crypto.secureZero(u8, &dec);
+                    inkeys.aesctr.encrypt(
+                        iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
+                        dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
+                    ) catch return IoError.KeyLifetimeExceeded;
 
-                    TRACEDUMP(.Debug, "dec", .{}, dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes]);
+                    UNSAFE_TRACEDUMP(.Debug, "dec", .{}, dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes]);
                     // copy decrypted back into writebuf
                     @memcpy(iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes], dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes]);
-                    TRACEDUMP(.Debug, "writebuf", .{}, iobuf[0..pkt_len]);
+                    UNSAFE_TRACEDUMP(.Debug, "writebuf", .{}, iobuf[0..pkt_len]);
                 }
 
                 // verify mac
-                if (iobuf.len < Protocol.mac_algo.key_length) {
-                    return IoError.InvalidPacketSize; // too small to have a mac
-                }
-                const rxmac = iobuf[pkt_len..iobuf.len]; // at the end
+                const rxmac = iobuf[frame.mac_offset.?..iobuf.len];
                 var calcmac: [Protocol.mac_algo.key_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &calcmac);
                 var m = Protocol.mac_algo.init(inkeys.mackey[0..Protocol.mac_algo.key_length]);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
                 const seq = std.mem.nativeTo(u32, inkeys.seq - 1, .big); // seq has already been incremented
                 m.update(std.mem.asBytes(&seq));
                 m.update(iobuf[0..pkt_len]); // plaintext
                 m.final(&calcmac);
 
-                TRACEDUMP(.Debug, "rxmac", .{}, rxmac);
-                TRACEDUMP(.Debug, "mackey", .{}, inkeys.mackey[0..Protocol.mac_algo.key_length]);
-                TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
-                TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..pkt_len]);
-                TRACEDUMP(.Debug, "calcmac", .{}, std.mem.asBytes(&calcmac));
+                UNSAFE_TRACEDUMP(.Debug, "rxmac", .{}, rxmac);
+                UNSAFE_TRACEDUMP(.Debug, "mackey", .{}, inkeys.mackey[0..Protocol.mac_algo.key_length]);
+                UNSAFE_TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
+                UNSAFE_TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..pkt_len]);
+                UNSAFE_TRACEDUMP(.Debug, "calcmac", .{}, std.mem.asBytes(&calcmac));
 
-                if (!std.mem.eql(u8, &calcmac, rxmac)) {
-                    return IoError.InvalidMac;
-                }
+                try verifyPacketMac(calcmac, rxmac);
+                try inkeys.accountEncryptedPacket(pkt_len);
 
                 // remove mac and return buffer containing just plaintext payload
                 const decrypted_payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
-                const decompressed = try inkeys.compression.decompressPayload(decrypted_payload, &self.iobuf_decompressed);
+                const decompressed = try inkeys.compression.decompressPayload(
+                    decrypted_payload,
+                    self.iobuf_decompressed[0..self.limits.max_decompressed_payload_size],
+                );
                 return BufferReader.init(decompressed);
             }
         }
@@ -694,8 +1511,8 @@ pub fn MisshodImpl(role: Role) type {
                 .VersionWrite => {
                     const sl = self.session.writeProtocolVersion(&self.iobuf_wr);
                     switch (role) {
-                        .Client => self.requestWrite(sl, .VersionReadLine),
-                        .Server => self.requestWrite(sl, .Idle),
+                        .Client => try self.requestWrite(sl, .VersionReadLine),
+                        .Server => try self.requestWrite(sl, .Idle),
                     }
                 },
                 .VersionReadLine => {
@@ -711,19 +1528,19 @@ pub fn MisshodImpl(role: Role) type {
                     self.requestRead(buf.len, 1, .{ .VersionReadLineChar = self.iobuf_rd[0 .. buf.len + 1] });
                 },
                 .VersionReadLineCompletion => |buf| {
-                    const terminator_len: usize = if (buf.len >= 2 and buf[buf.len - 2] == '\r') 2 else 1;
-                    const version = buf[0 .. buf.len - terminator_len];
-                    if (!std.mem.startsWith(u8, version, "SSH-")) {
+                    if (buf.len > self.limits.max_identification_bytes -| self.identification_bytes)
+                        return IoError.ResourceLimitExceeded;
+                    self.identification_bytes += buf.len;
+                    if (!std.mem.startsWith(u8, buf, "SSH-")) {
                         if (comptime role == .Server) return IoError.UnexpectedResponse;
                         self.session.pre_identification_lines += 1;
-                        if (self.session.pre_identification_lines > Protocol.MaxPreIdentificationLines) {
-                            return IoError.UnexpectedResponse;
-                        }
+                        if (self.session.pre_identification_lines > self.limits.max_identification_lines)
+                            return IoError.ResourceLimitExceeded;
                         self.session.setIoSessionState(.VersionReadLine);
                         return;
                     }
 
-                    if (!Protocol.isValidIdentification(version)) return IoError.UnexpectedResponse;
+                    const version = try inspectIdentificationLine(buf);
                     TRACE(.Debug, "RX: version '{s}'", .{version});
                     try self.session.setPeerProtocolVersion(version);
                     switch (role) {
@@ -750,37 +1567,28 @@ pub fn MisshodImpl(role: Role) type {
                     }
                 },
                 .ReadPktBody => |buf| {
+                    if (inkeys.seq == std.math.maxInt(u32)) return IoError.KeyLifetimeExceeded;
                     if (self.session.inbound_encrypted) {
                         // https://datatracker.ietf.org/doc/html/rfc4253#section-6
                         // grab first encrypted block from writebuf
                         var firstblock_encbuf: [Protocol.AesCtrT.block_size]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &firstblock_encbuf);
                         @memcpy(&firstblock_encbuf, buf);
 
                         // decrypt directly into iobuf_rd
-                        inkeys.aesctr.encrypt(&firstblock_encbuf, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
-                        TRACEDUMP(.Debug, "firstblock_dec(in payload)", .{}, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
+                        inkeys.aesctr.encrypt(
+                            &firstblock_encbuf,
+                            self.iobuf_rd[0..Protocol.AesCtrT.block_size],
+                        ) catch return IoError.KeyLifetimeExceeded;
+                        UNSAFE_TRACEDUMP(.Debug, "firstblock_dec(in payload)", .{}, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
 
-                        // read Protocol.PktHdr from first block
-                        const pkthdr_size = Protocol.sizeof_PktHdr;
-                        const hdr = Protocol.readPktHdr(buf[0..pkthdr_size]);
-
-                        // padding len is such that payload_len + sizeof(hdr) + padding = block size
-                        if (hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
-                            return IoError.InvalidPacketSize;
-                        }
-                        const payload_len: usize = @intCast(hdr.packet_length - (@as(u32, hdr.padding_length) + 1));
-                        if (hdr.padding_length < 4) {
-                            return IoError.InvalidPacketSize;
-                        }
-                        if (payload_len > Protocol.MaxPayload) {
-                            return IoError.InvalidPacketSize;
-                        }
-                        const pkt_len = payload_len + (Protocol.sizeof_PktHdr) + hdr.padding_length;
-                        // avoid reading obviously bad packet sizes
-                        if (pkt_len < 8 or pkt_len > Protocol.MaxSSHPacket or pkt_len % Protocol.AesCtrT.block_size != 0) {
-                            TRACE(.Info, "Bad pkt size {d}\n", .{pkt_len});
-                            return IoError.InvalidPacketSize;
-                        }
+                        const frame = try inspectPacketHeaderWithLimits(
+                            buf,
+                            true,
+                            self.limits.max_packet_size,
+                            self.limits.max_payload_size,
+                        );
+                        const pkt_len = frame.packet_len;
 
                         // calc number of remaining bytes + mac, read from network
                         var remaining_pkt_bytes: usize = 0;
@@ -791,25 +1599,21 @@ pub fn MisshodImpl(role: Role) type {
                         //
                         self.requestRead(buf.len, (remaining_pkt_bytes + Protocol.mac_algo.key_length), .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + remaining_pkt_bytes + Protocol.mac_algo.key_length] }); // on completion, how much we have
 
-                        inkeys.seq +%= 1;
+                        inkeys.seq += 1;
                     } else {
-                        // copy header
-                        const hdr = Protocol.readPktHdr(buf[0..Protocol.sizeof_PktHdr]);
+                        const frame = try inspectPacketHeaderWithLimits(
+                            buf,
+                            false,
+                            self.limits.max_packet_size,
+                            self.limits.max_payload_size,
+                        );
 
-                        TRACE(.Debug, ".ReadPktBody hdr={any}", .{hdr});
-                        // read in payload
-                        if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
-                            return IoError.InvalidPacketSize;
-                        }
-                        const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
-                        if (payload_len > Protocol.MaxPayload) return IoError.InvalidPacketSize;
-
-                        self.requestRead(buf.len, payload_len + hdr.padding_length, .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + payload_len + hdr.padding_length] });
-                        inkeys.seq +%= 1;
+                        self.requestRead(buf.len, frame.packet_len - buf.len, .{ .ReadPktCompletion = self.iobuf_rd[0..frame.packet_len] });
+                        inkeys.seq += 1;
                     }
                 },
                 .ReadPktCompletion => |buf| {
-                    TRACEDUMP(.Debug, ".ReadPktCompletion", .{}, buf);
+                    UNSAFE_TRACEDUMP(.Debug, ".ReadPktCompletion", .{}, buf);
                     try self.session.handlePacket(buf, self);
                 },
             }
@@ -834,11 +1638,16 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn advance(self: *Self) MisshodError!void {
+            if (self.terminated) return IoError.SessionTerminated;
+            errdefer self.failClosed();
             const inkeys = switch (role) {
                 .Client => &self.session.keydata.s2c,
                 .Server => &self.session.keydata.c2s,
             };
-            while (self.canProcessIoSessionState()) {
+            while (true) {
+                self.updateLocalRekeyPending(null);
+                _ = self.maybeStartLocalRekey();
+                if (!self.canProcessIoSessionState()) break;
                 const prev_io_state = self.session.ioSessionState;
                 const prev_rd = self.iostate_rd;
                 const prev_wr = self.iostate_wr;
@@ -852,15 +1661,24 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
-            try self.session.setPrivateKey(keydata_ascii);
+            return switch (role) {
+                .Client => try self.session.setPrivateKey(keydata_ascii),
+                .Server => IoError.UnimplementedService,
+            };
         }
 
         pub fn setPrivateKeyPassphrase(self: *Self, data: []const u8) MisshodError!void {
-            try self.session.setPrivateKeyPassphrase(data);
+            return switch (role) {
+                .Client => try self.session.setPrivateKeyPassphrase(data),
+                .Server => IoError.UnimplementedService,
+            };
         }
 
         pub fn setAuthPassphrase(self: *Self, data: []const u8) MisshodError!void {
-            try self.session.setAuthPassphrase(data);
+            return switch (role) {
+                .Client => try self.session.setAuthPassphrase(data),
+                .Server => IoError.UnimplementedService,
+            };
         }
 
         pub fn setTryNoneAuth(self: *Self, enabled: bool) MisshodError!void {
@@ -880,8 +1698,17 @@ pub fn MisshodImpl(role: Role) type {
 
         pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
             if (self.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
+            self.updateLocalRekeyPending(null);
+            if (self.local_rekey_pending or self.session.is_rekeying) {
+                _ = try self.session.queueChannelWrite(channel_id, nbytes);
+                _ = self.maybeStartLocalRekey();
+                return;
+            }
             if (self.iostate_rd != .Idle) {
-                try self.session.directChannelWrite(channel_id, nbytes, self);
+                self.session.directChannelWrite(channel_id, nbytes, self) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                };
             } else {
                 try self.session.channelWriteComplete(channel_id, nbytes);
                 try self.advance();
@@ -889,8 +1716,12 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn openSessionChannel(self: *Self) MisshodError!u32 {
+            try self.gateApplicationInitiation();
             return switch (role) {
-                .Client => try self.session.openSessionChannel(self),
+                .Client => self.session.openSessionChannel(self) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                },
                 .Server => IoError.UnimplementedService,
             };
         }
@@ -916,14 +1747,18 @@ pub fn MisshodImpl(role: Role) type {
             originator_host: []const u8,
             originator_port: u32,
         ) MisshodError!u32 {
+            try self.gateApplicationInitiation();
             return switch (role) {
-                .Client => try self.session.openDirectTcpipChannel(
+                .Client => self.session.openDirectTcpipChannel(
                     self,
                     host,
                     port,
                     originator_host,
                     originator_port,
-                ),
+                ) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                },
                 .Server => IoError.UnimplementedService,
             };
         }
@@ -939,15 +1774,23 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn requestRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) MisshodError!void {
+            try self.gateApplicationInitiation();
             return switch (role) {
-                .Client => try self.session.requestRemoteForward(self, bind_address, bind_port),
+                .Client => self.session.requestRemoteForward(self, bind_address, bind_port) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                },
                 .Server => IoError.UnimplementedService,
             };
         }
 
         pub fn cancelRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) MisshodError!void {
+            try self.gateApplicationInitiation();
             return switch (role) {
-                .Client => try self.session.cancelRemoteForward(self, bind_address, bind_port),
+                .Client => self.session.cancelRemoteForward(self, bind_address, bind_port) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                },
                 .Server => IoError.UnimplementedService,
             };
         }
@@ -959,15 +1802,19 @@ pub fn MisshodImpl(role: Role) type {
             originator_host: []const u8,
             originator_port: u32,
         ) MisshodError!u32 {
+            try self.gateApplicationInitiation();
             return switch (role) {
                 .Client => IoError.UnimplementedService,
-                .Server => try self.session.openForwardedTcpipChannel(
+                .Server => self.session.openForwardedTcpipChannel(
                     self,
                     connected_host,
                     connected_port,
                     originator_host,
                     originator_port,
-                ),
+                ) catch |err| {
+                    self.latchKeyLifetimeError(err);
+                    return err;
+                },
             };
         }
 
@@ -980,6 +1827,7 @@ pub fn MisshodImpl(role: Role) type {
                             if (request.channel != channel_id) return IoError.badClearEvent;
                             self.session.setIoSessionState(iotype.next_state);
                             self.iostate_wr = .Idle;
+                            self.scrubReceiveBuffers();
                             return;
                         },
                         else => return IoError.badClearEvent,
@@ -987,6 +1835,50 @@ pub fn MisshodImpl(role: Role) type {
                     else => return IoError.cannotAcceptWrite,
                 },
             }
+        }
+
+        fn clearPendingHostKeyEvent(self: *Self) MisshodError!void {
+            return switch (role) {
+                .Server => IoError.UnimplementedService,
+                .Client => switch (self.iostate_wr) {
+                    .Idle => IoError.badClearEvent,
+                    .Active => |iotype| switch (iotype.action) {
+                        .Eventing => |eventCode| switch (eventCode) {
+                            .CheckHostKey => {
+                                self.session.setIoSessionState(iotype.next_state);
+                                self.iostate_wr = .Idle;
+                                self.scrubReceiveBuffers();
+                            },
+                            else => return IoError.badClearEvent,
+                        },
+                        else => IoError.cannotAcceptWrite,
+                    },
+                },
+            };
+        }
+
+        /// Accepts the signature-verified host key from the pending CheckHostKey event.
+        pub fn acceptHostKey(self: *Self) MisshodError!void {
+            try self.clearPendingHostKeyEvent();
+            return switch (role) {
+                .Client => {
+                    try self.session.acceptHostKey();
+                    try self.advance();
+                },
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Rejects the pending host key and ends the client session before authentication.
+        pub fn rejectHostKey(self: *Self) MisshodError!void {
+            try self.clearPendingHostKeyEvent();
+            return switch (role) {
+                .Client => {
+                    try self.session.rejectHostKey(self);
+                    try self.advance();
+                },
+                .Server => IoError.UnimplementedService,
+            };
         }
 
         fn clearPendingTcpipForwardEvent(self: *Self) MisshodError!void {
@@ -1000,6 +1892,7 @@ pub fn MisshodImpl(role: Role) type {
                                 .TcpipForward => {
                                     self.session.setIoSessionState(iotype.next_state);
                                     self.iostate_wr = .Idle;
+                                    self.scrubReceiveBuffers();
                                 },
                                 else => return IoError.badClearEvent,
                             },
@@ -1021,6 +1914,7 @@ pub fn MisshodImpl(role: Role) type {
                                 .CancelTcpipForward => {
                                     self.session.setIoSessionState(iotype.next_state);
                                     self.iostate_wr = .Idle;
+                                    self.scrubReceiveBuffers();
                                 },
                                 else => return IoError.badClearEvent,
                             },
@@ -1088,12 +1982,22 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
-            try self.session.sendChannelEof(channel_id, self);
+            self.updateLocalRekeyPending(null);
+            _ = self.maybeStartLocalRekey();
+            self.session.sendChannelEof(channel_id, self) catch |err| {
+                self.latchKeyLifetimeError(err);
+                return err;
+            };
             try self.advance();
         }
 
         pub fn sendChannelClose(self: *Self, channel_id: u32) MisshodError!void {
-            try self.session.sendChannelClose(channel_id, self);
+            self.updateLocalRekeyPending(null);
+            _ = self.maybeStartLocalRekey();
+            self.session.sendChannelClose(channel_id, self) catch |err| {
+                self.latchKeyLifetimeError(err);
+                return err;
+            };
             try self.advance();
         }
 
@@ -1105,6 +2009,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         pub fn openAgentChannel(self: *Self) MisshodError!u32 {
+            try self.gateApplicationInitiation();
             switch (role) {
                 .Client => return IoError.UnimplementedService,
                 .Server => {
@@ -1140,6 +2045,20 @@ fn startClientIdentificationRead(client: *MisshodClient) !void {
     }
     const client_identification = try client.peek(Protocol.MaxIdentificationLineLen);
     try client.consumed(client_identification.len);
+}
+
+test "packet MAC verification accepts a matching MAC" {
+    const mac = [1]u8{0xa5} ** Protocol.mac_algo.key_length;
+    try verifyPacketMac(mac, &mac);
+}
+
+test "packet MAC verification rejects a different or incorrectly sized MAC" {
+    const mac = [1]u8{0xa5} ** Protocol.mac_algo.key_length;
+    var different = mac;
+    different[different.len - 1] ^= 1;
+
+    try std.testing.expectError(IoError.InvalidMac, verifyPacketMac(mac, &different));
+    try std.testing.expectError(IoError.InvalidMac, verifyPacketMac(mac, different[0 .. different.len - 1]));
 }
 
 test "EndSessionReason tagged union" {
@@ -1383,7 +2302,517 @@ test "client bounds pre-identification lines" {
 
     const line = "one-too-many\r\n";
     try feedClientIdentificationBytes(&client, line[0 .. line.len - 1]);
-    try std.testing.expectError(IoError.UnexpectedResponse, client.write(line[line.len - 1 ..]));
+    try std.testing.expectError(IoError.ResourceLimitExceeded, client.write(line[line.len - 1 ..]));
+    try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
+}
+
+test "resource limits validate defaults capacities and invalid relationships" {
+    try (ResourceLimits{}).validate();
+
+    var limits = ResourceLimits{};
+    limits.max_packet_size = ResourceCapacities.packet_size + 1;
+    try std.testing.expectError(error.PacketLimitExceedsCapacity, limits.validate());
+
+    limits = .{};
+    limits.max_payload_size = ResourceCapacities.payload_size + 1;
+    try std.testing.expectError(error.PayloadLimitExceedsCapacity, limits.validate());
+
+    limits = .{};
+    limits.max_channels = ResourceCapacities.channels + 1;
+    try std.testing.expectError(error.ChannelLimitExceedsCapacity, limits.validate());
+
+    limits = .{};
+    limits.initial_channel_window = 2;
+    limits.max_channel_window = 1;
+    try std.testing.expectError(error.InvalidChannelWindowLimits, limits.validate());
+
+    limits = .{};
+    limits.max_peer_packet_size = ResourceCapacities.channel_packet_size + 1;
+    try std.testing.expectError(error.InvalidPeerPacketLimit, limits.validate());
+
+    limits = .{};
+    limits.max_channel_buffered_data = ResourceCapacities.channel_buffered_data + 1;
+    try std.testing.expectError(error.BufferedDataLimitExceedsCapacity, limits.validate());
+
+    limits = .{};
+    limits.max_pending_buffered_data = ResourceCapacities.pending_buffered_data + 1;
+    try std.testing.expectError(error.InvalidPendingDataLimit, limits.validate());
+
+    limits = .{};
+    limits.max_identification_lines = ResourceCapacities.identification_lines + 1;
+    try std.testing.expectError(error.IdentificationLimitExceedsCapacity, limits.validate());
+
+    limits = .{};
+    limits.max_pre_auth_packets = 0;
+    try std.testing.expectError(error.InvalidPreAuthLimit, limits.validate());
+
+    limits = .{};
+    limits.max_server_auth_attempts = 0;
+    try std.testing.expectError(error.InvalidAuthAttemptLimit, limits.validate());
+
+    limits = .{};
+    limits.max_key_exchanges = 0;
+    try std.testing.expectError(error.InvalidKeyExchangeLimit, limits.validate());
+    limits = .{};
+    limits.min_packets_between_rekeys = ResourceCapacities.rekey_spacing_packets + 1;
+    try std.testing.expectError(error.InvalidKeyExchangeLimit, limits.validate());
+
+    limits = .{};
+    limits.key_lifetime.rekey_after_encrypted_bytes = 0;
+    try std.testing.expectError(error.InvalidKeyLifetimeLimit, limits.validate());
+    limits = .{};
+    limits.key_lifetime.rekey_after_encrypted_bytes =
+        ResourceCapacities.encrypted_bytes_per_key;
+    try std.testing.expectError(error.InvalidKeyLifetimeLimit, limits.validate());
+    limits = .{};
+    limits.key_lifetime.rekey_after_encrypted_packets =
+        ResourceCapacities.packets_per_sequence;
+    try std.testing.expectError(error.InvalidKeyLifetimeLimit, limits.validate());
+    limits = .{ .key_lifetime = .{ .rekey_after_monotonic_ticks = 0 } };
+    try std.testing.expectError(error.InvalidKeyLifetimeLimit, limits.validate());
+
+    limits = .{};
+    limits.max_outstanding_global_requests = ResourceCapacities.outstanding_global_requests + 1;
+    try std.testing.expectError(error.GlobalRequestLimitExceedsCapacity, limits.validate());
+
+    limits = .{};
+    limits.max_decompressed_payload_size = ResourceCapacities.decompressed_payload_size + 1;
+    try std.testing.expectError(error.DecompressionLimitExceedsCapacity, limits.validate());
+
+    limits = .{ .deadlines = .{ .idle = 0 } };
+    try std.testing.expectError(error.InvalidDeadlineLimit, limits.validate());
+}
+
+test "runtime packet limit enforces below at and above wire size" {
+    const limits = ResourceLimits{
+        .max_packet_size = 128,
+        .max_payload_size = 87,
+        .initial_channel_window = 32,
+        .channel_packet_size = 32,
+        .max_peer_packet_size = 32,
+        .max_channel_buffered_data = 32,
+        .max_pending_buffered_data = 128,
+        .max_decompressed_payload_size = 87,
+    };
+    var header: [Protocol.sizeof_PktHdr]u8 = undefined;
+
+    std.mem.writeInt(u32, header[0..4], 122, .big);
+    header[4] = 34;
+    _ = try inspectPacketHeaderWithLimits(&header, false, limits.max_packet_size, limits.max_payload_size);
+
+    std.mem.writeInt(u32, header[0..4], 124, .big);
+    header[4] = 36;
+    _ = try inspectPacketHeaderWithLimits(&header, false, limits.max_packet_size, limits.max_payload_size);
+
+    std.mem.writeInt(u32, header[0..4], 125, .big);
+    header[4] = 37;
+    try std.testing.expectError(
+        error.InvalidPacketSize,
+        inspectPacketHeaderWithLimits(&header, false, limits.max_packet_size, limits.max_payload_size),
+    );
+
+    std.mem.writeInt(u32, header[0..4], 124, .big);
+    header[4] = 36;
+    _ = try inspectPacketHeaderWithLimits(&header, false, limits.max_packet_size, limits.max_payload_size);
+    header[4] = 35;
+    try std.testing.expectError(
+        error.InvalidPacketSize,
+        inspectPacketHeaderWithLimits(&header, false, limits.max_packet_size, limits.max_payload_size),
+    );
+}
+
+test "identification byte limit accepts exact boundary then terminates" {
+    const limits = ResourceLimits{ .max_identification_bytes = 4 };
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer client.deinit();
+    try startClientIdentificationRead(&client);
+
+    try feedClientIdentificationBytes(&client, "x\n");
+    try feedClientIdentificationBytes(&client, "y\n");
+    try std.testing.expectError(
+        IoError.ResourceLimitExceeded,
+        feedClientIdentificationBytes(&client, "z\n"),
+    );
+    try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
+}
+
+test "pre-auth packet work and rekey limits fail closed at boundaries" {
+    var limits = ResourceLimits{
+        .max_pre_auth_packets = 2,
+        .max_pre_auth_work = 16,
+        .max_key_exchanges = 2,
+        .min_packets_between_rekeys = 1,
+    };
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer client.deinit();
+
+    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
+    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
+    try std.testing.expectError(
+        IoError.TooManyPreAuthPackets,
+        client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE)),
+    );
+    try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
+
+    limits.max_pre_auth_packets = 20;
+    limits.max_pre_auth_work = 9;
+    var work_client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer work_client.deinit();
+    try work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
+    try std.testing.expectError(
+        IoError.TooMuchPreAuthWork,
+        work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE)),
+    );
+
+    limits.max_pre_auth_work = 100;
+    limits.min_packets_between_rekeys = 1;
+    var frequency_client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer frequency_client.deinit();
+    try frequency_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try std.testing.expectError(
+        IoError.RekeyTooFrequent,
+        frequency_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT)),
+    );
+
+    limits.min_packets_between_rekeys = 0;
+    var count_client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer count_client.deinit();
+    try count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try std.testing.expectError(
+        IoError.TooManyKeyExchanges,
+        count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT)),
+    );
+}
+
+test "server authentication attempt limit is independent of client attempts" {
+    const privkey = @import("privkey.zig");
+    const limits = ResourceLimits{ .max_server_auth_attempts = 2 };
+    var prng = std.Random.DefaultPrng.init(42);
+    var server = try MisshodServer.initWithLimits(
+        prng.random(),
+        privkey.testkey_valid,
+        std.testing.allocator,
+        limits,
+    );
+    defer server.deinit();
+
+    try server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try std.testing.expectError(
+        IoError.TooManyAuthAttempts,
+        server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)),
+    );
+
+    var client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer client.deinit();
+    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+}
+
+fn installAutomaticRekeyTestKeys(keydata: *Protocol.KeyDataBi) !void {
+    const hash: [Protocol.hash_algo.digest_length]u8 = .{0x31} ** Protocol.hash_algo.digest_length;
+    const secret: [Protocol.kex_algo.shared_length]u8 = .{0x42} ** Protocol.kex_algo.shared_length;
+    const session_id: [Protocol.hash_algo.digest_length]u8 = .{0x53} ** Protocol.hash_algo.digest_length;
+    try keydata.genKeys(hash, secret, session_id);
+    try keydata.c2s.activateEpoch(0, null);
+    try keydata.s2c.activateEpoch(0, null);
+}
+
+test "automatic rekey thresholds are deterministic below at and above" {
+    const limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_encrypted_bytes = 100,
+        .rekey_after_encrypted_packets = 10,
+        .rekey_after_monotonic_ticks = 20,
+    } };
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        limits,
+    );
+    defer client.deinit();
+
+    const keys = &client.session.keydata.c2s;
+    keys.epoch = 1;
+    keys.activated_at_monotonic_tick = 100;
+
+    keys.encrypted_bytes = 99;
+    try std.testing.expect(!client.keyUsageDue(keys, 119));
+    keys.encrypted_bytes = 100;
+    try std.testing.expect(client.keyUsageDue(keys, 119));
+    keys.encrypted_bytes = 101;
+    try std.testing.expect(client.keyUsageDue(keys, 119));
+
+    keys.encrypted_bytes = 0;
+    keys.encrypted_packets = 9;
+    try std.testing.expect(!client.keyUsageDue(keys, 119));
+    keys.encrypted_packets = 10;
+    try std.testing.expect(client.keyUsageDue(keys, 119));
+    keys.encrypted_packets = 11;
+    try std.testing.expect(client.keyUsageDue(keys, 119));
+
+    keys.encrypted_packets = 0;
+    try std.testing.expect(!client.keyUsageDue(keys, 119));
+    try std.testing.expect(client.keyUsageDue(keys, 120));
+    try std.testing.expect(client.keyUsageDue(keys, 121));
+}
+
+test "client and server initiate automatic rekey and expose safe status" {
+    const privkey = @import("privkey.zig");
+    const limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_encrypted_bytes = 1000,
+        .rekey_after_encrypted_packets = 1,
+    } };
+    var cprng = std.Random.DefaultPrng.init(43);
+    var client = try MisshodClient.initWithLimits(
+        cprng.random(),
+        "test",
+        std.testing.allocator,
+        limits,
+    );
+    defer client.deinit();
+    try client.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&client.session.keydata);
+    client.session.encrypted = true;
+    client.session.inbound_encrypted = true;
+    client.session.keydata.c2s.encrypted_packets = 1;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+
+    const client_event = try client.getNextEvent();
+    try std.testing.expect(client_event == .ReadyToProduce);
+    try std.testing.expect(client.session.is_rekeying);
+    try std.testing.expectEqual(ClientSessionState.KexInitRead, client.session.sessionState);
+    const client_status = client.keyLifetimeStatus();
+    try std.testing.expect(client_status.rekey_in_progress);
+    try std.testing.expectEqual(@as(u64, 1), client_status.outbound.epoch);
+    try std.testing.expect(client_status.outbound.encrypted_bytes > 0);
+    try std.testing.expectEqual(@as(u64, 2), client_status.outbound.encrypted_packets);
+
+    var sprng = std.Random.DefaultPrng.init(44);
+    var server = try MisshodServer.initWithLimits(
+        sprng.random(),
+        privkey.testkey_valid,
+        std.testing.allocator,
+        limits,
+    );
+    defer server.deinit();
+    try server.session.setPeerProtocolVersion("SSH-2.0-test_client");
+    try installAutomaticRekeyTestKeys(&server.session.keydata);
+    server.session.encrypted = true;
+    server.session.inbound_encrypted = true;
+    server.session.keydata.s2c.encrypted_packets = 1;
+    server.session.setSessionState(.ChannelActive);
+    server.session.setIoSessionState(.ReadPktHdr);
+
+    const server_event = try server.getNextEvent();
+    try std.testing.expect(server_event == .ReadyToProduce);
+    try std.testing.expect(server.session.is_rekeying);
+    try std.testing.expectEqual(ServerSessionState.KexInitRead, server.session.sessionState);
+    try std.testing.expect(server.session.pending_server_kexinit != null);
+    const server_status = server.keyLifetimeStatus();
+    try std.testing.expect(server_status.rekey_in_progress);
+    try std.testing.expectEqual(@as(u64, 2), server_status.outbound.encrypted_packets);
+}
+
+test "automatic rekey gates channel data until a committed read finishes" {
+    const limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_encrypted_bytes = 1000,
+        .rekey_after_encrypted_packets = 1,
+    } };
+    var prng = std.Random.DefaultPrng.init(45);
+    var client = try MisshodClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        limits,
+    );
+    defer client.deinit();
+    try client.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&client.session.keydata);
+    client.session.encrypted = true;
+    client.session.inbound_encrypted = true;
+    client.session.keydata.c2s.encrypted_packets = 1;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+    const chan = client.session.channel_table.allocChannel(7, 1000, 1000).?;
+    chan.state = .DataRx;
+    @memcpy(chan.write_buf[0..4], "data");
+    client.requestRead(0, 1, .ReadPktHdr);
+
+    try client.channelWriteComplete(chan.local_id, 4);
+    try std.testing.expectEqual(@as(usize, 4), chan.write_buf_nbytes);
+    try std.testing.expectEqual(@as(usize, 0), chan.tx_in_flight_len);
+    try std.testing.expect(!client.session.is_rekeying);
+
+    client.iostate_rd = .Idle;
+    const event = try client.getNextEvent();
+    try std.testing.expect(event == .ReadyToProduce);
+    try std.testing.expect(client.session.is_rekeying);
+    try std.testing.expectEqual(@as(usize, 4), chan.write_buf_nbytes);
+    try std.testing.expectEqual(@as(usize, 0), chan.tx_in_flight_len);
+}
+
+test "caller monotonic time initiates rekey without changing timeout meaning" {
+    const rekey_limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_monotonic_ticks = 10,
+    } };
+    var prng = std.Random.DefaultPrng.init(46);
+    var client = try MisshodClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        rekey_limits,
+    );
+    defer client.deinit();
+    try client.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&client.session.keydata);
+    client.session.encrypted = true;
+    client.session.inbound_encrypted = true;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+    try client.initializeDeadlines(100);
+    try std.testing.expect((try client.tick(109)) == null);
+    try std.testing.expect(!client.session.is_rekeying);
+    try std.testing.expect((try client.tick(110)) == null);
+    try std.testing.expect(client.session.is_rekeying);
+    try std.testing.expect(client.timeoutOutcome() == null);
+
+    const timeout_limits = ResourceLimits{
+        .deadlines = .{ .idle = 10 },
+        .key_lifetime = .{ .rekey_after_monotonic_ticks = 10 },
+    };
+    var timed_out = try MisshodClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        timeout_limits,
+    );
+    defer timed_out.deinit();
+    try installAutomaticRekeyTestKeys(&timed_out.session.keydata);
+    timed_out.session.encrypted = true;
+    timed_out.session.inbound_encrypted = true;
+    timed_out.session.setSessionState(.ChannelActive);
+    timed_out.session.setIoSessionState(.ReadPktHdr);
+    try timed_out.initializeDeadlines(200);
+    try std.testing.expectEqual(TimeoutOutcome.Idle, (try timed_out.tick(210)).?);
+    try std.testing.expect(!timed_out.session.is_rekeying);
+    try std.testing.expectError(IoError.SessionTerminated, timed_out.getNextEvent());
+}
+
+test "inbound sequence hard bound terminates before wrap" {
+    var prng = std.Random.DefaultPrng.init(47);
+    var client = try MisshodClient.init(prng.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    client.session.keydata.s2c.seq = std.math.maxInt(u32);
+    client.session.setIoSessionState(.{ .ReadPktBody = client.iobuf_rd[0..Protocol.sizeof_PktHdr] });
+    client.iostate_rd = .Idle;
+    client.iostate_wr = .Idle;
+
+    try std.testing.expectError(IoError.KeyLifetimeExceeded, client.advance());
+    try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
+}
+
+test "direct application write latches key hard-bound failure" {
+    var prng = std.Random.DefaultPrng.init(48);
+    var client = try MisshodClient.init(prng.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    try installAutomaticRekeyTestKeys(&client.session.keydata);
+    client.session.encrypted = true;
+    client.session.inbound_encrypted = true;
+    client.session.keydata.c2s.seq = std.math.maxInt(u32);
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+    const chan = client.session.channel_table.allocChannel(7, 1000, 1000).?;
+    chan.state = .DataRx;
+    @memcpy(chan.write_buf[0..4], "data");
+    client.requestRead(0, 1, .ReadPktHdr);
+
+    try std.testing.expectError(
+        IoError.KeyLifetimeExceeded,
+        client.channelWriteComplete(chan.local_id, 4),
+    );
+    try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
+}
+
+test "caller-driven deadlines use monotonic fake time and typed outcomes" {
+    const limits = ResourceLimits{ .deadlines = .{
+        .handshake = 10,
+        .authentication = 20,
+        .idle = 30,
+        .total_session = 40,
+    } };
+    var prng = std.Random.DefaultPrng.init(42);
+
+    var handshake = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer handshake.deinit();
+    try std.testing.expectError(error.DeadlinesNotInitialized, handshake.checkDeadlines(0));
+    try handshake.initializeDeadlines(100);
+    try std.testing.expect((try handshake.tick(109)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.Handshake, (try handshake.tick(110)).?);
+    try std.testing.expectEqual(TimeoutOutcome.Handshake, handshake.timeoutOutcome().?);
+
+    var auth = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer auth.deinit();
+    auth.session.setSessionState(.AuthServReq);
+    try auth.initializeDeadlines(200);
+    try auth.noteActivity(205);
+    try std.testing.expect((try auth.tick(219)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.Authentication, (try auth.tick(220)).?);
+
+    var idle = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer idle.deinit();
+    idle.session.setSessionState(.ChannelActive);
+    try idle.initializeDeadlines(300);
+    try idle.noteActivity(310);
+    try std.testing.expect((try idle.tick(339)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.TotalSession, (try idle.tick(340)).?);
+
+    const idle_limits = ResourceLimits{ .deadlines = .{ .idle = 30, .total_session = 100 } };
+    var idle_only = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, idle_limits);
+    defer idle_only.deinit();
+    idle_only.session.setSessionState(.ChannelActive);
+    try idle_only.initializeDeadlines(400);
+    try idle_only.noteActivity(410);
+    try std.testing.expect((try idle_only.tick(439)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.Idle, (try idle_only.tick(440)).?);
+
+    var monotonic = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    defer monotonic.deinit();
+    try monotonic.initializeDeadlines(500);
+    try std.testing.expectError(error.DeadlinesAlreadyInitialized, monotonic.initializeDeadlines(501));
+    try monotonic.noteActivity(510);
+    try std.testing.expectError(error.NonMonotonicTime, monotonic.tick(509));
+}
+
+test "deadline phase transition precedes expiration of the prior phase" {
+    const limits = ResourceLimits{ .deadlines = .{
+        .handshake = 10,
+        .authentication = 20,
+    } };
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        limits,
+    );
+    defer client.deinit();
+
+    try client.initializeDeadlines(0);
+    client.session.setSessionState(.AuthServReq);
+
+    try std.testing.expect((try client.tick(10)) == null);
+    try std.testing.expectEqual(DeadlinePhase.Authentication, client.deadline_state.phase);
+    try std.testing.expectEqual(@as(u64, 10), client.deadline_state.phase_started_at);
+    try std.testing.expect((try client.tick(29)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.Authentication, (try client.tick(30)).?);
 }
 
 test "MisshodClientEventCodes Banner variant" {
@@ -1589,7 +3018,7 @@ test "client-server full handshake round-trip" {
                         .CheckHostKey => {
                             host_key_order = event_order;
                             event_order += 1;
-                            client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {};
+                            client.acceptHostKey() catch {};
                         },
                         .GetPrivateKey => {
                             client.clearEvent(.GetPrivateKey) catch {};
@@ -1659,6 +3088,12 @@ test "client-server full handshake round-trip" {
     try std.testing.expect(connected_client);
     try std.testing.expect(identification_order.? < host_key_order.?);
     try std.testing.expect(host_key_order.? < auth_order.?);
+    try std.testing.expect(!client.session.ecdh_ephem_keypair_active);
+    try std.testing.expect(!server.session.ecdh_ephem_keypair_active);
+    try std.testing.expect(!client.session.kex_hasher.active);
+    try std.testing.expect(!server.session.kex_hasher.active);
+    for (client.session.shared_secret_k) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (server.session.shared_secret_k) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
 }
 
 test "HostKeyInfo fingerprint computation" {
@@ -1688,6 +3123,81 @@ test "HostKeyInfo fingerprint is deterministic" {
     try std.testing.expectEqualSlices(u8, &fp1, &fp2);
 }
 
+fn prepareHostKeyDecision(client: *MisshodClient, raw_key: []const u8) !HostKeyInfo {
+    client.session.hostkey_ks = try std.testing.allocator.dupe(u8, raw_key);
+    var fingerprint: [Protocol.hash_algo.digest_length]u8 = undefined;
+    Protocol.hash_algo.hash(raw_key, &fingerprint, .{});
+    const info: HostKeyInfo = .{
+        .raw_key = client.session.hostkey_ks,
+        .fingerprint = fingerprint,
+    };
+    client.session.setSessionState(.HostKeyDecision);
+    client.session.setIoSessionState(.Idle);
+    client.requestEvent(.{ .CheckHostKey = info }, .Idle);
+    return info;
+}
+
+test "client explicitly accepts a pending host key" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    _ = try prepareHostKeyDecision(&client, "accepted-host-key");
+
+    try client.acceptHostKey();
+
+    try std.testing.expectEqual(ClientSessionState.NewKeysRead, client.session.sessionState);
+    try std.testing.expectEqual(@as(u8, 0), client.session.auth_attempts_total);
+    try std.testing.expect(client.iostate_wr == .Idle);
+}
+
+test "client explicitly rejects a pending host key before authentication" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    const expected = try prepareHostKeyDecision(&client, "rejected-host-key");
+
+    try client.rejectHostKey();
+
+    try std.testing.expectEqual(ClientSessionState.HostKeyRejected, client.session.sessionState);
+    try std.testing.expectEqual(@as(u8, 0), client.session.auth_attempts_total);
+    const event = try client.getNextEvent();
+    switch (event) {
+        .Event => |code| switch (code) {
+            .EndSession => |reason| switch (reason) {
+                .HostKeyRejected => |info| {
+                    try std.testing.expectEqualSlices(u8, expected.raw_key.?, info.raw_key.?);
+                    try std.testing.expectEqualSlices(u8, &expected.fingerprint, &info.fingerprint);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "clearing a host key event without a decision fails closed" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer client.deinit();
+    _ = try prepareHostKeyDecision(&client, "pending-host-key");
+
+    const first = try client.getNextEvent();
+    switch (first) {
+        .Event => |code| try std.testing.expectError(IoError.badClearEvent, client.clearEvent(code)),
+        else => return error.TestUnexpectedResult,
+    }
+    try client.advance();
+
+    try std.testing.expectEqual(ClientSessionState.HostKeyDecision, client.session.sessionState);
+    try std.testing.expectEqual(@as(u8, 0), client.session.auth_attempts_total);
+    const still_pending = try client.getNextEvent();
+    switch (still_pending) {
+        .Event => |code| try std.testing.expect(code == .CheckHostKey),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "init sets both iostates to Idle" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -1714,6 +3224,39 @@ test "deinit zeros both buffers" {
     for (m.iobuf_wr) |b| try std.testing.expectEqual(@as(u8, 0), b);
 }
 
+test "deadline fail-closed scrubs session credentials keys and packet buffers" {
+    const limits = ResourceLimits{ .deadlines = .{ .handshake = 1 } };
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
+
+    try m.setPrivateKey("copied-private-key");
+    try m.setPrivateKeyPassphrase("copied-key-passphrase");
+    try m.setAuthPassphrase("copied-password");
+    @memset(&m.iobuf_rd, 0xA5);
+    @memset(&m.iobuf_wr, 0x5A);
+    @memset(&m.iobuf_decompressed, 0xCC);
+    @memset(&m.session.shared_secret_k, 0x33);
+    @memset(std.mem.asBytes(&m.session.ecdh_ephem_keypair), 0x44);
+    m.session.ecdh_ephem_keypair_active = true;
+
+    try m.initializeDeadlines(10);
+    try std.testing.expectEqual(TimeoutOutcome.Handshake, (try m.tick(11)).?);
+    try std.testing.expect(m.terminated);
+    try std.testing.expect(m.session.privkey_ascii == null);
+    try std.testing.expect(m.session.privkey_passphrase == null);
+    try std.testing.expect(m.session.auth_passphrase == null);
+    try std.testing.expect(!m.session.ecdh_ephem_keypair_active);
+    try std.testing.expect(!m.session.kex_hasher.active);
+    for (m.iobuf_rd) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (m.iobuf_wr) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (m.iobuf_decompressed) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (m.session.shared_secret_k) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+
+    try std.testing.expectEqual(TimeoutOutcome.Handshake, (try m.tick(12)).?);
+    m.deinit();
+    m.deinit();
+}
+
 test "requestRead sets iostate_rd, leaves iostate_wr unchanged" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -1735,7 +3278,7 @@ test "requestWrite sets iostate_wr, leaves iostate_rd unchanged" {
     // Simulate data in write buffer
     const data = "hello";
     @memcpy(m.iobuf_wr[0..data.len], data);
-    m.requestWrite(m.iobuf_wr[0..data.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..data.len], .Idle);
 
     try std.testing.expect(m.iostate_wr != .Idle);
     try std.testing.expectEqual(IoState(.Client).Idle, m.iostate_rd);
@@ -1789,7 +3332,7 @@ test "peek reads from iobuf_wr" {
 
     const msg = "world";
     @memcpy(m.iobuf_wr[0..msg.len], msg);
-    m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
 
     const data = try m.peek(msg.len);
     try std.testing.expectEqualStrings(msg, data);
@@ -1811,7 +3354,7 @@ test "consumed advances wr_off" {
 
     const msg = "abcde";
     @memcpy(m.iobuf_wr[0..msg.len], msg);
-    m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
 
     try m.consumed(2);
     try std.testing.expectEqual(@as(usize, 2), m.wr_off);
@@ -1867,7 +3410,7 @@ test "getNextEvent returns ReadyToProduce when only write is active" {
     m.session.setIoSessionState(.Idle);
     const msg = "data";
     @memcpy(m.iobuf_wr[0..msg.len], msg);
-    m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
     const ev = try m.getNextEvent();
     switch (ev) {
         .ReadyToProduce => |n| try std.testing.expectEqual(@as(usize, msg.len), n),
@@ -1884,7 +3427,7 @@ test "getNextEvent returns ReadyToConsumeAndProduce when both active" {
     m.requestRead(0, 10, .ReadPktHdr);
     const msg = "data";
     @memcpy(m.iobuf_wr[0..msg.len], msg);
-    m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..msg.len], .Idle);
 
     const ev = try m.getNextEvent();
     switch (ev) {
@@ -1957,7 +3500,7 @@ test "simultaneous read and write I/O: data does not cross-contaminate" {
     // Start a write (producing 3 bytes)
     const wr_data = "abc";
     @memcpy(m.iobuf_wr[0..wr_data.len], wr_data);
-    m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
 
     // Feed data to read side
     try m.write("xy");
@@ -1999,7 +3542,7 @@ test "canProcessIoSessionState: ReadPktHdr only needs read idle" {
     // Write side active should not block read states
     const wr_data = "x";
     @memcpy(m.iobuf_wr[0..wr_data.len], wr_data);
-    m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
 
     try std.testing.expect(m.canProcessIoSessionState());
 }
@@ -2015,7 +3558,7 @@ test "canProcessIoSessionState: VersionWrite needs write idle" {
 
     const wr_data = "x";
     @memcpy(m.iobuf_wr[0..wr_data.len], wr_data);
-    m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
     try std.testing.expect(!m.canProcessIoSessionState());
 }
 
@@ -2031,7 +3574,7 @@ test "canProcessIoSessionState: ReadPktCompletion needs write idle" {
     // With write active, ReadPktCompletion should be blocked
     const wr_data = "x";
     @memcpy(m.iobuf_wr[0..wr_data.len], wr_data);
-    m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
+    try m.requestWrite(m.iobuf_wr[0..wr_data.len], .Idle);
     try std.testing.expect(!m.canProcessIoSessionState());
 }
 
@@ -2054,13 +3597,26 @@ fn largeChannelTestByte(packet_index: u8, byte_index: usize) u8 {
 
 test "full handshake round-trip handles multiple large compressed channel packets" {
     const privkey = @import("privkey.zig");
+    const limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_encrypted_packets = 10,
+    } };
 
     var cprng = std.Random.DefaultPrng.init(10);
     var sprng = std.Random.DefaultPrng.init(20);
 
-    var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
+    var client = try MisshodClient.initWithLimits(
+        cprng.random(),
+        "testuser",
+        std.testing.allocator,
+        limits,
+    );
     defer client.deinit();
-    var server = try MisshodServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
+    var server = try MisshodServer.initWithLimits(
+        sprng.random(),
+        privkey.testkey_valid,
+        std.testing.allocator,
+        limits,
+    );
     defer server.deinit();
 
     var c2s_buf: [16384]u8 = undefined;
@@ -2072,14 +3628,23 @@ test "full handshake round-trip handles multiple large compressed channel packet
     var connected_server = false;
     var server_packets_sent: u8 = 0;
     var client_packets_received: u8 = 0;
-    const packet_lengths = [_]usize{ 12_000, 6_000 };
+    var receive_epochs: [12]u64 = .{0} ** 12;
+    var initial_session_id: ?[Protocol.hash_algo.digest_length]u8 = null;
+    var accepted_host_fingerprint: ?[Protocol.hash_algo.digest_length]u8 = null;
+    const packet_lengths = [_]usize{
+        12_000, 6_000, 3_000, 3_000, 3_000, 3_000,
+        3_000,  3_000, 3_000, 3_000, 3_000, 3_000,
+    };
 
     const Endpoint = enum { client_ep, server_ep };
     const endpoints = [_]Endpoint{ .client_ep, .server_ep };
 
     var steps: usize = 0;
-    while (steps < 1000) : (steps += 1) {
-        if (client_packets_received == packet_lengths.len) break;
+    while (steps < 4000) : (steps += 1) {
+        if (client_packets_received == packet_lengths.len and
+            receive_epochs[packet_lengths.len - 1] > receive_epochs[0] and
+            !client.session.is_rekeying and !server.session.is_rekeying)
+            break;
 
         for (endpoints) |ep| {
             if (ep == .client_ep) {
@@ -2100,7 +3665,7 @@ test "full handshake round-trip handles multiple large compressed channel packet
                         }
                     },
                     .Event => |code| switch (code) {
-                        .CheckHostKey => client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {},
+                        .CheckHostKey => client.acceptHostKey() catch {},
                         .GetPrivateKey => client.clearEvent(.GetPrivateKey) catch {},
                         .GetAuthPassphrase => {
                             client.session.setAuthPassphrase("testpass") catch {};
@@ -2108,11 +3673,16 @@ test "full handshake round-trip handles multiple large compressed channel packet
                         },
                         .Connected => {
                             connected_client = true;
+                            initial_session_id = client.session.session_id;
+                            var fingerprint: [Protocol.hash_algo.digest_length]u8 = undefined;
+                            Protocol.hash_algo.hash(client.session.hostkey_ks.?, &fingerprint, .{});
+                            accepted_host_fingerprint = fingerprint;
                             client.clearEvent(.Connected) catch {};
                         },
                         .RxData => |data| {
                             const packet_index: usize = client_packets_received;
                             try std.testing.expect(packet_index < packet_lengths.len);
+                            receive_epochs[packet_index] = client.keyLifetimeStatus().inbound.epoch;
                             try std.testing.expectEqual(packet_lengths[packet_index], data.len);
                             for (data, 0..) |byte, byte_index| {
                                 try std.testing.expectEqual(
@@ -2181,6 +3751,18 @@ test "full handshake round-trip handles multiple large compressed channel packet
     try std.testing.expect(connected_client);
     try std.testing.expect(connected_server);
     try std.testing.expectEqual(@as(u8, packet_lengths.len), client_packets_received);
+    try std.testing.expect(receive_epochs[0] >= 1);
+    try std.testing.expect(receive_epochs[packet_lengths.len - 1] > receive_epochs[0]);
+    try std.testing.expect(client.keyLifetimeStatus().inbound.epoch >= 2);
+    try std.testing.expect(server.keyLifetimeStatus().outbound.epoch >= 2);
+    try std.testing.expectEqualSlices(u8, &initial_session_id.?, &client.session.session_id);
+    var final_host_fingerprint: [Protocol.hash_algo.digest_length]u8 = undefined;
+    Protocol.hash_algo.hash(client.session.hostkey_ks.?, &final_host_fingerprint, .{});
+    try std.testing.expectEqualSlices(
+        u8,
+        &accepted_host_fingerprint.?,
+        &final_host_fingerprint,
+    );
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.c2s.compression.algorithm);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, client.session.keydata.s2c.compression.algorithm);
     try std.testing.expectEqual(Protocol.CompressionAlgorithm.ZlibOpenSsh, server.session.keydata.c2s.compression.algorithm);
@@ -2260,7 +3842,7 @@ test "client channelWriteComplete uses direct write when read is active" {
                         }
                     },
                     .Event => |code| switch (code) {
-                        .CheckHostKey => client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {},
+                        .CheckHostKey => client.acceptHostKey() catch {},
                         .GetPrivateKey => client.clearEvent(.GetPrivateKey) catch {},
                         .GetAuthPassphrase => {
                             client.session.setAuthPassphrase("testpass") catch {};
@@ -2367,7 +3949,7 @@ fn driveHandshakeForKeys(hostkey_ascii: []const u8, client_key_ascii: ?[]const u
                         }
                     },
                     .Event => |code| switch (code) {
-                        .CheckHostKey => client.clearEvent(.{ .CheckHostKey = .{ .raw_key = null, .fingerprint = .{0} ** 32 } }) catch {},
+                        .CheckHostKey => client.acceptHostKey() catch {},
                         .GetPrivateKey => {
                             if (client_key_ascii) |key| client.setPrivateKey(key) catch {};
                             client.clearEvent(.GetPrivateKey) catch {};

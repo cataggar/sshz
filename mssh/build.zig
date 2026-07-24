@@ -46,4 +46,15 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run");
     run_step.dependOn(&run_cmd.step);
+
+    const known_hosts_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/known_hosts.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_known_hosts_tests = b.addRunArtifact(known_hosts_tests);
+    const test_step = b.step("test", "Run mssh tests");
+    test_step.dependOn(&run_known_hosts_tests.step);
 }

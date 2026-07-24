@@ -49,33 +49,9 @@ zig build
 
 Use `-A` or `--agent-forward` to forward the local SSH agent from `SSH_AUTH_SOCK`.
 
-To run a test SSH server (dropbear) in docker
-
-```bash
-cd testserver
-./sshserver
-```
-
-Login with password auth, ("password")
-
-```bash
-./zig-out/bin/mssh testuser@127.0.0.1 2022
-# Same as: ssh -p 2022 testuser@127.0.0.1
-```
-
-Login with pubkey auth using a passwordless private key
-
-```bash
-./zig-out/bin/mssh testuser@127.0.0.1 2022 ../testserver/id_ed25519_passwordless
-# Same as: ssh -p 2022 testuser@127.0.0.1 -i ../testserver/id_ed25519_passwordless
-```
-
-Login with pubkey auth using a password protected private key ("secretpassword")
-
-```bash
-./zig-out/bin/mssh testuser@127.0.0.1 2022 ../testserver/id_ed25519_passworded
-# Same as: ssh -p 2022 testuser@127.0.0.1 -i ../testserver/id_ed25519_passworded
-```
+The old manual Dropbear container has been retired. The `testserver` directory
+now only contains key fixtures used through runtime-only copies by the automated
+interop harness described below.
 
 For non-interactive runs, `mssh` reads optional secrets from `MSSH_AUTH_PASSWORD` and `MSSH_KEY_PASSPHRASE`.
 
@@ -123,13 +99,22 @@ zig build run -- foo@127.0.0.1 2022
 
 ## Interop tests
 
-Run the opt-in OpenSSH/libssh interoperability suite from the repository root:
+Run the OpenSSH interoperability suite from the repository root:
 
 ```bash
 zig build interop
 ```
 
-The runner builds `mssh` and `msshd`, starts an isolated localhost OpenSSH `sshd`, checks `mssh` public-key and encrypted-key auth against it, starts `msshd`, checks OpenSSH `ssh` against it, and can run the libssh probe when requested. Set `MSSH_INTEROP_ENABLE_LIBSSH=1` to run the libssh lane, `MSSH_INTEROP_REQUIRE_LIBSSH=1` to require it, and `MSSH_INTEROP_KEEP_ARTIFACTS=1` to keep logs.
+The runner builds `mssh` and `msshd`, starts isolated localhost peers on dynamic
+ports, and keeps runtime secrets separate from upload-safe logs. It always checks
+OpenSSH, and can additionally check both directions with Dropbear and the libssh
+client probe. Set `MSSH_INTEROP_ENABLE_DROPBEAR=1` or
+`MSSH_INTEROP_ENABLE_LIBSSH=1` to enable those installed dependencies. Use the
+corresponding `MSSH_INTEROP_REQUIRE_DROPBEAR=1` or
+`MSSH_INTEROP_REQUIRE_LIBSSH=1` in required lanes, and
+`MSSH_INTEROP_KEEP_ARTIFACTS=1` to keep local artifacts. The Dropbear lane needs
+non-interactive `sudo` so it can create and remove a dedicated local account;
+CI installs Ubuntu's `dropbear-bin` package and requires the lane.
 
 
 # Tiny client example
@@ -146,14 +131,36 @@ Tiny uses a weaker PRNG, a fixed buffer allocator and does no file I/O.
 
 **MiSSHod is not secure, it should not be used in real world systems**
 
- - Very little testing has been done and not all code paths have been exercised
- - No efforts have been made to prevent timing attacks
- - Sensitive data is held in RAM for longer than is strictly necessary
- - MiSSHod relies on Zig's standard library for all crypto algorithms, which is still relatively young
- - Most importantly, I am not a cryptographer and I have no idea what I'm doing
+The [production-facing API and lifecycle contract](doc/api-production.md)
+documents the client/server pump, borrowed data, mandatory trust decisions,
+channel lifecycle, cleanup, and pre-1.0 compatibility policy. Compile-check the
+separate fail-closed [client](examples/production/client.zig) and
+[server](examples/production/server.zig) integration skeletons with
+`zig build production-examples`. They are guidance, not production-readiness
+claims. The [release checklist and platform matrix](doc/release-checklist.md)
+defines the evidence required before such a claim.
+
+The [production threat model](doc/threat-model.md) documents the library's
+assets, trust boundaries, current mitigations, and explicit release blockers.
+The [SSH algorithm policy](doc/algorithm-policy.md) separates the current
+allowlist and enforcement from the algorithm work still required for release.
+The `mssh`, `msshd`, and `tiny` programs are insecure examples or demos, not
+production SSH clients or servers.
+
+- Deterministic malformed, stress, soak, and peer-interoperability coverage is
+  substantial but is not a substitute for coverage-guided fuzzing or
+  independent review.
+- Timing-sensitive paths have received targeted hardening, not a complete
+  side-channel audit.
+- Secret copies and lifetimes have been reduced and documented, but compiler,
+  allocator, dependency, crash-dump, and application copies remain outside
+  complete library control.
+- MiSSHod relies on Zig's still-young standard-library cryptography and system
+  zlib; release dependencies and independent vectors are not yet fully pinned.
+- No independent cryptographic or protocol security review has occurred.
 
 # Status
 
-MiSSHod was developed rapidly. The main aim was to get it working and learn something along the way. I don't know what's next, but hopefully you can learn something too by looking at a small SSH implementation.
-
-It's entirely undocumented and there aren't enough tests. The IO systems are a bit arcane, as I've tried wherever possible to avoid using excess RAM.
+MiSSHod was developed rapidly as a small SSH implementation. Its pre-1.0 API,
+security evidence, supported-platform matrix, and independent review are not
+yet sufficient for production use.

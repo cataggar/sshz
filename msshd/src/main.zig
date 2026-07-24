@@ -2,6 +2,30 @@ const std = @import("std");
 const Misshod = @import("misshod");
 const MisshodServer = Misshod.MisshodServer;
 const SshOpenFailureReason = Misshod.SshOpenFailureReason;
+const auth = @import("auth.zig");
+
+fn printUsage(program: []const u8) void {
+    std.debug.print(
+        \\Usage: {s} <port> <hostkey> [--authorized-keys <file> | --insecure-demo-auth]
+        \\
+        \\Authentication options:
+        \\  --authorized-keys <file>  Authorize public keys globally from a plain authorized_keys file.
+        \\                            Supported key types: ssh-ed25519,
+        \\                            ecdsa-sha2-nistp256, and ssh-rsa.
+        \\                            Key options and markers are not supported.
+        \\  --insecure-demo-auth      INSECURE demo mode: accept any cryptographically verified
+        \\                            public key, or a password equal to the username.
+        \\
+        \\With no authentication option, every authentication attempt is rejected.
+        \\
+    , .{program});
+}
+
+fn cliError(program: []const u8, comptime format: []const u8, args: anytype) noreturn {
+    std.debug.print("Error: " ++ format ++ "\n\n", args);
+    printUsage(program);
+    std.process.exit(1);
+}
 
 fn readFd(fd: std.c.fd_t, buf: []u8) !usize {
     if (buf.len == 0) return 0;
@@ -30,21 +54,115 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
 
+    if (args.len == 2 and
+        (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")))
+    {
+        printUsage(args[0]);
+        std.process.exit(0);
+    }
     if (args.len < 3) {
-        std.debug.print("{s} <port> <hostkey>\n", .{args[0]});
+        printUsage(args[0]);
         std.process.exit(1);
     }
 
-    const hostkey_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, args[2], allocator, .limited(1024)) catch {
-        std.debug.print("Failed to open hostkey file {s}\n", .{args[2]});
-        std.process.exit(1);
+    var policy: auth.Policy = .deny_all;
+    defer policy.deinit();
+    var authorized_keys_path: ?[]const u8 = null;
+    var insecure_demo_auth = false;
+    var arg_index: usize = 3;
+    while (arg_index < args.len) {
+        const arg = args[arg_index];
+        if (std.mem.eql(u8, arg, "--authorized-keys")) {
+            if (authorized_keys_path != null) {
+                cliError(args[0], "--authorized-keys may only be specified once", .{});
+            }
+            arg_index += 1;
+            if (arg_index == args.len) {
+                cliError(args[0], "--authorized-keys requires a file path", .{});
+            }
+            authorized_keys_path = args[arg_index];
+        } else if (std.mem.eql(u8, arg, "--insecure-demo-auth")) {
+            if (insecure_demo_auth) {
+                cliError(args[0], "--insecure-demo-auth may only be specified once", .{});
+            }
+            insecure_demo_auth = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            printUsage(args[0]);
+            std.process.exit(0);
+        } else {
+            cliError(args[0], "unknown option '{s}'", .{arg});
+        }
+        arg_index += 1;
+    }
+
+    if (authorized_keys_path != null and insecure_demo_auth) {
+        cliError(
+            args[0],
+            "--authorized-keys and --insecure-demo-auth are mutually exclusive",
+            .{},
+        );
+    }
+
+    if (authorized_keys_path) |path| {
+        const contents = std.Io.Dir.cwd().readFileAlloc(
+            init.io,
+            path,
+            allocator,
+            .limited(auth.MaxAuthorizedKeysFileBytes + 1),
+        ) catch |err| {
+            cliError(args[0], "cannot read authorized_keys file '{s}': {s}", .{ path, @errorName(err) });
+        };
+        const result = auth.AuthorizedKeys.parse(allocator, contents) catch |err| {
+            cliError(args[0], "cannot load authorized_keys file '{s}': {s}", .{ path, @errorName(err) });
+        };
+        policy = switch (result) {
+            .authorized_keys => |keys| .{ .authorized_keys = keys },
+            .invalid => |failure| {
+                if (failure.line == 0) {
+                    cliError(args[0], "invalid authorized_keys file '{s}': {s}", .{ path, failure.reason.message() });
+                }
+                cliError(args[0], "invalid authorized_keys file '{s}' at line {d}: {s}", .{
+                    path,
+                    failure.line,
+                    failure.reason.message(),
+                });
+            },
+        };
+        std.debug.print("Authentication policy: public keys from {s}\n", .{path});
+    } else if (insecure_demo_auth) {
+        policy = .insecure_demo;
+        std.debug.print("WARNING: --insecure-demo-auth is enabled; authentication is intentionally insecure\n", .{});
+    } else {
+        std.debug.print("WARNING: no authentication policy configured; all authentication attempts will be rejected\n", .{});
+    }
+
+    const hostkey_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, args[2], allocator, .limited(1024)) catch |err| {
+        cliError(args[0], "cannot read host key file '{s}': {s}", .{ args[2], @errorName(err) });
     };
     defer allocator.free(hostkey_ascii);
 
-    const port = try std.fmt.parseInt(u16, args[1], 10);
+    const port = std.fmt.parseInt(u16, args[1], 10) catch |err| {
+        cliError(args[0], "invalid port '{s}': {s}", .{ args[1], @errorName(err) });
+    };
+    if (port == 0) {
+        cliError(args[0], "port must be between 1 and 65535", .{});
+    }
+
+    if (hostkey_ascii.len == 0) {
+        cliError(args[0], "host key file '{s}' is empty", .{args[2]});
+    }
+
+    switch (policy) {
+        .authorized_keys => |keys| if (keys.blobs.len == 0) {
+            std.debug.print("WARNING: authorized_keys file contains no keys; all authentication attempts will be rejected\n", .{});
+        },
+        else => {},
+    }
 
     const addr: std.Io.net.IpAddress = .{ .ip4 = .unspecified(port) };
-    var server = try addr.listen(init.io, .{ .reuse_address = true });
+    var server = addr.listen(init.io, .{ .reuse_address = true }) catch |err| {
+        cliError(args[0], "cannot listen on port {d}: {s}", .{ port, @errorName(err) });
+    };
     defer server.deinit(init.io);
 
     std.debug.print("Server listening on port {d}\n", .{port});
@@ -95,30 +213,17 @@ pub fn main(init: std.process.Init) !void {
                             continue :ioloop;
                         },
                         .UserAuth => |credentials| {
-                            //std.debug.print("credentials: {any}\n", .{credentials});
-                            if (credentials.auth) |auth| {
-                                switch (auth) {
-                                    .Password => |password| {
-                                        // FIXME, some kind of username/password lookup
-                                        // for now, rule is password must match username
-                                        try misshod.grantAccess(std.mem.eql(u8, credentials.username, password));
-                                    },
-                                    .Pubkey => |pubkey| {
-                                        var fingerprint_buf: [512]u8 = undefined;
-                                        std.debug.assert(std.base64.standard.Encoder.calcSize(pubkey.blob.len) <= fingerprint_buf.len);
-                                        const fingerprint = std.base64.standard.Encoder.encode(&fingerprint_buf, pubkey.blob);
-                                        std.debug.print("FIXME decide whether to allow username={s} pubkey_alg={s} pubkey={s}\n", .{ credentials.username, pubkey.algorithm, fingerprint });
-
-                                        try misshod.grantAccess(true); // FIXME
-                                    },
-                                    .KeyboardInteractive => {
-                                        try misshod.grantAccess(false);
-                                    },
-                                }
-                            } else {
-                                try misshod.grantAccess(false); // "none"
-                            }
-                            try misshod.clearEvent(eventCode);
+                            const attempt: auth.Attempt = if (credentials.auth) |method| switch (method) {
+                                .Password => |password| .{ .password = password },
+                                .Pubkey => |pubkey| .{ .public_key = .{
+                                    .algorithm = pubkey.algorithm,
+                                    .blob = pubkey.blob,
+                                } },
+                                .KeyboardInteractive => .keyboard_interactive,
+                            } else .none;
+                            try misshod.decideUserAuth(
+                                if (policy.allows(credentials.username, attempt)) .Allow else .Deny,
+                            );
                         },
                         .GetPubkeyForUser => |username| {
                             std.debug.print(".GetPubkeyForUser: {s}\n", .{username});

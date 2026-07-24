@@ -22,8 +22,12 @@ pub const BufferReader = struct {
         };
     }
 
+    fn hasRemaining(self: *const Self, n: usize) bool {
+        return self.off <= self.payload.len and n <= self.payload.len - self.off;
+    }
+
     pub fn readBoolean(self: *Self) BufferError!bool {
-        if (self.off + 1 > self.payload.len) {
+        if (!self.hasRemaining(1)) {
             return BufferError.ReaderOutOfDataErr;
         } else {
             const v = self.payload[self.off];
@@ -33,7 +37,7 @@ pub const BufferReader = struct {
     }
 
     pub fn readU8(self: *Self) BufferError!u8 {
-        if (self.off + 1 > self.payload.len) {
+        if (!self.hasRemaining(1)) {
             return BufferError.ReaderOutOfDataErr;
         } else {
             const v = self.payload[self.off];
@@ -43,7 +47,7 @@ pub const BufferReader = struct {
     }
 
     pub fn skip(self: *Self, n: usize) BufferError!void {
-        if (self.off + n > self.payload.len) {
+        if (!self.hasRemaining(n)) {
             return BufferError.ReaderOutOfDataErr;
         } else {
             self.off += n;
@@ -51,7 +55,7 @@ pub const BufferReader = struct {
     }
 
     pub fn readBytes(self: *Self, n: usize) BufferError![]const u8 {
-        if (self.off + n > self.payload.len) {
+        if (!self.hasRemaining(n)) {
             return BufferError.ReaderOutOfDataErr;
         } else {
             const sl = self.payload[self.off .. self.off + n];
@@ -61,7 +65,7 @@ pub const BufferReader = struct {
     }
 
     pub fn readU32(self: *Self) BufferError!u32 {
-        if (self.off + 4 > self.payload.len) {
+        if (!self.hasRemaining(4)) {
             return BufferError.ReaderOutOfDataErr;
         } else {
             const v = std.mem.bytesToValue(u32, self.payload[self.off .. self.off + 4]);
@@ -73,6 +77,10 @@ pub const BufferReader = struct {
     pub fn readU32LenString(self: *Self) BufferError![]const u8 {
         const len = try self.readU32();
         return try self.readBytes(len);
+    }
+
+    pub fn readMpint(self: *Self) BufferError![]const u8 {
+        return self.readU32LenString();
     }
 
     // for walking lists
@@ -97,18 +105,28 @@ pub const BufferWriter = struct {
     }
 
     pub fn init(backingbuf: []u8, pre_payload_len: usize) Self {
+        const reserved_len = @min(pre_payload_len, backingbuf.len);
         var s = Self{
             .off = 0,
             .payload_buf = backingbuf,
-            .pre_payload_len = pre_payload_len,
+            .pre_payload_len = reserved_len,
             .payload = &.{},
         };
-        _ = s.skip(pre_payload_len) catch 0;
+        s.skip(reserved_len) catch unreachable;
         return s;
+    }
+
+    pub fn initChecked(backingbuf: []u8, pre_payload_len: usize) BufferError!Self {
+        if (pre_payload_len > backingbuf.len) return BufferError.WriterOutOfDataErr;
+        return init(backingbuf, pre_payload_len);
     }
 
     pub fn updateUnderlying(self: *Self) void {
         self.payload = self.payload_buf[0..self.off];
+    }
+
+    fn hasCapacity(self: *const Self, n: usize) bool {
+        return self.off <= self.payload_buf.len and n <= self.payload_buf.len - self.off;
     }
 
     pub fn discard(self: *Self, n: usize) BufferError!void {
@@ -121,7 +139,7 @@ pub const BufferWriter = struct {
     }
 
     pub fn skip(self: *Self, n: usize) BufferError!void {
-        if (self.off + n > self.payload_buf.len) {
+        if (!self.hasCapacity(n)) {
             return BufferError.WriterOutOfDataErr;
         } else {
             self.off += n;
@@ -130,7 +148,7 @@ pub const BufferWriter = struct {
     }
 
     pub fn writeBoolean(self: *Self, v: bool) BufferError!void {
-        if (self.off + 1 > self.payload_buf.len) {
+        if (!self.hasCapacity(1)) {
             return BufferError.WriterOutOfDataErr;
         } else {
             self.payload_buf[self.off] = if (v) 1 else 0;
@@ -140,7 +158,7 @@ pub const BufferWriter = struct {
     }
 
     pub fn writeU8(self: *Self, v: u8) BufferError!void {
-        if (self.off + 1 > self.payload_buf.len) {
+        if (!self.hasCapacity(1)) {
             return BufferError.WriterOutOfDataErr;
         } else {
             self.payload_buf[self.off] = v;
@@ -150,7 +168,7 @@ pub const BufferWriter = struct {
     }
 
     pub fn writeU32(self: *Self, v: u32) BufferError!void {
-        if (self.off + 4 > self.payload_buf.len) {
+        if (!self.hasCapacity(4)) {
             return BufferError.WriterOutOfDataErr;
         } else {
             const net_v = std.mem.nativeTo(u32, v, targetEndian);
@@ -161,7 +179,7 @@ pub const BufferWriter = struct {
     }
 
     pub fn writeBytes(self: *Self, v: []const u8) BufferError!void {
-        if (self.off + v.len > self.payload_buf.len) {
+        if (!self.hasCapacity(v.len)) {
             return BufferError.WriterOutOfDataErr;
         } else {
             @memcpy(self.payload_buf[self.off .. self.off + v.len], v);
@@ -173,8 +191,14 @@ pub const BufferWriter = struct {
     pub fn writeMpint(self: *Self, v: []const u8) BufferError!void {
         // if MSB of first byte is set, mpint must be padded
         // https://datatracker.ietf.org/doc/html/rfc4251#section-5
-        const pad = v[0] & 0x80 > 0;
-        if (self.off + v.len + 4 > self.payload_buf.len) {
+        const pad = v.len != 0 and v[0] & 0x80 > 0;
+        const prefix_len: usize = 4 + @as(usize, @intFromBool(pad));
+        if (v.len > @as(usize, std.math.maxInt(u32)) - @as(usize, @intFromBool(pad))) {
+            return BufferError.WriterOutOfDataErr;
+        }
+        if (self.off > self.payload_buf.len) return BufferError.WriterOutOfDataErr;
+        const remaining = self.payload_buf.len - self.off;
+        if (prefix_len > remaining or v.len > remaining - prefix_len) {
             return BufferError.WriterOutOfDataErr;
         } else {
             if (pad) {
@@ -190,7 +214,10 @@ pub const BufferWriter = struct {
     }
 
     pub fn writeU32LenString(self: *Self, v: []const u8) BufferError!void {
-        if (self.off + v.len + 4 > self.payload_buf.len) {
+        if (v.len > @as(usize, std.math.maxInt(u32))) return BufferError.WriterOutOfDataErr;
+        if (self.off > self.payload_buf.len) return BufferError.WriterOutOfDataErr;
+        const remaining = self.payload_buf.len - self.off;
+        if (4 > remaining or v.len > remaining - 4) {
             return BufferError.WriterOutOfDataErr;
         } else {
             try self.writeU32(@intCast(v.len));

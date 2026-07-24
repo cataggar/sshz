@@ -1,0 +1,144 @@
+name: Stress and soak
+
+on:
+  schedule:
+    - cron: "17 3 * * 2,4"
+    - cron: "41 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration_seconds:
+        description: Soak duration in seconds
+        required: true
+        default: "1200"
+      seed:
+        description: Deterministic unsigned seed
+        required: true
+        default: "1751547392"
+      peer:
+        description: Peer selection
+        required: true
+        type: choice
+        default: openssh
+        options:
+          - internal
+          - openssh
+          - dropbear
+          - libssh
+          - all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stress-soak-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  openssh-scheduled:
+    if: github.event_name == 'schedule' && github.event.schedule == '17 3 * * 2,4'
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        peer: [openssh]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout misshod
+        uses: actions/checkout@v5
+        with:
+          path: misshod
+      - &install-zig
+        name: Install Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="0.16.0"
+          archive="zig-x86_64-linux-${version}.tar.xz"
+          zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          echo "${zig_dir}" >> "${GITHUB_PATH}"
+          "${zig_dir}/zig" version
+      - &install-peers
+        name: Install peer and resource tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dropbear-bin gcc libssh-dev openssh-client openssh-server pkg-config time
+          sudo mkdir -p /run/sshd
+      - name: Run 20-minute OpenSSH soak
+        working-directory: misshod
+        env:
+          MISSHOD_SOAK_ARTIFACTS: ${{ runner.temp }}/misshod-soak
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/misshod-soak-safe"
+          zig build soak -Doptimize=ReleaseSafe -- \
+            --duration-seconds 1200 --seed 1751547392 --peer "${{ matrix.peer }}" \
+            2>&1 | tee "${RUNNER_TEMP}/misshod-soak-safe/soak.log"
+      - &upload-safe
+        name: Upload safe failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-failure-${{ github.job }}-${{ matrix.peer }}
+          path: |
+            ${{ runner.temp }}/misshod-soak-safe/soak.log
+            ${{ runner.temp }}/misshod-soak/**/logs/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+  extended-scheduled:
+    if: github.event_name == 'schedule' && github.event.schedule == '41 4 * * 0'
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        peer: [dropbear, libssh]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout misshod
+        uses: actions/checkout@v5
+        with:
+          path: misshod
+      - *install-zig
+      - *install-peers
+      - name: Run 20-minute extended peer soak
+        working-directory: misshod
+        env:
+          MISSHOD_SOAK_ARTIFACTS: ${{ runner.temp }}/misshod-soak
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/misshod-soak-safe"
+          zig build soak -Doptimize=ReleaseSafe -- \
+            --duration-seconds 1200 --seed 1751547392 --peer "${{ matrix.peer }}" \
+            2>&1 | tee "${RUNNER_TEMP}/misshod-soak-safe/soak.log"
+      - *upload-safe
+
+  manual:
+    if: github.event_name == 'workflow_dispatch'
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        peer: ["${{ inputs.peer }}"]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout misshod
+        uses: actions/checkout@v5
+        with:
+          path: misshod
+      - *install-zig
+      - *install-peers
+      - name: Run selected manual soak
+        working-directory: misshod
+        env:
+          MISSHOD_SOAK_ARTIFACTS: ${{ runner.temp }}/misshod-soak
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/misshod-soak-safe"
+          zig build soak -Doptimize=ReleaseSafe -- \
+            --duration-seconds "${{ inputs.duration_seconds }}" \
+            --seed "${{ inputs.seed }}" \
+            --peer "${{ matrix.peer }}" \
+            2>&1 | tee "${RUNNER_TEMP}/misshod-soak-safe/soak.log"
+      - *upload-safe

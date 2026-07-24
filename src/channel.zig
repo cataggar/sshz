@@ -2,6 +2,21 @@ const std = @import("std");
 const Protocol = @import("protocol.zig");
 
 pub const MaxChannels = 4;
+pub const MaxPendingChannelData = MaxChannels * Protocol.MaxChannelDataLen;
+
+pub const ChannelError = error{
+    ChannelPacketTooLarge,
+    ReceiveWindowExceeded,
+    WindowOverflow,
+};
+
+pub const ChannelLimits = struct {
+    max_channels: u8 = MaxChannels,
+    initial_window: u32 = Protocol.MaxChannelDataLen,
+    max_window: u32 = std.math.maxInt(u32),
+    packet_size: u32 = Protocol.MaxChannelDataLen,
+    max_buffered_data: usize = Protocol.MaxChannelDataLen,
+};
 
 pub const ClientChannelOpenMode = enum {
     AutoShell,
@@ -81,6 +96,9 @@ pub const Channel = struct {
     peer_window: u32,
     remote_max_packet_size: u32,
     local_window: u32,
+    local_window_target: u32,
+    local_max_packet_size: u32,
+    max_buffered_data: usize,
     write_buf: [Protocol.MaxChannelDataLen]u8 = undefined,
     write_buf_nbytes: usize,
     tx_in_flight_len: usize,
@@ -99,7 +117,7 @@ pub const Channel = struct {
     state: ChannelState,
 
     pub fn init(local_id: u32, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) Self {
-        return Self.initKind(.Session, local_id, remote_id, true, peer_window, remote_max_packet_size);
+        return Self.initKind(.Session, local_id, remote_id, true, peer_window, remote_max_packet_size, .{});
     }
 
     pub fn initKind(
@@ -109,6 +127,7 @@ pub const Channel = struct {
         remote_id_known: bool,
         peer_window: u32,
         remote_max_packet_size: u32,
+        limits: ChannelLimits,
     ) Self {
         return Self{
             .kind = kind,
@@ -117,7 +136,10 @@ pub const Channel = struct {
             .remote_id_known = remote_id_known,
             .peer_window = peer_window,
             .remote_max_packet_size = remote_max_packet_size,
-            .local_window = Protocol.MaxChannelDataLen,
+            .local_window = limits.initial_window,
+            .local_window_target = limits.initial_window,
+            .local_max_packet_size = limits.packet_size,
+            .max_buffered_data = limits.max_buffered_data,
             .write_buf_nbytes = 0,
             .tx_in_flight_len = 0,
             .eof_pending = false,
@@ -156,19 +178,27 @@ pub const Channel = struct {
         self.tx_in_flight_len = 0;
     }
 
-    /// Decrement local_window by the amount of data received.
-    pub fn consumeLocalWindow(self: *Self, len: u32) void {
-        self.local_window -|= len; // saturating subtract
+    pub fn consumeLocalWindow(self: *Self, len: usize) ChannelError!void {
+        if (len > self.local_max_packet_size) return error.ChannelPacketTooLarge;
+        if (len > self.local_window) return error.ReceiveWindowExceeded;
+        self.local_window -= @intCast(len);
+    }
+
+    pub fn adjustPeerWindow(self: *Self, amount: u32, maximum: u32) ChannelError!void {
+        if (self.peer_window > maximum or amount > maximum - self.peer_window)
+            return error.WindowOverflow;
+        self.peer_window += amount;
     }
 
     /// Returns true if local_window has dropped below the replenish threshold.
     pub fn needsWindowAdjust(self: *const Self) bool {
-        return self.local_window < Protocol.MaxChannelDataLen / 2;
+        return self.local_window == 0 or
+            self.local_window < self.local_window_target / 2;
     }
 
     /// Returns the number of bytes to add to restore the advertised receive window.
     pub fn windowAdjustAmount(self: *const Self) u32 {
-        return @as(u32, @intCast(Protocol.MaxChannelDataLen)) - self.local_window;
+        return self.local_window_target - self.local_window;
     }
 };
 
@@ -178,6 +208,7 @@ pub const ChannelTable = struct {
     channels: [MaxChannels]?Channel = .{null} ** MaxChannels,
     next_local_id: u32 = 0,
     last_serviced_slot: usize = 0,
+    limits: ChannelLimits = .{},
 
     pub fn allocChannel(self: *Self, remote_id: u32, peer_window: u32, remote_max_packet_size: u32) ?*Channel {
         return self.allocChannelKindKnown(.Session, remote_id, true, peer_window, remote_max_packet_size);
@@ -210,9 +241,10 @@ pub const ChannelTable = struct {
         remote_max_packet_size: u32,
     ) ?*Channel {
         const local_id = self.next_local_id;
-        for (&self.channels) |*slot| {
+        for (&self.channels, 0..) |*slot, index| {
+            if (index >= self.limits.max_channels) break;
             if (slot.* == null) {
-                slot.* = Channel.initKind(kind, local_id, remote_id, remote_id_known, peer_window, remote_max_packet_size);
+                slot.* = Channel.initKind(kind, local_id, remote_id, remote_id_known, peer_window, remote_max_packet_size, self.limits);
                 self.next_local_id +%= 1;
                 return &(slot.*.?);
             }
@@ -542,15 +574,75 @@ test "OpenWrite channel state is runnable" {
 test "consumeLocalWindow decrements local_window" {
     var ch = Channel.init(0, 1, 32768, 32768);
     const initial = ch.local_window;
-    ch.consumeLocalWindow(100);
+    try ch.consumeLocalWindow(100);
     try std.testing.expectEqual(initial - 100, ch.local_window);
 }
 
-test "consumeLocalWindow saturates at zero" {
+test "consumeLocalWindow rejects data above advertised window" {
     var ch = Channel.init(0, 1, 32768, 32768);
     ch.local_window = 50;
-    ch.consumeLocalWindow(200);
-    try std.testing.expectEqual(@as(u32, 0), ch.local_window);
+    try std.testing.expectError(error.ReceiveWindowExceeded, ch.consumeLocalWindow(200));
+    try std.testing.expectEqual(@as(u32, 50), ch.local_window);
+}
+
+test "channel packet and receive window limits enforce below at and above" {
+    var below = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 8,
+        .packet_size = 4,
+    });
+    try below.consumeLocalWindow(3);
+    try std.testing.expectEqual(@as(u32, 5), below.local_window);
+
+    var exact = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 4,
+        .packet_size = 4,
+    });
+    try exact.consumeLocalWindow(4);
+    try std.testing.expectEqual(@as(u32, 0), exact.local_window);
+    try std.testing.expect(exact.needsWindowAdjust());
+
+    var one_byte = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 1,
+        .packet_size = 1,
+    });
+    try one_byte.consumeLocalWindow(1);
+    try std.testing.expect(one_byte.needsWindowAdjust());
+    try std.testing.expectEqual(@as(u32, 1), one_byte.windowAdjustAmount());
+
+    var packet_over = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 8,
+        .packet_size = 4,
+    });
+    try std.testing.expectError(error.ChannelPacketTooLarge, packet_over.consumeLocalWindow(5));
+    try std.testing.expectEqual(@as(u32, 8), packet_over.local_window);
+
+    var window_over = Channel.initKind(.Session, 0, 1, true, 100, 100, .{
+        .initial_window = 4,
+        .packet_size = 8,
+    });
+    try std.testing.expectError(error.ReceiveWindowExceeded, window_over.consumeLocalWindow(5));
+    try std.testing.expectEqual(@as(u32, 4), window_over.local_window);
+}
+
+test "peer window adjustment rejects overflow without changing counter" {
+    var ch = Channel.init(0, 1, 8, 8);
+    try ch.adjustPeerWindow(2, 10);
+    try std.testing.expectEqual(@as(u32, 10), ch.peer_window);
+    try std.testing.expectError(error.WindowOverflow, ch.adjustPeerWindow(1, 10));
+    try std.testing.expectEqual(@as(u32, 10), ch.peer_window);
+
+    ch.peer_window = std.math.maxInt(u32);
+    try std.testing.expectError(
+        error.WindowOverflow,
+        ch.adjustPeerWindow(1, std.math.maxInt(u32)),
+    );
+}
+
+test "runtime channel count rejects above configured capacity" {
+    var table = ChannelTable{ .limits = .{ .max_channels = 1 } };
+    try std.testing.expect(table.allocChannel(1, 8, 8) != null);
+    try std.testing.expectEqual(@as(u32, 1), table.activeCount());
+    try std.testing.expect(table.allocChannel(2, 8, 8) == null);
 }
 
 test "needsWindowAdjust triggers below half advertised window" {
@@ -574,7 +666,7 @@ test "windowAdjustAmount replenishes advertised window" {
     try std.testing.expectEqual(Protocol.MaxChannelDataLen - 100, adjust);
 
     // After applying the adjust, window should match the advertised window.
-    ch.local_window += adjust;
+    ch.local_window = ch.local_window_target;
     try std.testing.expectEqual(Protocol.MaxChannelDataLen, ch.local_window);
 }
 
