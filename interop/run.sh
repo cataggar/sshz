@@ -20,6 +20,7 @@ DROPBEAR_USER=""
 DROPBEAR_USER_CREATED=0
 DROPBEAR_LAUNCH_PID=""
 DROPBEAR_PID_FILE=""
+DROPBEAR_HOME=""
 
 log() {
     printf '==> %s\n' "$*"
@@ -55,6 +56,9 @@ cleanup() {
         "${ROOT_CMD[@]}" "$USERDEL_BIN" "$DROPBEAR_USER" >/dev/null 2>&1 || {
             printf 'warning: could not remove Dropbear interop account %s\n' "$DROPBEAR_USER" >&2
         }
+    fi
+    if [[ "$DROPBEAR_HOME" == /tmp/misshod-dropbear-home.* ]]; then
+        rm -rf -- "$DROPBEAR_HOME"
     fi
 
     if [[ -n "$KEEP_ARTIFACTS" || "$status" -ne 0 ]]; then
@@ -361,7 +365,7 @@ if [[ "${MSSH_INTEROP_ENABLE_DROPBEAR:-}" == "1" || "${MSSH_INTEROP_REQUIRE_DROP
 
     if [[ -n "$DROPBEAR_BIN" && "${#missing_dropbear_commands[@]}" -eq 0 ]]; then
         DROPBEAR_DIR="$RUNTIME_DIR/dropbear"
-        DROPBEAR_HOME="$DROPBEAR_DIR/home"
+        DROPBEAR_HOME="$(mktemp -d /tmp/misshod-dropbear-home.XXXXXX)"
         DROPBEAR_PID_FILE="$DROPBEAR_DIR/dropbear.pid"
         DROPBEAR_HOST_KEY="$DROPBEAR_DIR/dropbear_ed25519_host_key"
         DROPBEAR_AUTHORIZED_KEYS="$DROPBEAR_HOME/.ssh/authorized_keys"
@@ -373,10 +377,9 @@ if [[ "${MSSH_INTEROP_ENABLE_DROPBEAR:-}" == "1" || "${MSSH_INTEROP_REQUIRE_DROP
         while id "$DROPBEAR_USER" >/dev/null 2>&1; do
             DROPBEAR_USER="msshdi$RANDOM"
         done
-
+        mkdir -p "$DROPBEAR_DIR" "$DROPBEAR_HOME/.ssh"
         mkdir -p "$DROPBEAR_HOME/.ssh"
-        chmod 711 "$WORK" "$RUNTIME_DIR"
-        chmod 711 "$DROPBEAR_DIR"
+        chmod 700 "$DROPBEAR_DIR"
         chmod 700 "$DROPBEAR_HOME" "$DROPBEAR_HOME/.ssh"
         ssh-keygen -y -f "$KEY_PASSWORDLESS" >"$DROPBEAR_AUTHORIZED_KEYS"
         ssh-keygen -y -P "$KEY_PASSPHRASE" -f "$KEY_ENCRYPTED" >>"$DROPBEAR_AUTHORIZED_KEYS"
@@ -404,11 +407,8 @@ banner=misshod-dropbear-auth-banner
 authorized_fixture_keys=passwordless-ed25519,encrypted-ed25519
 EOF
 
-        # Dropbear rejects locked accounts before public-key authorization.
-        # The empty password only unlocks this ephemeral account; -s keeps
-        # password authentication disabled for the isolated server.
         "${ROOT_CMD[@]}" "$USERADD_BIN" --home-dir "$DROPBEAR_HOME" --shell /bin/sh \
-            --no-create-home --user-group --password '' "$DROPBEAR_USER"
+            --no-create-home --user-group "$DROPBEAR_USER"
         DROPBEAR_USER_CREATED=1
         "${ROOT_CMD[@]}" chown -R "$DROPBEAR_USER:$DROPBEAR_USER" "$DROPBEAR_HOME"
 
