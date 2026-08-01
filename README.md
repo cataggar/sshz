@@ -19,26 +19,43 @@ It aims to be:
 
 **Features**
 
- - Public key auth
- - Password auth
+ - User authentication
+    - `publickey` (Ed25519, ECDSA P-256, RSA with SHA-2)
+    - `password`
+    - `keyboard-interactive`
+    - `none` (used to probe the server's method list)
+ - Connection layer
+    - Multiple concurrent channels with round-robin scheduling
+    - Session channels: `shell`, `exec`, `pty-req`, `window-change`, `subsystem`
+    - TCP/IP port forwarding (`direct-tcpip`, `forwarded-tcpip`, `tcpip-forward`)
+    - Agent forwarding (`auth-agent-req@openssh.com`)
+    - Per-channel receive-window accounting and EOF half-close semantics
+    - Re-keying after the initial key exchange
  - Supports a focused set of SSH transport algorithms
-    - hmac-sha2-256 (hmac)
     - curve25519-sha256 (key exchange)
-    - ssh-ed25519 (key)
+    - ssh-ed25519, ecdsa-sha2-nistp256, rsa-sha2-512, rsa-sha2-256 (host key)
     - aes256-ctr (cipher)
+    - hmac-sha2-256 (mac)
     - zlib@openssh.com (delayed compression)
+
+The [SSH algorithm policy](doc/algorithm-policy.md) is the authoritative
+description of what is negotiated and enforced.
 
 # Building
 
 MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/) and system zlib.
 
+To run the library test suites from the repository root:
+
+```bash
+zig build test        # library unit tests
+zig build malformed   # bounded deterministic malformed-input corpus
+zig build stress      # deterministic in-process stress acceptance
+```
+
 ## Client
 
 To build `mssh`, a command line SSH client for Mac/Linux
-
-```bash
-zig build test
-```
 
 ```bash
 cd mssh
@@ -49,9 +66,8 @@ zig build
 
 Use `-A` or `--agent-forward` to forward the local SSH agent from `SSH_AUTH_SOCK`.
 
-The old manual Dropbear container has been retired. The `testserver` directory
-now only contains key fixtures used through runtime-only copies by the automated
-interop harness described below.
+The `testserver` directory contains only key fixtures, which the automated
+interop harness described below uses through runtime-only copies.
 
 For non-interactive runs, `mssh` reads optional secrets from `MSSH_AUTH_PASSWORD` and `MSSH_KEY_PASSPHRASE`.
 
@@ -117,16 +133,6 @@ non-interactive `sudo` so it can create and remove a dedicated local account;
 CI installs Ubuntu's `dropbear-bin` package and requires the lane.
 
 
-# Tiny client example
-
-As a proof of concept, the `tiny` example logs into the test server but contains no socket code. Instead, it uses stdout and stdin. To run it via `socat`:
-
-```bash
-zig build && socat TCP4:127.0.0.1:2022 EXEC:./zig-out/bin/tiny
-```
-
-Tiny uses a weaker PRNG, a fixed buffer allocator and does no file I/O.
-
 # Security
 
 **MiSSHod is not secure, it should not be used in real world systems**
@@ -144,7 +150,7 @@ The [production threat model](doc/threat-model.md) documents the library's
 assets, trust boundaries, current mitigations, and explicit release blockers.
 The [SSH algorithm policy](doc/algorithm-policy.md) separates the current
 allowlist and enforcement from the algorithm work still required for release.
-The `mssh`, `msshd`, and `tiny` programs are insecure examples or demos, not
+The `mssh` and `msshd` programs are insecure examples or demos, not
 production SSH clients or servers.
 
 - Deterministic malformed, stress, soak, and peer-interoperability coverage is

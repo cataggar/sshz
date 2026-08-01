@@ -234,7 +234,7 @@ an issue link as a completed test.
 The following are excluded from the product-code review unless separately
 added to a signed scope amendment:
 
-- `mssh/`, `msshd/`, and `tiny` as production applications; they are examples
+- `mssh/` and `msshd/` as production applications; they are examples
   or demos. Their use as test drivers and their handling of the library trust
   boundary may be observed, but does not make them reviewed deployment tools;
 - `interop/` and `testserver/` as production code; they are evidence

@@ -1,13 +1,11 @@
 .{
     .name = .mssh,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0xf9c4e594f592e3c3,
     .dependencies = .{
         .misshod = .{ .path = ".." },
     },
     .paths = .{
-        "LICENSE",
-        "README.md",
         "build.zig",
         "build.zig.zon",
         "src",

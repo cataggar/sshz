@@ -1,6 +1,6 @@
 .{
     .name = .misshod,
-    .version = "0.0.1",
+    .version = "0.1.0",
     .fingerprint = 0x7170711567835565,
     .minimum_zig_version = "0.16.0",
 
@@ -9,10 +9,15 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "LICENSE.md",
+        "README.md",
+        "doc",
+        "examples",
         "interop",
         "mssh",
         "msshd",
         "src",
+        "test",
         "testserver",
     },
 }
