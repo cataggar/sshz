@@ -32,8 +32,10 @@ pub fn AesCtr(enc_algo: anytype) type {
             if (in.len > max_bytes_per_key - self.bytecount) return error.CounterExhausted;
 
             // fixup the counter iv according to the bytecount
+            // readInt(.big) already yields a host-native integer; byte-swapping it
+            // again would corrupt the counter base on big-endian targets.
             const orig = std.mem.readInt(u128, &self.origiv, .big);
-            std.mem.writeInt(u128, &self.iv, @as(u128, self.bytecount / iv_size) +% std.mem.toNative(u128, orig, .little), .big);
+            std.mem.writeInt(u128, &self.iv, @as(u128, self.bytecount / iv_size) +% orig, .big);
             ctr_mode(aes.AesEncryptCtx(enc_algo), self.ctx, out, in, self.iv, std.builtin.Endian.big);
             self.bytecount += in.len;
         }

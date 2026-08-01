@@ -77,6 +77,8 @@ pub const Session = struct {
     kex_hash_order: Protocol.KexHashOrder = .Init,
     selected_hostkey_algorithm: ?Key.SignatureAlgorithm,
     session_id: [Protocol.hash_algo.digest_length]u8 = .{0} ** Protocol.hash_algo.digest_length,
+    session_id_established: bool = false,
+    user_authenticated: bool = false,
     keydata: Protocol.KeyDataBi,
     rand: std.Random = undefined,
     encrypted: bool,
@@ -172,6 +174,8 @@ pub const Session = struct {
         self.keydata.clear();
         self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
+        self.session_id_established = false;
+        self.user_authenticated = false;
         self.clearHostPrivateKey();
         self.encrypted = false;
         self.inbound_encrypted = false;
@@ -202,6 +206,8 @@ pub const Session = struct {
         self.clearAndFreeOptional(&self.pending_server_kexinit);
         self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
+        self.session_id_established = false;
+        self.user_authenticated = false;
         self.clearHostPrivateKey();
         self.auth_pubkey_attempted.clear();
         self.auth_pubkey_algorithm = null;
@@ -285,6 +291,20 @@ pub const Session = struct {
         self.is_rekeying = true;
     }
 
+    /// Connection-protocol handlers finish by returning the session to
+    /// `.ChannelActive`. RFC 4253 §9 lets those packets keep arriving while a
+    /// locally-initiated re-key has parked `sessionState` in the key-exchange
+    /// states, and overwriting it there would strand the re-key: the peer's
+    /// KEXINIT would then look peer-initiated and be rejected. Record the
+    /// target as the post-NEWKEYS resume state instead.
+    fn resumeChannelActive(self: *Self) void {
+        if (self.is_rekeying) {
+            self.rekey_resume_state = .ChannelActive;
+            return;
+        }
+        self.setSessionState(.ChannelActive);
+    }
+
     fn clearPendingKeys(self: *Self) void {
         if (self.pending_c2s_keys) |*keys| keys.clear();
         if (self.pending_s2c_keys) |*keys| keys.clear();
@@ -294,7 +314,14 @@ pub const Session = struct {
 
     fn installExchangeKeys(self: *Self, kexhash: [Protocol.hash_algo.digest_length]u8) MisshodError!void {
         defer std.crypto.secureZero(u8, &self.shared_secret_k);
-        if (!self.is_rekeying) @memcpy(&self.session_id, &kexhash);
+        if (!self.is_rekeying) {
+            @memcpy(&self.session_id, &kexhash);
+            self.session_id_established = true;
+        } else if (!self.session_id_established) {
+            // A re-key can never be the first exchange. Refuse rather than derive
+            // keys and bind userauth signatures against an all-zero session_id.
+            return IoError.UnexpectedResponse;
+        }
         self.clearPendingKeys();
         var pending = Protocol.KeyDataBi.init();
         defer pending.clear();
@@ -526,6 +553,7 @@ pub const Session = struct {
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS));
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr);
                 try self.activateDelayedCompression();
+                self.user_authenticated = true;
                 self.setSessionState(.Authenticated);
                 try misshod.requestWrite(wrapped, .Idle);
             },
@@ -713,7 +741,7 @@ pub const Session = struct {
         if (chan.state != .Open) return IoError.UnexpectedResponse;
         chan.state = .ConfirmWrite;
         self.active_channel_id = channel_id;
-        self.setSessionState(.ChannelActive);
+        self.resumeChannelActive();
         self.setIoSessionState(.Idle);
     }
 
@@ -724,7 +752,7 @@ pub const Session = struct {
         chan.open_failure_description = description;
         chan.state = .OpenFailureWrite;
         self.active_channel_id = channel_id;
-        self.setSessionState(.ChannelActive);
+        self.resumeChannelActive();
         self.setIoSessionState(.Idle);
     }
 
@@ -753,7 +781,7 @@ pub const Session = struct {
         };
         chan.state = .OpenWrite;
         self.active_channel_id = chan.local_id;
-        self.setSessionState(.ChannelActive);
+        self.resumeChannelActive();
         self.setIoSessionState(.Idle);
         try self.advanceChannel(misshod, &self.keydata.s2c);
         return chan.local_id;
@@ -774,7 +802,7 @@ pub const Session = struct {
     pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
         const chan = try self.queueChannelWrite(channel_id, nbytes);
         if (chan.state == .DataRx) {
-            self.setSessionState(.ChannelActive);
+            self.resumeChannelActive();
             self.setIoSessionState(.Idle);
         }
     }
@@ -935,7 +963,7 @@ pub const Session = struct {
             if (chan.close_received) {
                 chan.state = .Closed;
                 self.active_channel_id = chan.local_id;
-                self.setSessionState(.ChannelActive);
+                self.resumeChannelActive();
             }
             const received_packet_pending = switch (self.ioSessionState) {
                 .ReadPktCompletion => true,
@@ -975,7 +1003,7 @@ pub const Session = struct {
         const chan = self.channel_table.allocOutboundChannelKind(.AgentForward) orelse return IoError.UnexpectedResponse;
         chan.state = .Open;
         self.active_channel_id = chan.local_id;
-        self.setSessionState(.ChannelActive);
+        self.resumeChannelActive();
         self.setIoSessionState(.Idle);
         return chan.local_id;
     }
@@ -1144,12 +1172,12 @@ pub const Session = struct {
         if (channel_type == .Session) {
             chan.state = .ConfirmWrite;
             self.active_channel_id = chan.local_id;
-            self.setSessionState(.ChannelActive);
+            self.resumeChannelActive();
             self.setIoSessionState(.Idle);
         } else {
             chan.state = .Open;
             self.active_channel_id = null;
-            self.setSessionState(.ChannelActive);
+            self.resumeChannelActive();
             self.requestChannelOpenEvent(misshod, chan);
         }
     }
@@ -1220,7 +1248,7 @@ pub const Session = struct {
                 chan.remote_max_packet_size = max_packet_size;
                 chan.state = .Data;
                 self.active_channel_id = null;
-                self.setSessionState(.ChannelActive);
+                self.resumeChannelActive();
                 misshod.requestEvent(.{ .AgentChannelOpen = chan.local_id }, .ReadPktHdr);
                 return;
             }
@@ -1231,7 +1259,7 @@ pub const Session = struct {
             chan.remote_max_packet_size = max_packet_size;
             chan.state = .Data;
             self.active_channel_id = chan.local_id;
-            self.setSessionState(.ChannelActive);
+            self.resumeChannelActive();
             misshod.requestEvent(.{ .ChannelOpened = chan.local_id }, .Idle);
         } else {
             self.setIoSessionState(.ReadPktHdr);
@@ -1255,7 +1283,7 @@ pub const Session = struct {
 
             self.channel_table.freeChannel(local_id);
             self.active_channel_id = null;
-            self.setSessionState(.ChannelActive);
+            self.resumeChannelActive();
             misshod.requestEvent(.{ .ChannelOpenFailure = .{
                 .channel = local_id,
                 .reason_code = reason_code,
@@ -1264,6 +1292,15 @@ pub const Session = struct {
         } else {
             self.setIoSessionState(.ReadPktHdr);
         }
+    }
+
+    /// RFC 4250 §4.1.2 reserves message numbers 80-127 for the connection
+    /// protocol, which is only reachable after `ssh-userauth` succeeds. This is
+    /// a latch rather than a `sessionState` test because RFC 4253 §9 allows
+    /// connection-protocol packets sent before a re-key to still arrive while
+    /// `sessionState` is temporarily back in the key-exchange states.
+    fn isAuthenticatedForConnectionProtocol(self: *const Self) bool {
+        return self.user_authenticated;
     }
 
     pub fn handlePacket(self: *Self, buf: []const u8, misshod: *MisshodServer) MisshodError!void {
@@ -1281,16 +1318,29 @@ pub const Session = struct {
             return;
         }
 
+        if (msgid >= Protocol.connection_protocol_msgid_min and
+            msgid <= Protocol.connection_protocol_msgid_max and
+            !self.isAuthenticatedForConnectionProtocol())
+        {
+            return IoError.UnexpectedResponse;
+        }
+
         switch (msgid) {
             @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT) => {
                 errdefer self.clearKexState();
                 TRACE(.Debug, "{any}", .{@as(Protocol.MsgId, @enumFromInt(msgid))});
 
+                // A peer-initiated re-key is only meaningful once the first key
+                // exchange has completed. Without this, a KEXINIT arriving
+                // mid-initial-handshake is misclassified as a re-key, which
+                // leaves session_id all-zero and can drive kex_hash_order into
+                // an illegal transition.
                 const initial_kex = self.sessionState == .KexInitRead and !self.is_rekeying and
                     !self.encrypted and !self.inbound_encrypted;
                 const local_or_simultaneous_rekey = self.sessionState == .KexInitRead and self.is_rekeying;
                 const peer_initiated_rekey = !initial_kex and !local_or_simultaneous_rekey;
                 if (peer_initiated_rekey) {
+                    if (!self.session_id_established) return IoError.UnexpectedResponse;
                     TRACE(.Info, "Re-keying initiated by peer", .{});
                     try self.startPeerRekey();
                 }
@@ -1579,11 +1629,11 @@ pub const Session = struct {
                 if (wantreply) {
                     self.active_channel_id = chan.local_id;
                     chan.state = .RspWrite;
-                    self.setSessionState(.ChannelActive);
+                    self.resumeChannelActive();
                     self.setIoSessionState(.Idle);
                 } else {
                     chan.state = .Data;
-                    self.setSessionState(.ChannelActive);
+                    self.resumeChannelActive();
                     self.setIoSessionState(.Idle);
                 }
             },
@@ -1607,7 +1657,7 @@ pub const Session = struct {
                 misshod.requestEvent(.{ .RxData = .{ .channel = chan.local_id, .data = s } }, .Idle);
                 chan.state = .Data;
                 self.active_channel_id = chan.local_id;
-                self.setSessionState(.ChannelActive);
+                self.resumeChannelActive();
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
                 const channelnum = try rdr.readU32();
@@ -1629,7 +1679,7 @@ pub const Session = struct {
                 misshod.requestEvent(.{ .RxExtendedData = .{ .channel = chan.local_id, .data_type = data_type, .data = s } }, .Idle);
                 chan.state = .Data;
                 self.active_channel_id = chan.local_id;
-                self.setSessionState(.ChannelActive);
+                self.resumeChannelActive();
             },
             @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
                 // RFC 4253 §11.1
@@ -1648,7 +1698,7 @@ pub const Session = struct {
                     chan.eof_received = true;
                     if (chan.write_buf_nbytes > 0 or chan.eof_pending or chan.close_pending) {
                         self.active_channel_id = chan.local_id;
-                        self.setSessionState(.ChannelActive);
+                        self.resumeChannelActive();
                         self.setIoSessionState(.Idle);
                         return;
                     }
@@ -1668,7 +1718,7 @@ pub const Session = struct {
                     if (chan.kind == .AgentForward) {
                         self.active_channel_id = chan.local_id;
                         chan.state = .Closed;
-                        self.setSessionState(.ChannelActive);
+                        self.resumeChannelActive();
                         self.setIoSessionState(.Idle);
                     } else {
                         self.channel_table.freeChannel(chan.local_id);
@@ -1683,7 +1733,7 @@ pub const Session = struct {
                     self.active_channel_id = chan.local_id;
                     chan.close_pending = true;
                     chan.state = .DataRx;
-                    self.setSessionState(.ChannelActive);
+                    self.resumeChannelActive();
                     self.setIoSessionState(.Idle);
                 }
             },
@@ -1711,7 +1761,7 @@ pub const Session = struct {
                     try chan.adjustPeerWindow(bytes_to_add, self.limits.max_channel_window);
                     if (chan.write_buf_nbytes > 0) {
                         self.active_channel_id = chan.local_id;
-                        self.setSessionState(.ChannelActive);
+                        self.resumeChannelActive();
                         self.setIoSessionState(.Idle);
                         return;
                     }
@@ -2318,6 +2368,7 @@ test "server rekey preserves initial session id for key derivation" {
     session.session_id = original_session_id;
     session.shared_secret_k = rekey_secret;
     session.is_rekeying = true;
+    session.session_id_established = true;
 
     var expected = Protocol.KeyDataBi.init();
     defer expected.clear();
@@ -2349,6 +2400,8 @@ test "simultaneous server local and client rekey preserves exact local KEXINIT" 
     );
     defer m.deinit();
     try m.session.setPeerProtocolVersion("SSH-2.0-test_client");
+    m.session.session_id_established = true;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     m.session.setIoSessionState(.ReadPktHdr);
     m.session.encrypted = true;
@@ -2413,6 +2466,7 @@ test "server rekey activates outbound and inbound keys at NEWKEYS boundaries" {
     m.session.inbound_encrypted = true;
     try m.initializeDeadlines(100);
     m.session.is_rekeying = true;
+    m.session.session_id_established = true;
     m.session.shared_secret_k = new_secret;
     try m.session.installExchangeKeys(new_hash);
 
@@ -2489,6 +2543,8 @@ test "server rekey gates deferred channel traffic until NEWKEYS completes" {
     const channel_b = m.session.channel_table.allocChannel(20, 1000, 1000).?;
     channel_b.state = .DataRx;
     for (channel_a.write_buf[0..2000], 0..) |*byte, index| byte.* = @truncate(index);
+    m.session.session_id_established = true;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     m.session.setIoSessionState(.ReadPktHdr);
     m.requestRead(0, 1, .ReadPktHdr);
@@ -2539,6 +2595,7 @@ test "server rekey gates deferred channel traffic until NEWKEYS completes" {
 
     try m.session.activatePendingC2sKeys(&m);
     m.session.is_rekeying = false;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     m.session.setIoSessionState(.Idle);
     m.iostate_rd = .Idle;
@@ -2607,6 +2664,7 @@ test "server local close discards window-blocked suffix after in-flight fragment
 
     const chan = m.session.channel_table.allocChannel(77, 1000, 1000).?;
     chan.state = .DataRx;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     for (chan.write_buf[0..2000], 0..) |*byte, index| byte.* = @truncate(index);
     m.session.setIoSessionState(.ReadPktHdr);
@@ -2637,6 +2695,7 @@ test "server completion schedules pending control on another channel" {
     channel_a.state = .DataRx;
     const channel_b = m.session.channel_table.allocChannel(20, 1000, 1000).?;
     channel_b.state = .DataRx;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     const data_len: usize = 100;
     for (channel_a.write_buf[0..data_len], 0..) |*byte, index| byte.* = @truncate(index);
@@ -2667,6 +2726,8 @@ test "server close completion dispatches next channel control during active read
     first.state = .DataRx;
     const second = m.session.channel_table.allocChannel(20, 1000, 1000).?;
     second.state = .DataRx;
+    m.session.session_id_established = true;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     m.session.setIoSessionState(.ReadPktHdr);
     m.requestRead(0, 1, .ReadPktHdr);
@@ -2742,6 +2803,7 @@ test "server rejects channel data above packet and receive window limits" {
     defer packet_server.deinit();
     const packet_chan = packet_server.session.channel_table.allocChannel(42, 8, 4).?;
     packet_chan.state = .DataRx;
+    packet_server.session.user_authenticated = true;
     var payload_backing: [64]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
     try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
@@ -2763,6 +2825,7 @@ test "server rejects channel data above packet and receive window limits" {
     defer window_server.deinit();
     const window_chan = window_server.session.channel_table.allocChannel(42, 8, 4).?;
     window_chan.state = .DataRx;
+    window_server.session.user_authenticated = true;
     window_chan.local_window = 3;
     payload = BufferWriter.init(&payload_backing, 0);
     try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
@@ -2776,11 +2839,54 @@ test "server rejects channel data above packet and receive window limits" {
     try std.testing.expectEqual(@as(u32, 3), window_chan.local_window);
 }
 
+test "handlePacket: channel data is accepted while a rekey is in flight" {
+    // Regression: RFC 4253 s9 allows connection-protocol packets that the peer
+    // sent before it saw our KEXINIT to arrive during a rekey. Gating on
+    // sessionState would drop them; the authentication latch must not.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(42, 32768, Protocol.MaxChannelDataLen).?;
+    chan.state = .DataRx;
+    m.session.user_authenticated = true;
+
+    // Mid-rekey: we sent our KEXINIT and are parked waiting for the peer's,
+    // so sessionState has legitimately left the connection-protocol set.
+    m.session.session_id_established = true;
+    m.session.rekey_resume_state = .ChannelActive;
+    m.session.is_rekeying = true;
+    m.session.setSessionState(.KexInitRead);
+
+    var payload_backing: [64]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(chan.local_id);
+    try payload.writeU32LenString("hello");
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .RxData => |data| try std.testing.expectEqualSlices(u8, "hello", data.data),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    // The in-flight packet must not clobber the parked key-exchange state,
+    // or the peer's KEXINIT would later be misread as peer-initiated.
+    try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
+    try std.testing.expectEqual(SessionState.ChannelActive, m.session.rekey_resume_state.?);
+}
+
 test "handlePacket: direct-tcpip open emits request and accept confirms" {
     const privkey = @import("privkey.zig");
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
     defer m.deinit();
+    m.session.user_authenticated = true;
     m.session.setSessionState(.Authenticated);
 
     var payload_backing: [160]u8 = undefined;
@@ -2836,6 +2942,7 @@ test "rejectChannelOpen writes caller-provided failure" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
     defer m.deinit();
+    m.session.user_authenticated = true;
     m.session.setSessionState(.Authenticated);
 
     var payload_backing: [160]u8 = undefined;
@@ -2879,6 +2986,7 @@ test "handlePacket: unknown channel type writes open failure" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
     defer m.deinit();
+    m.session.user_authenticated = true;
     m.session.setSessionState(.Authenticated);
 
     var payload_backing: [64]u8 = undefined;
@@ -2901,6 +3009,61 @@ test "handlePacket: unknown channel type writes open failure" {
     try std.testing.expectEqualStrings("unknown channel type", try rdr.readU32LenString());
 }
 
+test "handlePacket: global requests are rejected before authentication" {
+    // Regression: an unauthenticated peer must not reach global-request
+    // handling, which would otherwise ask the application to bind a
+    // listening socket on its behalf.
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    var payload_backing: [96]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU32LenString("tcpip-forward");
+    try pw.writeBoolean(true);
+    try pw.writeU32LenString("127.0.0.1");
+    try pw.writeU32(0);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+
+    // sessionState is still .Init: no kex and no userauth.
+    try std.testing.expectError(
+        error.UnexpectedResponse,
+        m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m),
+    );
+    try std.testing.expect(m.session.pending_global_request == null);
+}
+
+test "handlePacket: server rejects a KEXINIT that arrives mid initial handshake" {
+    // Regression: a second KEXINIT before the first exchange completes must not
+    // be classified as a peer-initiated rekey, which would leave session_id
+    // all-zero while it still binds publickey userauth signatures.
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+    try m.session.setPeerProtocolVersion("SSH-2.0-test_client");
+
+    var payload_buf: [512]u8 = undefined;
+    var payload = BufferWriter.init(&payload_buf, 0);
+    try writeKexInitPayloadForTest(&payload);
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+
+    // Server is awaiting KEX_ECDH_INIT, i.e. the first exchange is incomplete.
+    m.session.setSessionState(.EcdhInitRead);
+    m.session.setIoSessionState(.ReadPktHdr);
+
+    try std.testing.expectError(
+        error.UnexpectedResponse,
+        m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m),
+    );
+    try std.testing.expect(!m.session.is_rekeying);
+    try std.testing.expect(!m.session.session_id_established);
+}
+
 test "handlePacket: tcpip-forward emits event and accept writes allocated port" {
     const privkey = @import("privkey.zig");
     var prng = std.Random.DefaultPrng.init(42);
@@ -2917,6 +3080,7 @@ test "handlePacket: tcpip-forward emits event and accept writes allocated port" 
 
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
     m.session.encrypted = false;
+    m.session.user_authenticated = true;
     try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
     @memset(&m.iobuf_rd, 0xaa);
 
@@ -2955,6 +3119,7 @@ test "handlePacket: cancel-tcpip-forward emits event and reject writes failure" 
 
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
     m.session.encrypted = false;
+    m.session.user_authenticated = true;
     try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
 
     const evt = try m.getNextEvent();
@@ -2989,6 +3154,7 @@ test "handlePacket: unknown global request with reply writes failure" {
 
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
     m.session.encrypted = false;
+    m.session.user_authenticated = true;
     try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
 
     const data = try m.peek(Protocol.MaxSSHPacket);
@@ -3003,6 +3169,7 @@ test "openForwardedTcpipChannel writes forwarded-tcpip open payload" {
     defer m.deinit();
 
     m.session.encrypted = false;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.Authenticated);
 
     const channel_id = try m.openForwardedTcpipChannel("127.0.0.1", 2200, "203.0.113.10", 44444);
@@ -3029,6 +3196,7 @@ test "unconfirmed server channel defers close until remote id is known" {
 
     const existing = m.session.channel_table.allocChannel(0, 1000, 1000).?;
     existing.state = .DataRx;
+    m.session.user_authenticated = true;
     m.session.setSessionState(.ChannelActive);
     const channel_id = try m.openForwardedTcpipChannel("127.0.0.1", 2200, "203.0.113.10", 44444);
     const pending = m.session.channel_table.findByLocalId(channel_id).?;
@@ -3090,6 +3258,7 @@ test "handlePacket: auth-agent request surfaces channel request event" {
 
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
     m.session.encrypted = false;
+    m.session.user_authenticated = true;
 
     try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
 
@@ -3131,6 +3300,7 @@ test "handlePacket: agent channel open confirmation activates server channel" {
     const channel_id = try m.session.openAgentChannel();
     const chan = m.session.channel_table.findByLocalId(channel_id).?;
     chan.state = .OpenSent;
+    m.session.user_authenticated = true;
 
     var payload_backing: [64]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
@@ -3167,6 +3337,7 @@ test "handlePacket: agent channel open failure emits close event" {
     const channel_id = try m.session.openAgentChannel();
     const chan = m.session.channel_table.findByLocalId(channel_id).?;
     chan.state = .OpenSent;
+    m.session.user_authenticated = true;
 
     var payload_backing: [128]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
