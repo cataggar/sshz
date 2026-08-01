@@ -19,8 +19,6 @@ implementations:
   authentication by default and can load a bounded `authorized_keys` file, but
   it also offers an explicitly unsafe demo mode that accepts every
   cryptographically valid public key and uses `password == username`.
-- `tiny` is a proof of concept with fixed credentials, a deterministic
-  non-cryptographic PRNG, and automatic host-key acceptance.
 - `testserver/` and `interop/` are test infrastructure, not deployment
   templates.
 
@@ -158,8 +156,7 @@ identity.
 unsafe behavior requires an explicit demo flag. The core API requires an
 explicit accept or reject decision and exposes typed rejection. It still
 delegates hostname, port, alias, trust-store, and replacement policy to the
-application. `tiny` remains an excluded proof of concept and auto-accepts the
-event. Rekey does not prompt again: after signature verification, the client
+application. Rekey does not prompt again: after signature verification, the client
 compares the complete host-key blob with the initially application-approved
 identity and fails with `HostKeyChanged` on any change. Remaining
 production-safe host-trust and integration work is tracked by

@@ -25,7 +25,9 @@ pub const MinRsaBytes = MinRsaBits / 8;
 pub const MaxRsaBits = 4096;
 pub const MaxRsaBytes = MaxRsaBits / 8;
 pub const MaxPublicKeyBlobLen = 4 + ecdsa_p256_name.len + 4 + ecdsa_p256_curve_name.len + 4 + EcdsaP256.PublicKey.uncompressed_sec1_encoded_length;
-pub const MaxRsaPublicKeyBlobLen = 4 + rsa_key_name.len + 4 + 8 + 4 + MaxRsaBytes + 1;
+// Both mpints (e and n) may need their own leading zero pad byte when the
+// high bit of the first octet is set, so budget one pad for each.
+pub const MaxRsaPublicKeyBlobLen = 4 + rsa_key_name.len + 4 + 8 + 1 + 4 + MaxRsaBytes + 1;
 pub const MaxKeyBlobLen = @max(MaxPublicKeyBlobLen, MaxRsaPublicKeyBlobLen);
 pub const MaxSignatureBlobLen = 4 + rsa_sha2_512_name.len + 4 + MaxRsaBytes;
 

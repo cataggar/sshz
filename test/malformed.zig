@@ -389,30 +389,43 @@ fn runClientCase(case: CorpusCase, case_index: usize) !void {
                 client.session.setSessionState(.KexInitRead);
             },
             31 => if (case.input.len > 1) client.session.setSessionState(.EcdhReply),
+            // Userauth replies are gated on the authentication phase, so park the
+            // session there to exercise the parser rather than the phase gate.
+            51, 52, 60 => client.session.setSessionState(.AuthMethodQueued),
+            // Connection-protocol messages are gated on authentication, so put the
+            // session past userauth to exercise the parser rather than the gate.
+            80...127 => {
+                client.session.user_authenticated = true;
+            },
             else => {},
         },
         .client_channel_data_wrong_state => {
+            client.session.user_authenticated = true;
             _ = client.session.channel_table.allocChannel(1, 16, 16) orelse
                 return error.UnexpectedResponse;
         },
         .client_channel_packet_too_large => {
+            client.session.user_authenticated = true;
             const channel = client.session.channel_table.allocChannel(1, 16, 16) orelse
                 return error.UnexpectedResponse;
             channel.state = .DataRx;
             channel.local_max_packet_size = 4;
         },
         .client_channel_receive_window => {
+            client.session.user_authenticated = true;
             const channel = client.session.channel_table.allocChannel(1, 16, 16) orelse
                 return error.UnexpectedResponse;
             channel.state = .DataRx;
             channel.local_window = 3;
         },
         .client_channel_extended_truncated => {
+            client.session.user_authenticated = true;
             const channel = client.session.channel_table.allocChannel(1, 16, 16) orelse
                 return error.UnexpectedResponse;
             channel.state = .DataRx;
         },
         .client_channel_window_overflow => {
+            client.session.user_authenticated = true;
             const channel = client.session.channel_table.allocChannel(
                 1,
                 std.math.maxInt(u32) - 1,
@@ -421,6 +434,7 @@ fn runClientCase(case: CorpusCase, case_index: usize) !void {
             channel.state = .DataRx;
         },
         .client_channel_close_disconnect => {
+            client.session.user_authenticated = true;
             const channel = client.session.channel_table.allocChannel(1, 16, 16) orelse
                 return error.UnexpectedResponse;
             channel.close_sent = true;

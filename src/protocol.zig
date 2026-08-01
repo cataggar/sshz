@@ -53,6 +53,11 @@ pub const MsgId = enum(u8) {
     SSH_MSG_CHANNEL_SUCCESS = 99,
 };
 
+// RFC 4250 §4.1.2 reserves message numbers 80-127 for the connection protocol,
+// which is only reachable after `ssh-userauth` succeeds.
+pub const connection_protocol_msgid_min: u8 = 80;
+pub const connection_protocol_msgid_max: u8 = 127;
+
 // SSH packet header, appears before payload
 // https://datatracker.ietf.org/doc/html/rfc4253#section-6
 pub const PktHdr = packed struct {
