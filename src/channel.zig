@@ -261,6 +261,20 @@ pub const ChannelTable = struct {
         return null;
     }
 
+    /// Finds a channel of `kind` regardless of whether it has work pending.
+    ///
+    /// `findNextRunnable` deliberately skips an idle channel, so it cannot be
+    /// used to deliver something *to* one — a session waiting in `.DataRx` is
+    /// exactly the case that needs to be woken for an out-of-band request.
+    pub fn findByKind(self: *Self, kind: ChannelKind) ?*Channel {
+        for (&self.channels) |*slot| {
+            if (slot.*) |*ch| {
+                if (ch.kind == kind) return ch;
+            }
+        }
+        return null;
+    }
+
     pub fn findByRemoteId(self: *Self, remote_id: u32) ?*Channel {
         for (&self.channels) |*slot| {
             if (slot.*) |*ch| {

@@ -1640,6 +1640,7 @@ pub fn MisshodImpl(role: Role) type {
         pub fn advance(self: *Self) MisshodError!void {
             if (self.terminated) return IoError.SessionTerminated;
             errdefer self.failClosed();
+            if (role == .Client) _ = try self.session.flushPendingWindowChange(self);
             const inkeys = switch (role) {
                 .Client => &self.session.keydata.s2c,
                 .Server => &self.session.keydata.c2s,
