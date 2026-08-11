@@ -1037,21 +1037,7 @@ pub const Session = struct {
                 chan.state = .Data;
             },
             .Data => {
-                if (chan.kind == .Session and self.pending_window_change != null) {
-                    // Send window-change directly
-                    const wc = self.pending_window_change.?;
-                    self.pending_window_change = null;
-                    var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
-                    try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
-                    try pkt.writeU32(chan.remote_id);
-                    try pkt.writeU32LenString("window-change");
-                    try pkt.writeBoolean(false); // want reply
-                    try pkt.writeU32(wc[0]); // cols
-                    try pkt.writeU32(wc[1]); // rows
-                    try pkt.writeU32(wc[2]); // width_px
-                    try pkt.writeU32(wc[3]); // height_px
-                    try misshod.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr), .Idle);
-                } else if (chan.needsWindowAdjust()) {
+                if (chan.needsWindowAdjust()) {
                     // RFC 4254 §5.2 — replenish receive window
                     var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
                     try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
@@ -1375,6 +1361,69 @@ pub const Session = struct {
         if (!queued) _ = try self.dispatchDeferredChannelWrite(misshod);
     }
 
+    /// Sends a queued `window-change` for the session channel, if one is due.
+    ///
+    /// The write completes back into whatever `ioSessionState` was current
+    /// rather than into `.Idle`. A resize arrives on its own schedule, almost
+    /// always while a read is in flight, and that read's completion state is
+    /// still the one the session must return to; restoring it makes this a
+    /// packet interjected into the stream rather than a step in the sequence.
+    ///
+    /// The request is cleared before the write so a failure cannot leave it
+    /// retrying against a channel that is going away, and a resize that lands
+    /// while one is in flight simply replaces it — only the latest size matters.
+    fn startPendingWindowChange(
+        self: *Self,
+        misshod: *MisshodClient,
+        outkeys: *Protocol.KeyDataUni,
+    ) MisshodError!bool {
+        if (self.pending_window_change == null) return false;
+
+        const chan = self.channel_table.findByKind(.Session) orelse return false;
+        if (!chan.remote_id_known or chan.tx_in_flight_len != 0 or
+            chan.close_pending or chan.close_sent or chan.close_received)
+        {
+            return false;
+        }
+
+        const wc = self.pending_window_change.?;
+        self.pending_window_change = null;
+
+        var pkt = BufferWriter.init(&misshod.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+        try pkt.writeU32(chan.remote_id);
+        try pkt.writeU32LenString("window-change");
+        try pkt.writeBoolean(false); // want reply
+        try pkt.writeU32(wc[0]); // cols
+        try pkt.writeU32(wc[1]); // rows
+        try pkt.writeU32(wc[2]); // width_px
+        try pkt.writeU32(wc[3]); // height_px
+        try misshod.requestWrite(
+            try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &misshod.iobuf_wr),
+            self.ioSessionState,
+        );
+        return true;
+    }
+
+    /// Flushes a queued `window-change` as soon as the write side is free.
+    ///
+    /// `advance` calls this ahead of the io state machine because the state
+    /// machine cannot reach it: waiting for a packet parks the session in
+    /// `.ReadPktHdr` with a read outstanding, which `canProcessIoSessionState`
+    /// refuses to advance, so a resize on an otherwise quiet connection would
+    /// sit queued until the server happened to send something. The write side
+    /// is tracked separately from the read side and is free in that state, so
+    /// there is nothing to wait for.
+    pub fn flushPendingWindowChange(self: *Self, misshod: *MisshodClient) MisshodError!bool {
+        if (self.pending_window_change == null) return false;
+        if (self.sessionState != .ChannelActive or self.is_rekeying or
+            misshod.local_rekey_pending or misshod.iostate_wr != .Idle)
+        {
+            return false;
+        }
+        return try self.startPendingWindowChange(misshod, &self.keydata.c2s);
+    }
+
     fn startPendingChannelControl(
         self: *Self,
         chan: *Channel,
@@ -1487,19 +1536,15 @@ pub const Session = struct {
         _ = try self.startPendingChannelControl(chan, misshod, &self.keydata.c2s);
     }
 
+    /// Queues a `window-change` request for the session channel.
+    ///
+    /// Only queues: the request goes out from `dispatchDeferredChannelWrite`,
+    /// which is the point in `advance` where interjecting a packet is safe. A
+    /// terminal is normally resized while nothing is being transmitted, so the
+    /// caller is almost always arriving mid-read, and stealing the state
+    /// machine then would abandon a read the transport is still expecting.
     pub fn sendWindowChange(self: *Self, cols: u32, rows: u32, width_px: u32, height_px: u32) void {
         self.pending_window_change = .{ cols, rows, width_px, height_px };
-        if (self.sessionState == .ChannelActive) {
-            if (self.channel_table.findNextRunnable()) |chan| {
-                if (chan.state == .DataRx) {
-                    if (self.ioSessionState == .ReadPktHdr) {
-                        chan.state = .Data;
-                        self.active_channel_id = chan.local_id;
-                        self.setIoSessionState(.Idle);
-                    }
-                }
-            }
-        }
     }
 
     pub fn enableAgentForwarding(self: *Self) MisshodError!void {
@@ -4486,6 +4531,108 @@ test "sendWindowChange queues pending change" {
     try std.testing.expectEqual(@as(u32, 40), wc[1]);
     try std.testing.expectEqual(@as(u32, 960), wc[2]);
     try std.testing.expectEqual(@as(u32, 640), wc[3]);
+}
+
+test "a queued window-change is flushed while the channel sits idle" {
+    // Regression: the request used to be sent only from the channel's `.Data`
+    // pass, which nothing re-enters once a session is established, and the
+    // wake-up in sendWindowChange asked findNextRunnable for a channel it
+    // reports as not runnable. A terminal resized while nothing was being
+    // typed kept its original size for the life of the connection.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
+    chan.state = .DataRx;
+    m.session.sessionState = .ChannelActive;
+    m.iostate_wr = .Idle;
+
+    m.session.sendWindowChange(120, 40, 960, 640);
+    // Queued only: sending is the transport's job, at a point where it is safe.
+    try std.testing.expect(m.session.pending_window_change != null);
+
+    try std.testing.expect(try m.session.flushPendingWindowChange(&m));
+    try std.testing.expect(m.session.pending_window_change == null);
+    try std.testing.expectEqual(ChannelState.DataRx, chan.state);
+}
+
+test "a flushed window-change returns the session to the state it interrupted" {
+    // A resize almost always lands while a read is outstanding. Completing the
+    // write into `.Idle` would drop the read's completion state on the floor;
+    // the packet has to be interjected without disturbing the sequence.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
+    chan.state = .DataRx;
+    m.session.sessionState = .ChannelActive;
+    m.iostate_wr = .Idle;
+    m.session.setIoSessionState(.ReadPktHdr);
+
+    m.session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expect(try m.session.flushPendingWindowChange(&m));
+
+    switch (m.iostate_wr) {
+        .Active => |iotype| try std.testing.expectEqual(
+            Protocol.IoSessionState.ReadPktHdr,
+            std.meta.activeTag(iotype.next_state),
+        ),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "a window-change waits for the write side to be free" {
+    // `iobuf_wr` holds exactly one packet, so interjecting a resize into a
+    // write already in flight would corrupt it.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
+    chan.state = .DataRx;
+    m.session.sessionState = .ChannelActive;
+    m.iostate_wr = .{ .Active = .{ .action = .{ .Producing = 16 }, .next_state = .Idle } };
+
+    m.session.sendWindowChange(120, 40, 960, 640);
+    try std.testing.expect(!try m.session.flushPendingWindowChange(&m));
+    try std.testing.expect(m.session.pending_window_change != null);
+}
+
+test "a window-change is not dispatched onto a closing channel" {
+    // The remote end has gone; a request naming its channel would be answered
+    // with a failure at best, and the resize is meaningless either way.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannelKind(.Session, 7, 32768, 32768).?;
+    chan.state = .DataRx;
+    chan.close_received = true;
+    m.session.sessionState = .ChannelActive;
+    m.iostate_wr = .Idle;
+
+    m.session.sendWindowChange(120, 40, 960, 640);
+    _ = try m.session.flushPendingWindowChange(&m);
+    try std.testing.expect(m.session.pending_window_change != null);
+}
+
+test "a window-change waits for a session channel to exist" {
+    // A resize can arrive before the channel is open, and an agent-forward
+    // channel is not the one carrying the terminal.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannelKind(.AgentForward, 7, 32768, 32768).?;
+    chan.state = .DataRx;
+    m.session.sessionState = .ChannelActive;
+    m.iostate_wr = .Idle;
+
+    m.session.sendWindowChange(120, 40, 960, 640);
+    _ = try m.session.flushPendingWindowChange(&m);
+    try std.testing.expect(m.session.pending_window_change != null);
 }
 
 test "handlePacket: SSH_MSG_USERAUTH_INFO_REQUEST surfaces keyboard-interactive prompt" {
