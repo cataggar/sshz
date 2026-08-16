@@ -7,3 +7,5 @@ zig-out/
 *.dll
 *.lib
 *.pdb
+zig-pkg/
+.zig-pkg/

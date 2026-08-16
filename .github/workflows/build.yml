@@ -66,7 +66,7 @@ jobs:
   test:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{matrix.os}}
     steps:
       - name: Checkout misshod
@@ -83,16 +83,27 @@ jobs:
             Linux-X64) zig_target="x86_64-linux" ;;
             macOS-ARM64) zig_target="aarch64-macos" ;;
             macOS-X64) zig_target="x86_64-macos" ;;
+            Windows-X64) zig_target="x86_64-windows" ;;
             *)
               echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2
               exit 1
               ;;
           esac
 
-          archive="zig-${zig_target}-${version}.tar.xz"
+          # Windows releases ship as .zip, every other target as .tar.xz.
+          case "${{ runner.os }}" in
+            Windows) archive_ext="zip" ;;
+            *) archive_ext="tar.xz" ;;
+          esac
+
+          archive="zig-${zig_target}-${version}.${archive_ext}"
           zig_dir="${RUNNER_TEMP}/zig-${zig_target}-${version}"
           curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
-          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          if [ "${archive_ext}" = "zip" ]; then
+            unzip -q "${RUNNER_TEMP}/${archive}" -d "${RUNNER_TEMP}"
+          else
+            tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          fi
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           "${zig_dir}/zig" version
       - name: Build test
@@ -109,9 +120,11 @@ jobs:
         run: zig build
         working-directory: misshod
       - name: Build mssh
+        if: runner.os != 'Windows'
         run: zig build
         working-directory: misshod/mssh
       - name: Build msshd
+        if: runner.os != 'Windows'
         run: zig build
         working-directory: misshod/msshd
       - name: Install interop dependencies
