@@ -10,4 +10,5 @@ comptime {
     _ = @import("misshod.zig");
     _ = @import("channel.zig");
     _ = @import("key.zig");
+    _ = @import("known_hosts.zig");
 }
