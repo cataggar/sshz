@@ -11,6 +11,22 @@ comptime {
     }
 }
 
+/// zlib is built from source rather than taken from the system.
+///
+/// `zlib@openssh.com` compression is not optional -- `protocol.zig` reaches
+/// `zlib.h` unconditionally -- so a system library made the whole package
+/// unbuildable anywhere one is not installed and discoverable, Windows
+/// included. The dependency carries zlib's own sources and compiles them for
+/// whatever target is being built, so the same `zig build` works on every
+/// host, and every module here links the one static artifact.
+fn linkZlib(b: *std.Build, mod: *std.Build.Module) void {
+    const dep = b.dependency("zlib", .{
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize.?,
+    });
+    mod.linkLibrary(dep.artifact("z"));
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -32,7 +48,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addOptions("misshod_build_options", options);
-    mod.linkSystemLibrary("z", .{});
+    linkZlib(b, mod);
 
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test.zig"),
@@ -41,7 +57,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.addOptions("misshod_build_options", options);
-    test_mod.linkSystemLibrary("z", .{});
+    linkZlib(b, test_mod);
 
     const lib_tests = b.addTest(.{
         .root_module = test_mod,
@@ -74,7 +90,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     production_client_mod.addImport("misshod", mod);
-    production_client_mod.linkSystemLibrary("z", .{});
+    linkZlib(b, production_client_mod);
     const production_client = b.addExecutable(.{
         .name = "misshod-production-client-example",
         .root_module = production_client_mod,
@@ -94,7 +110,7 @@ pub fn build(b: *std.Build) void {
     production_server_mod.addAnonymousImport("production_test_host_key", .{
         .root_source_file = b.path("testserver/id_ed25519_passwordless"),
     });
-    production_server_mod.linkSystemLibrary("z", .{});
+    linkZlib(b, production_server_mod);
     const production_server = b.addExecutable(.{
         .name = "misshod-production-server-example",
         .root_module = production_server_mod,
@@ -120,7 +136,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     malformed_mod.addImport("misshod", mod);
-    malformed_mod.linkSystemLibrary("z", .{});
+    linkZlib(b, malformed_mod);
     const malformed_tests = b.addTest(.{
         .root_module = malformed_mod,
     });
@@ -138,7 +154,7 @@ pub fn build(b: *std.Build) void {
     stress_mod.addAnonymousImport("stress_host_key", .{
         .root_source_file = b.path("testserver/id_ed25519_passwordless"),
     });
-    stress_mod.linkSystemLibrary("z", .{});
+    linkZlib(b, stress_mod);
     const stress_exe = b.addExecutable(.{
         .name = "misshod-stress",
         .root_module = stress_mod,

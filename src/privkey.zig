@@ -35,7 +35,12 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
     }
     if (b64_slice_opt) |b64_slice| {
         UNSAFE_TRACEDUMP(.Debug, "b64", .{}, b64_slice);
-        var decoder = std.base64.Base64DecoderWithIgnore.init(std.base64.standard_alphabet_chars, '=', "\n");
+        // CRLF as well as LF: an OpenSSH private key is text, and text that
+        // has been through a Windows checkout, an editor, or a copy-paste
+        // arrives with carriage returns. A `\r` reaching the decoder is an
+        // `InvalidCharacter`, which surfaced here as an unreadable key rather
+        // than as anything pointing at line endings.
+        var decoder = std.base64.Base64DecoderWithIgnore.init(std.base64.standard_alphabet_chars, '=', "\r\n");
         const decoded_size = decoder.calcSizeUpperBound(b64_slice.len);
         if (decoded_size > keydata_bin_buf.len) {
             return PrivKeyError.PrivKeyOutofSpace;
@@ -332,6 +337,30 @@ test "decodepriv" {
     try std.testing.expectEqualSlices(u8, &(.{0} ** pubblob.len), &pubblob);
     try decodePrivKey(testkey_valid, null, &blob, &pubblob);
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 166, 119, 186, 89, 114, 101, 152, 133, 196, 14, 211, 238, 206, 143, 73, 223, 41, 101, 45, 196, 132, 150, 240, 240, 41, 82, 229, 54, 152, 193, 40, 220, 232, 131, 168, 235, 233, 3, 218, 50, 159, 159, 165, 94, 166, 155, 49, 203, 223, 47, 9, 101, 69, 137, 215, 186, 3, 175, 96, 21, 112, 247, 116, 245 }));
+}
+
+test "a private key with CRLF line endings decodes the same as one with LF" {
+    // A Windows checkout, a text-mode transfer, or a copy-paste turns every
+    // `\n` in a PEM body into `\r\n`. The key is the same key, so it has to
+    // decode to the same bytes rather than to `BadPrivKey`.
+    const gpa = std.testing.allocator;
+    const crlf = try std.mem.replaceOwned(u8, gpa, testkey_valid, "\n", "\r\n");
+    defer gpa.free(crlf);
+
+    var lf_blob: [std.crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
+    defer crypto.secureZero(u8, &lf_blob);
+    var lf_pub: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
+    defer crypto.secureZero(u8, &lf_pub);
+    try decodePrivKey(testkey_valid, null, &lf_blob, &lf_pub);
+
+    var crlf_blob: [std.crypto.sign.Ed25519.SecretKey.encoded_length]u8 = undefined;
+    defer crypto.secureZero(u8, &crlf_blob);
+    var crlf_pub: [std.crypto.sign.Ed25519.PublicKey.encoded_length]u8 = undefined;
+    defer crypto.secureZero(u8, &crlf_pub);
+    try decodePrivKey(crlf, null, &crlf_blob, &crlf_pub);
+
+    try std.testing.expectEqualSlices(u8, &lf_blob, &crlf_blob);
+    try std.testing.expectEqualSlices(u8, &lf_pub, &crlf_pub);
 }
 
 test "decode OpenSSH private key algorithms and sign/verify" {

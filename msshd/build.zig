@@ -22,7 +22,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    exe_mod.linkSystemLibrary("z", .{});
 
     const misshod_dep = b.dependency("misshod", .{
         .target = target,
@@ -43,7 +42,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     auth_test_mod.addImport("misshod", misshod_dep.module("misshod"));
-    auth_test_mod.linkSystemLibrary("z", .{});
     const auth_tests = b.addTest(.{
         .root_module = auth_test_mod,
     });

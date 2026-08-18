@@ -43,7 +43,9 @@ description of what is negotiated and enforced.
 
 # Building
 
-MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/) and system zlib.
+MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/). zlib is built
+from source as a package dependency, so no system library is needed and the
+same `zig build` works on Linux, macOS, and Windows.
 
 To run the library test suites from the repository root:
 
