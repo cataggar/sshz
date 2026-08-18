@@ -51,6 +51,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/known_hosts.zig"),
             .target = target,
             .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "misshod", .module = misshod_dep.module("misshod") },
+            },
         }),
     });
     const run_known_hosts_tests = b.addRunArtifact(known_hosts_tests);

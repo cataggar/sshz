@@ -9,6 +9,10 @@ const ServerSessionState = @import("server_session.zig").SessionState;
 pub const BufferError = @import("buffer.zig").BufferError;
 pub const BufferReader = @import("buffer.zig").BufferReader;
 pub const BufferWriter = @import("buffer.zig").BufferWriter;
+
+/// Reading and matching OpenSSH's `known_hosts`, so that an embedder deciding
+/// `CheckHostKey` does not have to reimplement the format. Does no I/O.
+pub const known_hosts = @import("known_hosts.zig");
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
 const Key = @import("key.zig");
 const Protocol = @import("protocol.zig");
