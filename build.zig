@@ -27,9 +27,32 @@ fn linkZlib(b: *std.Build, mod: *std.Build.Module) void {
     mod.linkLibrary(dep.artifact("z"));
 }
 
+/// How much the library is allowed to print.
+///
+/// `off` by default because an application that links misshod owns its own
+/// stderr -- and, if it draws a terminal UI, its own screen. `mssh` and
+/// `msshd` ask for `info`.
+pub const TraceLevel = enum { off, info, debug };
+
+/// What a build gets when it does not ask. Named so `trace_off_test` can
+/// assert on it: changing this to anything but `off` fails the suite.
+const default_trace_level: TraceLevel = .off;
+
+/// Emitted as a name rather than the enum itself so `util.zig` keeps one
+/// definition of the level and maps onto it explicitly.
+fn addTraceLevel(options: *std.Build.Step.Options, level: TraceLevel) void {
+    options.addOption([]const u8, "trace_level", @tagName(level));
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    const trace_level = b.option(
+        TraceLevel,
+        "trace",
+        "How much misshod prints to stderr (default: off)",
+    ) orelse default_trace_level;
 
     // UNSAFE: This may print plaintext packets, private keys, shared secrets,
     // and derived encryption/MAC keys. Never enable it in production or CI.
@@ -40,6 +63,7 @@ pub fn build(b: *std.Build) void {
     ) orelse false;
     const options = b.addOptions();
     options.addOption(bool, "unsafe_secret_tracing", unsafe_secret_tracing);
+    addTraceLevel(options, trace_level);
 
     const mod = b.addModule("misshod", .{
         .root_source_file = b.path("src/misshod.zig"),
@@ -67,6 +91,7 @@ pub fn build(b: *std.Build) void {
 
     const safe_trace_options = b.addOptions();
     safe_trace_options.addOption(bool, "unsafe_secret_tracing", false);
+    addTraceLevel(safe_trace_options, trace_level);
     const safe_trace_test_mod = b.createModule(.{
         .root_source_file = b.path("src/trace_gate_test.zig"),
         .target = target,
@@ -79,9 +104,28 @@ pub fn build(b: *std.Build) void {
     });
     const run_safe_trace_tests = b.addRunArtifact(safe_trace_tests);
 
+    // Built with the options a dependent gets, not the ones this invocation
+    // was given, so `zig build test -Dtrace=info` does not silently excuse
+    // the default from staying quiet.
+    const default_trace_options = b.addOptions();
+    default_trace_options.addOption(bool, "unsafe_secret_tracing", false);
+    addTraceLevel(default_trace_options, default_trace_level);
+    const trace_off_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/trace_off_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    trace_off_test_mod.addOptions("misshod_build_options", default_trace_options);
+    const trace_off_tests = b.addTest(.{
+        .root_module = trace_off_test_mod,
+    });
+    const run_trace_off_tests = b.addRunArtifact(trace_off_tests);
+
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_safe_trace_tests.step);
+    test_step.dependOn(&run_trace_off_tests.step);
 
     const production_client_mod = b.createModule(.{
         .root_source_file = b.path("examples/production/client.zig"),
@@ -177,3 +221,5 @@ pub fn build(b: *std.Build) void {
     const interop_step = b.step("interop", "Run OpenSSH/libssh interoperability tests");
     interop_step.dependOn(&interop_cmd.step);
 }
+
+

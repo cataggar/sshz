@@ -4,14 +4,37 @@ const build_options = @import("misshod_build_options");
 const BufferReader = @import("buffer.zig").BufferReader;
 const BufferWriter = @import("buffer.zig").BufferWriter;
 
+/// What a call site asks for, and -- with `Off` -- what the build can allow.
+///
+/// `Off` sorts below `Info` so the existing `trace_level >= level` test
+/// suppresses everything: no call site passes `Off`, so nothing can clear it.
 const TraceLevel = enum {
+    Off,
     Info,
     Debug,
 };
 
-const trace_level: TraceLevel = .Info;
+/// Set by `-Dtrace`, and `Off` unless asked for.
+///
+/// A library does not get to decide that its host writes to stderr. `.Info`
+/// fires during entirely successful sessions -- stock OpenSSH sends a global
+/// request misshod does not handle, every time -- and an application that
+/// owns the terminal has its screen corrupted by it. `mssh` and `msshd` ask
+/// for `info` in their own `build.zig`, so their output is unchanged.
+const trace_level: TraceLevel = blk: {
+    const name = build_options.trace_level;
+    if (std.mem.eql(u8, name, "off")) break :blk .Off;
+    if (std.mem.eql(u8, name, "info")) break :blk .Info;
+    if (std.mem.eql(u8, name, "debug")) break :blk .Debug;
+    @compileError("unknown trace level: " ++ name);
+};
 
 pub const unsafe_secret_tracing = build_options.unsafe_secret_tracing;
+
+/// Whether any call site can reach `std.debug.print`.
+///
+/// Exposed so a build can assert that the default one stays silent.
+pub const traces_are_printed = trace_level != .Off;
 
 pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
     if (builtin.os.tag != .freestanding) {

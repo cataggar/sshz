@@ -23,9 +23,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // These are diagnostic tools: their traces are the point, so they ask
+    // for what the library no longer prints by default.
     const misshod_dep = b.dependency("misshod", .{
         .target = target,
         .optimize = optimize,
+        .trace = .info,
     });
     exe_mod.addImport("misshod", misshod_dep.module("misshod"));
 
@@ -60,3 +63,4 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run");
     run_step.dependOn(&run_cmd.step);
 }
+
