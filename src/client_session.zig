@@ -2102,7 +2102,7 @@ pub const Session = struct {
                 const s = try rdr.readU32LenString();
                 try chan.consumeLocalWindow(s.len);
                 switch (chan.kind) {
-                    .Session => misshod.requestEvent(.{ .RxData = s }, .Idle),
+                    .Session => misshod.requestEvent(.{ .RxData = .{ .channel = chan.local_id, .data = s } }, .Idle),
                     .AgentForward => misshod.requestEvent(.{ .AgentData = .{ .channel = chan.local_id, .data = s } }, .Idle),
                 }
                 chan.state = .Data;
@@ -2126,7 +2126,11 @@ pub const Session = struct {
                 const data_type = try rdr.readU32();
                 const s = try rdr.readU32LenString();
                 try chan.consumeLocalWindow(s.len);
-                misshod.requestEvent(.{ .RxExtendedData = .{ .data_type = data_type, .data = s } }, .Idle);
+                misshod.requestEvent(.{ .RxExtendedData = .{
+                    .channel = chan.local_id,
+                    .data_type = data_type,
+                    .data = s,
+                } }, .Idle);
                 chan.state = .Data;
                 self.active_channel_id = chan.local_id;
                 self.resumeChannelActive();
@@ -3573,7 +3577,10 @@ test "handlePacket: channel data is accepted while a rekey is in flight" {
     const evt = try m.getNextEvent();
     switch (evt) {
         .Event => |code| switch (code) {
-            .RxData => |data| try std.testing.expectEqualSlices(u8, "hello", data),
+            .RxData => |channel_data| {
+                try std.testing.expectEqual(chan.local_id, channel_data.channel);
+                try std.testing.expectEqualSlices(u8, "hello", channel_data.data);
+            },
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
@@ -3582,6 +3589,55 @@ test "handlePacket: channel data is accepted while a rekey is in flight" {
     // or the peer's KEXINIT would later be misread as peer-initiated.
     try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
     try std.testing.expectEqual(SessionState.ChannelActive, m.session.rekey_resume_state.?);
+}
+
+test "a client with two channels can tell their data apart" {
+    // Reaching Connected opens a session channel and asks for a pty and a
+    // shell, so any client that then opens a `direct-tcpip` tunnel has two
+    // channels delivering data. Without the channel on the event the two
+    // byte streams are indistinguishable, and splicing shell output into a
+    // tunnel corrupts whatever protocol is running over it -- silently, and
+    // far from here.
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    m.session.user_authenticated = true;
+    const shell = m.session.channel_table.allocChannel(1, 32768, Protocol.MaxChannelDataLen).?;
+    shell.state = .DataRx;
+    const tunnel = m.session.channel_table.allocChannel(2, 32768, Protocol.MaxChannelDataLen).?;
+    tunnel.state = .DataRx;
+    try std.testing.expect(shell.local_id != tunnel.local_id);
+
+    // What bash actually sends first: ESC [ ? 2 0 0 4 h, bracketed paste on.
+    // Read as TLS it is a record header claiming 0x3f32 bytes that will
+    // never arrive.
+    try expectChannelData(&m, shell.local_id, "\x1b[?2004h");
+    try expectChannelData(&m, tunnel.local_id, "\x17\x03\x03\x00\xa2");
+}
+
+/// Feeds one `SSH_MSG_CHANNEL_DATA` and asserts the event names its channel.
+fn expectChannelData(m: *MisshodClient, channel: u32, data: []const u8) !void {
+    var payload_backing: [64]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(channel);
+    try payload.writeU32LenString(data);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], m);
+
+    switch (try m.getNextEvent()) {
+        .Event => |code| switch (code) {
+            .RxData => |received| {
+                try std.testing.expectEqual(channel, received.channel);
+                try std.testing.expectEqualSlices(u8, data, received.data);
+                try m.clearEvent(.{ .RxData = received });
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "handlePacket: agent channel data surfaces AgentData event" {
@@ -3640,9 +3696,10 @@ test "client receives exactly advertised maximum channel data" {
     const evt = try m.getNextEvent();
     switch (evt) {
         .Event => |code| switch (code) {
-            .RxData => |data| {
-                try std.testing.expectEqual(@as(usize, Protocol.MaxChannelDataLen), data.len);
-                try std.testing.expectEqualSlices(u8, &channel_data, data);
+            .RxData => |received| {
+                try std.testing.expectEqual(chan.local_id, received.channel);
+                try std.testing.expectEqual(@as(usize, Protocol.MaxChannelDataLen), received.data.len);
+                try std.testing.expectEqualSlices(u8, &channel_data, received.data);
             },
             else => return error.TestUnexpectedResult,
         },
@@ -3975,6 +4032,7 @@ test "client direct write retains suffix across peer packet and window limits" {
     switch (inbound_event) {
         .Event => |event| switch (event) {
             .RxExtendedData => |data| {
+                try std.testing.expectEqual(chan.local_id, data.channel);
                 try std.testing.expectEqual(@as(u32, 1), data.data_type);
                 try std.testing.expectEqualStrings("peer-data", data.data);
             },
@@ -3982,7 +4040,11 @@ test "client direct write retains suffix across peer packet and window limits" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try m.clearEvent(.{ .RxExtendedData = .{ .data_type = 1, .data = "peer-data" } });
+    try m.clearEvent(.{ .RxExtendedData = .{
+        .channel = chan.local_id,
+        .data_type = 1,
+        .data = "peer-data",
+    } });
 
     received_len += try consumeProducedChannelDataForTest(&m, &received, received_len);
     try std.testing.expectEqual(@as(usize, 1500), received_len);
@@ -4509,6 +4571,7 @@ test "handlePacket: SSH_MSG_CHANNEL_EXTENDED_DATA surfaces stderr" {
     switch (evt) {
         .Event => |code| switch (code) {
             .RxExtendedData => |ext| {
+                try std.testing.expectEqual(@as(u32, 0), ext.channel);
                 try std.testing.expectEqual(@as(u32, 1), ext.data_type);
                 try std.testing.expectEqualStrings("error: something failed\n", ext.data);
             },

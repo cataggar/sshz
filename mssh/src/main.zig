@@ -496,8 +496,8 @@ pub fn main(init: std.process.Init) !void {
                                 try misshod.clearEvent(eventCode);
                                 try raw_mode_start();
                             },
-                            .RxData => |buf| {
-                                try writeAllFd(std.c.STDOUT_FILENO, buf);
+                            .RxData => |channel_data| {
+                                try writeAllFd(std.c.STDOUT_FILENO, channel_data.data);
                                 try misshod.clearEvent(eventCode);
                             },
                             .RxExtendedData => |ext| {

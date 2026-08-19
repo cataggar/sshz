@@ -108,8 +108,8 @@ fn handleEvent(
             .password,
         ),
         .KeyboardInteractive => return error.UnsupportedAuthenticationMethod,
-        .RxData => |data| {
-            try config.sink.data_fn(config.sink.context, data);
+        .RxData => |channel_data| {
+            try config.sink.data_fn(config.sink.context, channel_data.data);
             try client.clearEvent(event);
         },
         .RxExtendedData => |extended| {
