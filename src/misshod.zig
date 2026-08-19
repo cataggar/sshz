@@ -562,8 +562,14 @@ pub const MisshodClientEventCodes = union(enum) {
     TcpipForwardFailure: TcpipForwardFailure,
     CancelTcpipForwardSuccess: TcpipForwardRequest,
     CancelTcpipForwardFailure: TcpipForwardRequest,
-    RxData: []const u8,
-    RxExtendedData: ExtendedData,
+    // The channel is part of the event because a client can have more than
+    // one open at a time -- the auto-shell session and any `direct-tcpip`
+    // tunnel -- and their bytes are not interchangeable. Splicing one into
+    // the other corrupts whatever protocol is running over the tunnel, and
+    // does so silently. These match the server-side events, which have
+    // always carried the channel.
+    RxData: ChannelData,
+    RxExtendedData: ChannelExtendedData,
     AgentChannelOpen: u32,
     AgentData: ChannelData,
     AgentChannelClosed: u32,
@@ -3684,19 +3690,19 @@ test "full handshake round-trip handles multiple large compressed channel packet
                             accepted_host_fingerprint = fingerprint;
                             client.clearEvent(.Connected) catch {};
                         },
-                        .RxData => |data| {
+                        .RxData => |channel_data| {
                             const packet_index: usize = client_packets_received;
                             try std.testing.expect(packet_index < packet_lengths.len);
                             receive_epochs[packet_index] = client.keyLifetimeStatus().inbound.epoch;
-                            try std.testing.expectEqual(packet_lengths[packet_index], data.len);
-                            for (data, 0..) |byte, byte_index| {
+                            try std.testing.expectEqual(packet_lengths[packet_index], channel_data.data.len);
+                            for (channel_data.data, 0..) |byte, byte_index| {
                                 try std.testing.expectEqual(
                                     largeChannelTestByte(@intCast(packet_index), byte_index),
                                     byte,
                                 );
                             }
                             client_packets_received += 1;
-                            client.clearEvent(.{ .RxData = data }) catch {};
+                            client.clearEvent(.{ .RxData = channel_data }) catch {};
                         },
                         .EndSession => break,
                         else => {

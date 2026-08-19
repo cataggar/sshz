@@ -317,9 +317,9 @@ const Pair = struct {
                         try self.noteClientChannel(channel);
                         try self.client.clearEvent(code);
                     },
-                    .RxData => |data| {
+                    .RxData => |channel_data| {
                         const transfer = self.s2c_transfer orelse return error.UnexpectedClientData;
-                        try transfer.receive(data);
+                        try transfer.receive(channel_data.data);
                         try self.client.clearEvent(code);
                     },
                     .EndSession => self.client_ended = true,
