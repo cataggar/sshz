@@ -3,7 +3,7 @@
 ## Status
 
 This document describes the intended embedding boundary; it is not a security
-claim. **MiSSHod is not secure and must not be used in real-world systems.**
+claim. **sshz is not secure and must not be used in real-world systems.**
 The [threat model](threat-model.md) lists release blockers. `mssh` and
 `msshd` are demos, not deployment templates. The examples under
 [`examples/production/`](../examples/production/) demonstrate fail-closed
@@ -11,15 +11,15 @@ integration patterns, but do not make the library production-ready.
 
 ## Compatibility policy
 
-MiSSHod is currently pre-1.0 and has no stable release line. Until a release
+sshz is currently pre-1.0 and has no stable release line. Until a release
 explicitly declares API version 1, every Zig API may change between minor
 releases. Releases must call out changes to the production-facing surface below
 and provide a migration note for source-breaking changes.
 
-The candidate production-facing surface is the `misshod` module's
-`MisshodClient`, `MisshodServer`, event and event-payload types,
+The candidate production-facing surface is the `sshz` module's
+`SshzClient`, `SshzServer`, event and event-payload types,
 `ResourceLimits`, deadline/key-lifetime types, `SshOpenFailureReason`,
-`MisshodError`, and buffer helper types. After API version 1, these names,
+`SshzError`, and buffer helper types. After API version 1, these names,
 their documented semantics, and default resource limits follow semantic
 versioning: source-breaking changes require a major version; additive events
 or errors require at least a minor version; fixes that preserve the contract
@@ -35,13 +35,13 @@ forwarding APIs are **experimental** until their authorization contracts have
 dedicated tests and documentation. Demo program APIs and behavior carry no
 compatibility guarantee.
 
-Applications should pin an exact MiSSHod revision and Zig version, compile with
+Applications should pin an exact sshz revision and Zig version, compile with
 the next candidate before upgrading, and never infer compatibility from a
 successful protocol handshake.
 
 ## Construction, ownership, and cleanup
 
-Create one `MisshodClient` or `MisshodServer` per ordered, reliable byte stream.
+Create one `SshzClient` or `SshzServer` per ordered, reliable byte stream.
 Supply a cryptographically secure `std.Random`, an allocator whose lifetime
 contains the session, and explicit validated `ResourceLimits` through
 `initWithLimits`. The client's second argument is the username; the server's
@@ -66,7 +66,7 @@ I/O returns `SessionTerminated`.
 
 ## The transport pump
 
-MiSSHod performs no transport I/O. Repeatedly call `getNextEvent()` and service
+sshz performs no transport I/O. Repeatedly call `getNextEvent()` and service
 exactly the returned requirement:
 
 | Result | Caller action |
@@ -180,7 +180,7 @@ KEX, decompression, and global-request limits; add process-wide connection,
 memory, CPU, file-descriptor, bandwidth, and source limits. See
 [resource limits](resource-limits.md).
 
-MiSSHod does not read a clock. Call `initializeDeadlines(now)` once, use one
+sshz does not read a clock. Call `initializeDeadlines(now)` once, use one
 monotonic tick unit, call `noteActivity(now)` only for real progress, and call
 `tick(now)` often enough to enforce handshake, authentication, idle, total,
 and key-age limits. A timeout is terminal. The embedding transport also needs

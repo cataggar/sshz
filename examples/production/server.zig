@@ -1,20 +1,20 @@
 const std = @import("std");
-const misshod = @import("misshod");
+const sshz = @import("sshz");
 const common = @import("common.zig");
 
 pub const Policy = struct {
     context: *anyopaque,
-    authenticate_fn: *const fn (*anyopaque, misshod.UserCredentials) anyerror!bool,
-    channel_open_fn: *const fn (*anyopaque, misshod.ChannelOpenRequestEvent) anyerror!bool,
-    channel_request_fn: *const fn (*anyopaque, misshod.ChannelRequestEvent) anyerror!bool,
-    window_change_fn: *const fn (*anyopaque, misshod.WindowSize) anyerror!bool,
-    signal_fn: *const fn (*anyopaque, misshod.ChannelSignal) anyerror!bool,
-    data_fn: *const fn (*anyopaque, misshod.ChannelData) anyerror!void,
-    extended_data_fn: *const fn (*anyopaque, misshod.ChannelExtendedData) anyerror!void,
+    authenticate_fn: *const fn (*anyopaque, sshz.UserCredentials) anyerror!bool,
+    channel_open_fn: *const fn (*anyopaque, sshz.ChannelOpenRequestEvent) anyerror!bool,
+    channel_request_fn: *const fn (*anyopaque, sshz.ChannelRequestEvent) anyerror!bool,
+    window_change_fn: *const fn (*anyopaque, sshz.WindowSize) anyerror!bool,
+    signal_fn: *const fn (*anyopaque, sshz.ChannelSignal) anyerror!bool,
+    data_fn: *const fn (*anyopaque, sshz.ChannelData) anyerror!void,
+    extended_data_fn: *const fn (*anyopaque, sshz.ChannelExtendedData) anyerror!void,
 };
 
 pub const Config = struct {
-    limits: misshod.ResourceLimits,
+    limits: sshz.ResourceLimits,
     policy: Policy,
 };
 
@@ -24,11 +24,11 @@ pub fn init(
     allocator: std.mem.Allocator,
     config: *const Config,
     now: u64,
-) !misshod.MisshodServer {
+) !sshz.SshzServer {
     if (host_private_key.len == 0) return error.InvalidConfiguration;
     try common.requireProductionLimits(config.limits);
 
-    var server = try misshod.MisshodServer.initWithLimits(
+    var server = try sshz.SshzServer.initWithLimits(
         random,
         host_private_key,
         allocator,
@@ -40,9 +40,9 @@ pub fn init(
 }
 
 fn handleEvent(
-    server: *misshod.MisshodServer,
+    server: *sshz.SshzServer,
     config: *const Config,
-    event: misshod.MisshodServerEventCodes,
+    event: sshz.SshzServerEventCodes,
 ) !common.PumpResult {
     switch (event) {
         .UserAuth => |credentials| {
@@ -62,7 +62,7 @@ fn handleEvent(
             } else {
                 try server.rejectChannelOpen(
                     request.channel,
-                    misshod.SshOpenFailureReason.AdministrativelyProhibited,
+                    sshz.SshOpenFailureReason.AdministrativelyProhibited,
                     "channel denied by application policy",
                 );
             }
@@ -115,7 +115,7 @@ fn handleEvent(
 }
 
 fn consume(
-    server: *misshod.MisshodServer,
+    server: *sshz.SshzServer,
     transport: common.Transport,
     scratch: []u8,
     requested: usize,
@@ -129,7 +129,7 @@ fn consume(
 }
 
 fn produce(
-    server: *misshod.MisshodServer,
+    server: *sshz.SshzServer,
     transport: common.Transport,
     requested: usize,
     now: u64,
@@ -144,7 +144,7 @@ fn produce(
 /// Call only after polling the transport. The caller owns transport closure
 /// and must `defer server.deinit()`; any returned error is terminal.
 pub fn pumpOnce(
-    server: *misshod.MisshodServer,
+    server: *sshz.SshzServer,
     config: *const Config,
     transport: common.Transport,
     scratch: []u8,
@@ -176,7 +176,7 @@ pub fn pumpOnce(
 }
 
 pub fn sendChannelData(
-    server: *misshod.MisshodServer,
+    server: *sshz.SshzServer,
     channel: u32,
     data: []const u8,
 ) !usize {
@@ -195,29 +195,29 @@ pub fn main(_: std.process.Init) !void {
 
 test "production server pump is compile-checked without network I/O" {
     const Mock = struct {
-        fn authenticate(_: *anyopaque, _: misshod.UserCredentials) !bool {
+        fn authenticate(_: *anyopaque, _: sshz.UserCredentials) !bool {
             return false;
         }
 
-        fn channelOpen(_: *anyopaque, _: misshod.ChannelOpenRequestEvent) !bool {
+        fn channelOpen(_: *anyopaque, _: sshz.ChannelOpenRequestEvent) !bool {
             return false;
         }
 
-        fn channelRequest(_: *anyopaque, _: misshod.ChannelRequestEvent) !bool {
+        fn channelRequest(_: *anyopaque, _: sshz.ChannelRequestEvent) !bool {
             return false;
         }
 
-        fn windowChange(_: *anyopaque, _: misshod.WindowSize) !bool {
+        fn windowChange(_: *anyopaque, _: sshz.WindowSize) !bool {
             return false;
         }
 
-        fn signal(_: *anyopaque, _: misshod.ChannelSignal) !bool {
+        fn signal(_: *anyopaque, _: sshz.ChannelSignal) !bool {
             return false;
         }
 
-        fn data(_: *anyopaque, _: misshod.ChannelData) !void {}
+        fn data(_: *anyopaque, _: sshz.ChannelData) !void {}
 
-        fn extendedData(_: *anyopaque, _: misshod.ChannelExtendedData) !void {}
+        fn extendedData(_: *anyopaque, _: sshz.ChannelExtendedData) !void {}
 
         fn read(_: *anyopaque, _: []u8) !usize {
             return error.UnexpectedRead;

@@ -1,19 +1,19 @@
-# MiSSHod
+# sshz
 
-*misshod. (ˌmɪsˈʃɒd). adj. badly shod*
+*sshz. (ˌmɪsˈʃɒd). adj. badly shod*
 
 # About
 
-MiSSHod is a minimal, experimental SSH client and server implemented as a library.
+sshz is a minimal, experimental SSH client and server implemented as a library.
 
 It has been tested with both [OpenSSH](https://github.com/openssh/openssh-portable) and [Dropbear](https://github.com/mkj/dropbear).
 
-**MiSSHod is not secure, it should not be used in real world systems**
+**sshz is not secure, it should not be used in real world systems**
 
 It aims to be:
 
- - Transport and I/O agnostic - TCP would be normal, but MiSShod can be run over any reliable stream protocol
- - Asynchronous - MiSShod never blocks execution for I/O, it enters a wait state and can be resumed when data arrives
+ - Transport and I/O agnostic - TCP would be normal, but sshz can be run over any reliable stream protocol
+ - Asynchronous - sshz never blocks execution for I/O, it enters a wait state and can be resumed when data arrives
  - Callback free - asynchronous message passing prevents the caller needing callbacks and context structs
  - Very lightweight, opening up the possibility of running on small embedded devices
 
@@ -43,7 +43,7 @@ description of what is negotiated and enforced.
 
 # Building
 
-MiSSHod requires [Zig 0.16.0](https://ziglang.org/download/). zlib is built
+sshz requires [Zig 0.16.0](https://ziglang.org/download/). zlib is built
 from source as a package dependency, so no system library is needed and the
 same `zig build` works on Linux, macOS, and Windows.
 
@@ -137,7 +137,7 @@ CI installs Ubuntu's `dropbear-bin` package and requires the lane.
 
 # Security
 
-**MiSSHod is not secure, it should not be used in real world systems**
+**sshz is not secure, it should not be used in real world systems**
 
 The [production-facing API and lifecycle contract](doc/api-production.md)
 documents the client/server pump, borrowed data, mandatory trust decisions,
@@ -163,12 +163,12 @@ production SSH clients or servers.
 - Secret copies and lifetimes have been reduced and documented, but compiler,
   allocator, dependency, crash-dump, and application copies remain outside
   complete library control.
-- MiSSHod relies on Zig's still-young standard-library cryptography and system
+- sshz relies on Zig's still-young standard-library cryptography and system
   zlib; release dependencies and independent vectors are not yet fully pinned.
 - No independent cryptographic or protocol security review has occurred.
 
 # Status
 
-MiSSHod was developed rapidly as a small SSH implementation. Its pre-1.0 API,
+sshz was developed rapidly as a small SSH implementation. Its pre-1.0 API,
 security evidence, supported-platform matrix, and independent review are not
 yet sufficient for production use.

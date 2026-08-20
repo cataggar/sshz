@@ -1,7 +1,7 @@
 .{
-    .name = .misshod,
+    .name = .sshz,
     .version = "0.1.0",
-    .fingerprint = 0x7170711567835565,
+    .fingerprint = 0x138d7fea38809664,
     .minimum_zig_version = "0.16.0",
 
     .dependencies = .{

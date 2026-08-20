@@ -6,7 +6,7 @@ if [[ -n "${MSSH_INTEROP_ARTIFACTS:-}" ]]; then
     WORK="$MSSH_INTEROP_ARTIFACTS"
 else
     mkdir -p "$ROOT/.zig-cache"
-    WORK="$(mktemp -d "$ROOT/.zig-cache/misshod-interop.XXXXXX")"
+    WORK="$(mktemp -d "$ROOT/.zig-cache/sshz-interop.XXXXXX")"
 fi
 KEEP_ARTIFACTS="${MSSH_INTEROP_KEEP_ARTIFACTS:-}"
 TIMEOUT="${MSSH_INTEROP_TIMEOUT:-25}"
@@ -57,7 +57,7 @@ cleanup() {
             printf 'warning: could not remove Dropbear interop account %s\n' "$DROPBEAR_USER" >&2
         }
     fi
-    if [[ "$DROPBEAR_HOME" == /tmp/misshod-dropbear-home.* ]]; then
+    if [[ "$DROPBEAR_HOME" == /tmp/sshz-dropbear-home.* ]]; then
         rm -rf -- "$DROPBEAR_HOME"
     fi
 
@@ -275,7 +275,7 @@ PermitRootLogin no
 PermitTTY yes
 PrintMotd no
 PrintLastLog no
-ForceCommand printf misshod-openssh-forced
+ForceCommand printf sshz-openssh-forced
 LogLevel DEBUG3
 KexAlgorithms curve25519-sha256
 HostKeyAlgorithms ssh-ed25519
@@ -298,7 +298,7 @@ log "testing mssh pubkey auth against OpenSSH sshd"
 run_mssh_command "$TIMEOUT" "$LOG_DIR/mssh-openssh-pubkey.out" "$LOG_DIR/mssh-openssh-pubkey.err" \
     '' \
     "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT" --insecure-demo "$KEY_PASSWORDLESS"
-assert_contains "$LOG_DIR/mssh-openssh-pubkey.out" "misshod-openssh-forced"
+assert_contains "$LOG_DIR/mssh-openssh-pubkey.out" "sshz-openssh-forced"
 assert_contains "$LOG_DIR/mssh-openssh-pubkey.err" "Connected!"
 
 log "testing mssh encrypted-key auth against OpenSSH sshd"
@@ -306,7 +306,7 @@ run_mssh_command "$TIMEOUT" "$LOG_DIR/mssh-openssh-encrypted-key.out" "$LOG_DIR/
     '' \
     env MSSH_KEY_PASSPHRASE="$KEY_PASSPHRASE" \
     "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT" --insecure-demo "$KEY_ENCRYPTED"
-assert_contains "$LOG_DIR/mssh-openssh-encrypted-key.out" "misshod-openssh-forced"
+assert_contains "$LOG_DIR/mssh-openssh-encrypted-key.out" "sshz-openssh-forced"
 
 if [[ -n "$OPENSSH_PASSWORD" ]]; then
     log "testing mssh password auth against OpenSSH sshd"
@@ -314,7 +314,7 @@ if [[ -n "$OPENSSH_PASSWORD" ]]; then
         '' \
         env MSSH_AUTH_PASSWORD="$OPENSSH_PASSWORD" \
         "$MSSH_BIN" "$USER_NAME@$HOST" "$OPENSSH_PORT" --insecure-demo
-    assert_contains "$LOG_DIR/mssh-openssh-password.out" "misshod-openssh-forced"
+    assert_contains "$LOG_DIR/mssh-openssh-password.out" "sshz-openssh-forced"
 else
     log "skipping OpenSSH password-auth lane; set MSSH_INTEROP_OPENSSH_PASSWORD to enable it for the current user"
 fi
@@ -365,7 +365,7 @@ if [[ "${MSSH_INTEROP_ENABLE_DROPBEAR:-}" == "1" || "${MSSH_INTEROP_REQUIRE_DROP
 
     if [[ -n "$DROPBEAR_BIN" && "${#missing_dropbear_commands[@]}" -eq 0 ]]; then
         DROPBEAR_DIR="$RUNTIME_DIR/dropbear"
-        DROPBEAR_HOME="$(mktemp -d /tmp/misshod-dropbear-home.XXXXXX)"
+        DROPBEAR_HOME="$(mktemp -d /tmp/sshz-dropbear-home.XXXXXX)"
         DROPBEAR_PID_FILE="$DROPBEAR_DIR/dropbear.pid"
         DROPBEAR_HOST_KEY="$DROPBEAR_DIR/dropbear_ed25519_host_key"
         DROPBEAR_AUTHORIZED_KEYS="$DROPBEAR_HOME/.ssh/authorized_keys"
@@ -384,7 +384,7 @@ if [[ "${MSSH_INTEROP_ENABLE_DROPBEAR:-}" == "1" || "${MSSH_INTEROP_REQUIRE_DROP
         ssh-keygen -y -f "$KEY_PASSWORDLESS" >"$DROPBEAR_AUTHORIZED_KEYS"
         ssh-keygen -y -P "$KEY_PASSPHRASE" -f "$KEY_ENCRYPTED" >>"$DROPBEAR_AUTHORIZED_KEYS"
         chmod 600 "$DROPBEAR_AUTHORIZED_KEYS"
-        printf '%s\n' "misshod-dropbear-auth-banner" >"$DROPBEAR_BANNER"
+        printf '%s\n' "sshz-dropbear-auth-banner" >"$DROPBEAR_BANNER"
         "$DROPBEARKEY_BIN" -t ed25519 -f "$DROPBEAR_HOST_KEY" \
             >"$LOG_DIR/dropbear-host-key.out" 2>"$LOG_DIR/dropbear-host-key.err"
         ssh-keygen -q -t ed25519 -N '' -f "$DROPBEAR_REJECTED_KEY"
@@ -403,7 +403,7 @@ user=$DROPBEAR_USER
 host_key_type=ed25519
 password_auth=disabled
 root_login=disabled
-banner=misshod-dropbear-auth-banner
+banner=sshz-dropbear-auth-banner
 authorized_fixture_keys=passwordless-ed25519,encrypted-ed25519
 EOF
 
@@ -425,19 +425,19 @@ EOF
 
         log "testing mssh passwordless Ed25519 auth and shell data against Dropbear"
         run_mssh_command "$TIMEOUT" "$LOG_DIR/mssh-dropbear-pubkey.out" "$LOG_DIR/mssh-dropbear-pubkey.err" \
-            "printf 'misshod-dropbear-shell:%s\\n' 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'" \
+            "printf 'sshz-dropbear-shell:%s\\n' 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'" \
             "$MSSH_BIN" "$DROPBEAR_USER@$HOST" "$DROPBEAR_PORT" --insecure-demo "$KEY_PASSWORDLESS"
         assert_contains "$LOG_DIR/mssh-dropbear-pubkey.out" \
-            "misshod-dropbear-shell:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        assert_contains "$LOG_DIR/mssh-dropbear-pubkey.err" "misshod-dropbear-auth-banner"
+            "sshz-dropbear-shell:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        assert_contains "$LOG_DIR/mssh-dropbear-pubkey.err" "sshz-dropbear-auth-banner"
         assert_contains "$LOG_DIR/mssh-dropbear-pubkey.err" "Connected!"
 
         log "testing mssh encrypted Ed25519 key auth against Dropbear"
         run_mssh_command "$TIMEOUT" "$LOG_DIR/mssh-dropbear-encrypted-key.out" "$LOG_DIR/mssh-dropbear-encrypted-key.err" \
-            "printf 'misshod-dropbear-encrypted-key\\n'" \
+            "printf 'sshz-dropbear-encrypted-key\\n'" \
             env MSSH_KEY_PASSPHRASE="$KEY_PASSPHRASE" \
             "$MSSH_BIN" "$DROPBEAR_USER@$HOST" "$DROPBEAR_PORT" --insecure-demo "$KEY_ENCRYPTED"
-        assert_contains "$LOG_DIR/mssh-dropbear-encrypted-key.out" "misshod-dropbear-encrypted-key"
+        assert_contains "$LOG_DIR/mssh-dropbear-encrypted-key.out" "sshz-dropbear-encrypted-key"
         assert_contains "$LOG_DIR/mssh-dropbear-encrypted-key.err" "Connected!"
 
         log "testing mssh auth rejection against Dropbear"
@@ -500,14 +500,14 @@ run_openssh_client_to_msshd() {
 
     (
         {
-            printf 'misshod-openssh-client\n'
+            printf 'sshz-openssh-client\n'
             sleep 1
         } | "$SSH_BIN" "$@" "${SSH_COMMON[@]}" "interop@$HOST"
     ) >"$out_file" 2>"$err_file" &
     local pid=$!
 
     for _ in $(seq 1 "$((TIMEOUT * 4))"); do
-        if grep -Fq "You said 'misshod-openssh-client" "$out_file" 2>/dev/null; then
+        if grep -Fq "You said 'sshz-openssh-client" "$out_file" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
             wait "$pid" 2>/dev/null || true
             return 0
@@ -526,7 +526,7 @@ run_openssh_client_to_msshd() {
 
 log "testing OpenSSH ssh client against msshd"
 run_openssh_client_to_msshd "$LOG_DIR/openssh-msshd.out" "$LOG_DIR/openssh-msshd.err" -vvv
-assert_contains "$LOG_DIR/openssh-msshd.out" "You said 'misshod-openssh-client"
+assert_contains "$LOG_DIR/openssh-msshd.out" "You said 'sshz-openssh-client"
 
 log "checking OpenSSH negotiated algorithms against msshd"
 assert_matches "$LOG_DIR/openssh-msshd.err" "kex: algorithm: curve25519-sha256"
@@ -536,7 +536,7 @@ assert_matches "$LOG_DIR/openssh-msshd.err" "cipher: aes256-ctr.*MAC: hmac-sha2-
 if [[ -n "${DROPBEAR_CLIENT_KEY:-}" ]]; then
     log "testing Dropbear dbclient data and clean close against msshd"
     (
-        printf '%s\n' "misshod-dropbear-dbclient:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" |
+        printf '%s\n' "sshz-dropbear-dbclient:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ" |
             "$DBCLIENT_BIN" -y -y -T -p "$MSSHD_PORT" -i "$DROPBEAR_CLIENT_KEY" "interop@$HOST"
     ) >"$LOG_DIR/dropbear-dbclient-msshd.out" 2>"$LOG_DIR/dropbear-dbclient-msshd.err" &
     DBCLIENT_PID=$!
@@ -546,7 +546,7 @@ if [[ -n "${DROPBEAR_CLIENT_KEY:-}" ]]; then
         fail "Dropbear dbclient failed or did not close cleanly"
     fi
     assert_contains "$LOG_DIR/dropbear-dbclient-msshd.out" \
-        "You said 'misshod-dropbear-dbclient:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "You said 'sshz-dropbear-dbclient:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 fi
 
 if [[ "${MSSH_INTEROP_ENABLE_LIBSSH:-}" == "1" || "${MSSH_INTEROP_REQUIRE_LIBSSH:-}" == "1" ]]; then
@@ -571,7 +571,7 @@ if [[ "${MSSH_INTEROP_ENABLE_LIBSSH:-}" == "1" || "${MSSH_INTEROP_REQUIRE_LIBSSH
         sed -n '1,160p' "$LOG_DIR/msshd.err" >&2 || true
         fail "libssh probe failed"
     fi
-    assert_contains "$LOG_DIR/libssh-msshd.out" "You said 'misshod-libssh-probe"
+    assert_contains "$LOG_DIR/libssh-msshd.out" "You said 'sshz-libssh-probe"
     assert_contains "$LOG_DIR/libssh-msshd.out" \
         "negotiated kex=curve25519-sha256 hostkey=ssh-ed25519 cipher-in=aes256-ctr cipher-out=aes256-ctr hmac-in=hmac-sha2-256 hmac-out=hmac-sha2-256"
 else

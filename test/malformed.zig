@@ -1,5 +1,5 @@
 const std = @import("std");
-const misshod = @import("misshod");
+const sshz = @import("sshz");
 
 const max_steps = 64;
 const max_input_bytes = 512;
@@ -95,13 +95,13 @@ const valid_packet = [_]u8{
     2,
 } ++ ([_]u8{0} ** 10);
 const overlong_packet = valid_packet ++ [_]u8{0};
-const truncated_mac_packet = valid_packet ++ ([_]u8{0} ** (misshod.TransportLimits.mac_len - 1));
+const truncated_mac_packet = valid_packet ++ ([_]u8{0} ** (sshz.TransportLimits.mac_len - 1));
 const bad_block_packet = [_]u8{
     0, 0, 0, 8, 6,
     2,
-} ++ ([_]u8{0} ** 6) ++ ([_]u8{0} ** misshod.TransportLimits.mac_len);
-const corrupt_mac = ([_]u8{0} ** (misshod.TransportLimits.mac_len - 1)) ++ [_]u8{1};
-const truncated_ecdh_key = [_]u8{0x42} ** (misshod.TransportLimits.ecdh_public_key_len - 1);
+} ++ ([_]u8{0} ** 6) ++ ([_]u8{0} ** sshz.TransportLimits.mac_len);
+const corrupt_mac = ([_]u8{0} ** (sshz.TransportLimits.mac_len - 1)) ++ [_]u8{1};
+const truncated_ecdh_key = [_]u8{0x42} ** (sshz.TransportLimits.ecdh_public_key_len - 1);
 const ecdh_reply_trailing = [_]u8{
     31,
     0,
@@ -111,8 +111,8 @@ const ecdh_reply_trailing = [_]u8{
     0,
     0,
     0,
-    misshod.TransportLimits.ecdh_public_key_len,
-} ++ ([_]u8{0x42} ** misshod.TransportLimits.ecdh_public_key_len) ++ [_]u8{
+    sshz.TransportLimits.ecdh_public_key_len,
+} ++ ([_]u8{0x42} ** sshz.TransportLimits.ecdh_public_key_len) ++ [_]u8{
     0,    0, 0, 0,
     0xff,
 };
@@ -319,8 +319,8 @@ fn buildUnencryptedPacket(buf: []u8, payload: []const u8, seed: u64) !usize {
 
 fn expectClientOutcome(
     case: CorpusCase,
-    client: *misshod.MisshodClient,
-    result: misshod.MisshodError!void,
+    client: *sshz.SshzClient,
+    result: sshz.SshzError!void,
 ) !void {
     switch (case.expected) {
         .peer_disconnect => {
@@ -361,14 +361,14 @@ fn expectClientOutcome(
 fn runClientCase(case: CorpusCase, case_index: usize) !void {
     const seed = corpus_seed +% case_index;
     var prng = std.Random.DefaultPrng.init(seed);
-    var client = try misshod.MisshodClient.init(prng.random(), "malformed-corpus", std.testing.allocator);
+    var client = try sshz.SshzClient.init(prng.random(), "malformed-corpus", std.testing.allocator);
     defer client.deinit();
 
     var generated_payload: [max_input_bytes]u8 = undefined;
     var payload = case.input;
     switch (case.operation) {
         .client_kexinit => {
-            var writer = misshod.BufferWriter.init(&generated_payload, 0);
+            var writer = sshz.BufferWriter.init(&generated_payload, 0);
             try writer.writeU8(20);
             try writer.writeBytes(&([_]u8{0} ** 16));
             try writer.writeU32LenString(case.input);
@@ -453,49 +453,49 @@ fn runClientCase(case: CorpusCase, case_index: usize) !void {
 
 fn runCase(case: CorpusCase, case_index: usize) !void {
     switch (case.operation) {
-        .identification => try std.testing.expectError(case.expected.value(), misshod.inspectIdentificationLine(case.input)),
-        .packet => try std.testing.expectError(case.expected.value(), misshod.inspectPacket(case.input, false)),
-        .encrypted_packet => try std.testing.expectError(case.expected.value(), misshod.inspectPacket(case.input, true)),
+        .identification => try std.testing.expectError(case.expected.value(), sshz.inspectIdentificationLine(case.input)),
+        .packet => try std.testing.expectError(case.expected.value(), sshz.inspectPacket(case.input, false)),
+        .encrypted_packet => try std.testing.expectError(case.expected.value(), sshz.inspectPacket(case.input, true)),
         .mac => {
-            const calculated = [_]u8{0} ** misshod.TransportLimits.mac_len;
-            try std.testing.expectError(case.expected.value(), misshod.verifyPacketMac(calculated, case.input));
+            const calculated = [_]u8{0} ** sshz.TransportLimits.mac_len;
+            try std.testing.expectError(case.expected.value(), sshz.verifyPacketMac(calculated, case.input));
         },
         .compression => {
-            var state: misshod.CompressionState = .{ .algorithm = .ZlibOpenSsh };
+            var state: sshz.CompressionState = .{ .algorithm = .ZlibOpenSsh };
             defer state.deinit();
             try state.activateInflate();
-            var output: [misshod.TransportLimits.max_payload_len]u8 = undefined;
+            var output: [sshz.TransportLimits.max_payload_len]u8 = undefined;
             try std.testing.expectError(case.expected.value(), state.decompressPayload(case.input, &output));
         },
         .string => {
-            var reader = misshod.BufferReader.init(case.input);
+            var reader = sshz.BufferReader.init(case.input);
             try std.testing.expectError(case.expected.value(), reader.readU32LenString());
         },
         .mpint => {
-            var reader = misshod.BufferReader.init(case.input);
+            var reader = sshz.BufferReader.init(case.input);
             try std.testing.expectError(case.expected.value(), reader.readMpint());
         },
         .ecdh_public_key => try std.testing.expectError(
             case.expected.value(),
-            misshod.exerciseEcdhReplyPublicKey(case.input, std.testing.allocator),
+            sshz.exerciseEcdhReplyPublicKey(case.input, std.testing.allocator),
         ),
-        .message => try std.testing.expectError(case.expected.value(), misshod.inspectMessageFraming(case.input)),
+        .message => try std.testing.expectError(case.expected.value(), sshz.inspectMessageFraming(case.input)),
         .reader_skip => {
-            var reader = misshod.BufferReader.init(case.input);
+            var reader = sshz.BufferReader.init(case.input);
             try std.testing.expectError(case.expected.value(), reader.skip(std.math.maxInt(usize)));
         },
         .writer_init => {
             var backing: [4]u8 = undefined;
-            try std.testing.expectError(case.expected.value(), misshod.BufferWriter.initChecked(&backing, backing.len + 1));
+            try std.testing.expectError(case.expected.value(), sshz.BufferWriter.initChecked(&backing, backing.len + 1));
         },
         .writer_skip => {
             var backing: [4]u8 = undefined;
-            var writer = misshod.BufferWriter.init(&backing, 0);
+            var writer = sshz.BufferWriter.init(&backing, 0);
             try std.testing.expectError(case.expected.value(), writer.skip(std.math.maxInt(usize)));
         },
         .writer_mpint => {
             var backing: [5]u8 = undefined;
-            var writer = misshod.BufferWriter.init(&backing, 0);
+            var writer = sshz.BufferWriter.init(&backing, 0);
             try std.testing.expectError(case.expected.value(), writer.writeMpint(case.input));
             try std.testing.expectEqual(@as(usize, 0), writer.off);
         },

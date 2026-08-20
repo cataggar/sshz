@@ -1,7 +1,7 @@
 # Release checklist and platform matrix
 
 This checklist gates a future production claim. Completing a build alone is
-not sufficient. **MiSSHod is currently not secure and must not be used in
+not sufficient. **sshz is currently not secure and must not be used in
 real-world systems.**
 
 ## Candidate checklist

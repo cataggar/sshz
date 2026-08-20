@@ -29,7 +29,7 @@ fn linkZlib(b: *std.Build, mod: *std.Build.Module) void {
 
 /// How much the library is allowed to print.
 ///
-/// `off` by default because an application that links misshod owns its own
+/// `off` by default because an application that links sshz owns its own
 /// stderr -- and, if it draws a terminal UI, its own screen. `mssh` and
 /// `msshd` ask for `info`.
 pub const TraceLevel = enum { off, info, debug };
@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
     const trace_level = b.option(
         TraceLevel,
         "trace",
-        "How much misshod prints to stderr (default: off)",
+        "How much sshz prints to stderr (default: off)",
     ) orelse default_trace_level;
 
     // UNSAFE: This may print plaintext packets, private keys, shared secrets,
@@ -65,13 +65,13 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "unsafe_secret_tracing", unsafe_secret_tracing);
     addTraceLevel(options, trace_level);
 
-    const mod = b.addModule("misshod", .{
-        .root_source_file = b.path("src/misshod.zig"),
+    const mod = b.addModule("sshz", .{
+        .root_source_file = b.path("src/sshz.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    mod.addOptions("misshod_build_options", options);
+    mod.addOptions("sshz_build_options", options);
     linkZlib(b, mod);
 
     const test_mod = b.createModule(.{
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.addOptions("misshod_build_options", options);
+    test_mod.addOptions("sshz_build_options", options);
     linkZlib(b, test_mod);
 
     const lib_tests = b.addTest(.{
@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    safe_trace_test_mod.addOptions("misshod_build_options", safe_trace_options);
+    safe_trace_test_mod.addOptions("sshz_build_options", safe_trace_options);
     const safe_trace_tests = b.addTest(.{
         .root_module = safe_trace_test_mod,
     });
@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    trace_off_test_mod.addOptions("misshod_build_options", default_trace_options);
+    trace_off_test_mod.addOptions("sshz_build_options", default_trace_options);
     const trace_off_tests = b.addTest(.{
         .root_module = trace_off_test_mod,
     });
@@ -133,10 +133,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    production_client_mod.addImport("misshod", mod);
+    production_client_mod.addImport("sshz", mod);
     linkZlib(b, production_client_mod);
     const production_client = b.addExecutable(.{
-        .name = "misshod-production-client-example",
+        .name = "sshz-production-client-example",
         .root_module = production_client_mod,
     });
     const production_client_tests = b.addTest(.{
@@ -150,13 +150,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    production_server_mod.addImport("misshod", mod);
+    production_server_mod.addImport("sshz", mod);
     production_server_mod.addAnonymousImport("production_test_host_key", .{
         .root_source_file = b.path("testserver/id_ed25519_passwordless"),
     });
     linkZlib(b, production_server_mod);
     const production_server = b.addExecutable(.{
-        .name = "misshod-production-server-example",
+        .name = "sshz-production-server-example",
         .root_module = production_server_mod,
     });
     const production_server_tests = b.addTest(.{
@@ -179,7 +179,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    malformed_mod.addImport("misshod", mod);
+    malformed_mod.addImport("sshz", mod);
     linkZlib(b, malformed_mod);
     const malformed_tests = b.addTest(.{
         .root_module = malformed_mod,
@@ -194,13 +194,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    stress_mod.addImport("misshod", mod);
+    stress_mod.addImport("sshz", mod);
     stress_mod.addAnonymousImport("stress_host_key", .{
         .root_source_file = b.path("testserver/id_ed25519_passwordless"),
     });
     linkZlib(b, stress_mod);
     const stress_exe = b.addExecutable(.{
-        .name = "misshod-stress",
+        .name = "sshz-stress",
         .root_module = stress_mod,
     });
 

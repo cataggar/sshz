@@ -2,9 +2,9 @@ const std = @import("std");
 const util = @import("util.zig");
 const TRACE = util.trace;
 const UNSAFE_TRACEDUMP = util.unsafeTracedump;
-const Misshod = @import("misshod.zig").Misshod;
-const MisshodError = @import("misshod.zig").MisshodError;
-const IoError = @import("misshod.zig").IoError;
+const Sshz = @import("sshz.zig").Sshz;
+const SshzError = @import("sshz.zig").SshzError;
+const IoError = @import("sshz.zig").IoError;
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
@@ -277,7 +277,7 @@ fn selectClientPreferred(client_namelist: []const u8, server_namelist: []const u
     return null;
 }
 
-pub fn readKexInit(rdr: *BufferReader) MisshodError!KexInit {
+pub fn readKexInit(rdr: *BufferReader) SshzError!KexInit {
     _ = try rdr.readBytes(16);
     const result: KexInit = .{
         .offers = .{
@@ -314,7 +314,7 @@ pub fn negotiateAlgorithms(
     peer: KexInit,
     role: AlgorithmRole,
     local_host_key_algorithms: []const u8,
-) MisshodError!NegotiatedAlgorithms {
+) SshzError!NegotiatedAlgorithms {
     inline for (std.meta.fields(AlgorithmOffers)) |field| {
         if (!isValidNameList(@field(peer.offers, field.name), true)) {
             return IoError.AlgorithmNegotiationFailed;
@@ -435,7 +435,7 @@ pub const CompressionState = struct {
         }
     }
 
-    pub fn activateDeflate(self: *Self) MisshodError!void {
+    pub fn activateDeflate(self: *Self) SshzError!void {
         switch (self.algorithm) {
             .None => {},
             .ZlibOpenSsh => {
@@ -447,7 +447,7 @@ pub const CompressionState = struct {
         }
     }
 
-    pub fn activateInflate(self: *Self) MisshodError!void {
+    pub fn activateInflate(self: *Self) SshzError!void {
         switch (self.algorithm) {
             .None => {},
             .ZlibOpenSsh => {
@@ -459,7 +459,7 @@ pub const CompressionState = struct {
         }
     }
 
-    pub fn compressPayload(self: *Self, input: []const u8, output: []u8) MisshodError![]const u8 {
+    pub fn compressPayload(self: *Self, input: []const u8, output: []u8) SshzError![]const u8 {
         if (!self.active or self.algorithm == .None) return input;
         if (input.len > MaxPayload or output.len == 0) return IoError.tooBig;
 
@@ -483,7 +483,7 @@ pub const CompressionState = struct {
         }
     }
 
-    pub fn decompressPayload(self: *Self, input: []const u8, output: []u8) MisshodError![]const u8 {
+    pub fn decompressPayload(self: *Self, input: []const u8, output: []u8) SshzError![]const u8 {
         if (!self.active or self.algorithm == .None) return input;
         if (output.len == 0) return IoError.tooBig;
 
@@ -527,14 +527,14 @@ pub const CompressionState = struct {
         self.active = false;
     }
 
-    fn initDeflate(self: *Self) MisshodError!void {
+    fn initDeflate(self: *Self) SshzError!void {
         self.deflate_stream = std.mem.zeroes(zlib.z_stream);
         const rc = zlib.deflateInit_(&self.deflate_stream, zlib.Z_DEFAULT_COMPRESSION, zlib.ZLIB_VERSION, @sizeOf(zlib.z_stream));
         if (rc != zlib.Z_OK) return IoError.UnexpectedResponse;
         self.deflate_initialized = true;
     }
 
-    fn initInflate(self: *Self) MisshodError!void {
+    fn initInflate(self: *Self) SshzError!void {
         self.inflate_stream = std.mem.zeroes(zlib.z_stream);
         const rc = zlib.inflateInit_(&self.inflate_stream, zlib.ZLIB_VERSION, @sizeOf(zlib.z_stream));
         if (rc != zlib.Z_OK) return IoError.UnexpectedResponse;
@@ -567,7 +567,7 @@ pub const KeyDataUni = struct {
     aesctr: AesCtrT = undefined,
     compression: CompressionState = .{},
 
-    pub fn activateEpoch(self: *KeyDataUni, previous_epoch: u64, activated_at: ?u64) MisshodError!void {
+    pub fn activateEpoch(self: *KeyDataUni, previous_epoch: u64, activated_at: ?u64) SshzError!void {
         if (previous_epoch == std.math.maxInt(u64)) return IoError.KeyLifetimeExceeded;
         self.epoch = previous_epoch + 1;
         self.encrypted_bytes = 0;
@@ -575,7 +575,7 @@ pub const KeyDataUni = struct {
         self.activated_at_monotonic_tick = activated_at;
     }
 
-    pub fn accountEncryptedPacket(self: *KeyDataUni, packet_len: usize) MisshodError!void {
+    pub fn accountEncryptedPacket(self: *KeyDataUni, packet_len: usize) SshzError!void {
         self.encrypted_bytes = std.math.add(u64, self.encrypted_bytes, packet_len) catch
             return IoError.KeyLifetimeExceeded;
         self.encrypted_packets = std.math.add(u64, self.encrypted_packets, 1) catch
@@ -684,11 +684,11 @@ pub const KeyDataBi = struct {
     }
 };
 
-pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer: *BufferWriter, iobuf: []u8) MisshodError![]const u8 {
+pub fn wrapPkt(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, buffer: *BufferWriter, iobuf: []u8) SshzError![]const u8 {
     return wrapPayload(rand, encrypted, keysuni, buffer.active(), iobuf);
 }
 
-pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, payload: []const u8, iobuf: []u8) MisshodError![]const u8 {
+pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, payload: []const u8, iobuf: []u8) SshzError![]const u8 {
     // https://datatracker.ietf.org/doc/html/rfc4253#section-6
     if (payload.len > MaxPayload) return IoError.tooBig;
     if (keysuni.seq == std.math.maxInt(u32)) return IoError.KeyLifetimeExceeded;

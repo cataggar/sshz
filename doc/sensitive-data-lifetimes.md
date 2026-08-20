@@ -1,6 +1,6 @@
 # Sensitive data lifetimes
 
-MiSSHod treats an error returned while driving protocol I/O as terminal. The
+sshz treats an error returned while driving protocol I/O as terminal. The
 caller must stop using the transport and call `deinit`. Resource, key-lifetime,
 and deadline failures also latch the session closed and scrub it immediately.
 Cleanup is idempotent so `deinit` remains required and safe after fail-closed
@@ -24,7 +24,7 @@ cleanup.
 | Server host private key | Session-owned from successful initialization because rekey needs it | Fail-closed or deinit; partial initialization clears it with `errdefer` |
 | Server authentication packet | Input-packet storage owned by the session | After the application clears the `UserAuth` event. Password and keyboard-interactive fields are borrowed until then. Authentication signatures are scrubbed earlier after verification. |
 | Packet plaintext, decompression output, and channel write buffers | Packet buffers belong to the core session; channel buffers belong to their channel slot | Input/decompression storage on release of a borrowing event or before reuse; output storage only after the caller reports it fully consumed; terminal cleanup/deinit; channel consumption, discard, close, slot reuse, or terminal cleanup |
-| Random source | Borrowed from the caller; MiSSHod does not own its PRNG state | Caller responsibility. MiSSHod clears the exchange seeds it draws, but cannot clear the caller's generator state. |
+| Random source | Borrowed from the caller; sshz does not own its PRNG state | Caller responsibility. sshz clears the exchange seeds it draws, but cannot clear the caller's generator state. |
 
 Public host keys, public X25519 values, negotiation transcripts, and algorithm
 names are not secret, but temporary copies are still bounded and released with
@@ -37,7 +37,7 @@ copying or rejection.
 Slices in events such as `UserAuth`, `RxData`, `RxExtendedData`, banners,
 disconnect descriptions, channel requests, and forwarding requests are
 borrowed. They are valid only until the caller clears, accepts, or rejects that
-event. MiSSHod deliberately does not scrub their backing packet while the event
+event. sshz deliberately does not scrub their backing packet while the event
 is outstanding. Callers must copy data they need later and must not retain or
 read a slice after releasing the event.
 
@@ -65,7 +65,7 @@ CI logs, or reports.
 `std.crypto.secureZero` narrows the exposure window; it does not provide
 process-compromise protection. Compiler-generated copies, register spills,
 cryptographic or zlib internals, allocator metadata/quarantine, and storage
-previously returned to an allocator may retain data outside MiSSHod's direct
+previously returned to an allocator may retain data outside sshz's direct
 control. Optimizing compilers and dependencies form part of the trusted
 computing base.
 

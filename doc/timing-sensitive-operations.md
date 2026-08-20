@@ -1,14 +1,14 @@
 # Timing-sensitive operation inventory
 
 This review tracks the server-authentication portion of
-[issue #62](https://github.com/cataggar/misshod/issues/62). It covers the SSH
+[issue #62](https://github.com/cataggar/sshz/issues/62). It covers the SSH
 server state machine and the `msshd` authorization policy as of July 2026.
 
 ## Inventory
 
 | Operation | Code | Treatment |
 | --- | --- | --- |
-| Packet MAC verification | `src/misshod.zig` `verifyPacketMac` | Compares the fixed-size calculated and received MAC with `std.crypto.timing_safe.eql`. A wrong length is necessarily visible in the packet framing. |
+| Packet MAC verification | `src/sshz.zig` `verifyPacketMac` | Compares the fixed-size calculated and received MAC with `std.crypto.timing_safe.eql`. A wrong length is necessarily visible in the packet framing. |
 | Public-key signature verification | `src/server_session.zig` `handlePacket`; `src/key.zig` `verifySignature` | Parsing, algorithm mismatch, and cryptographic verification failure all enter `SessionState.UserAuthDenied` and produce the same RFC 4252 failure packet. Verification uses Zig's Ed25519/ECDSA/RSA primitives. Algorithm-specific computation is unavoidable because the requested algorithm and key are public wire data. |
 | Authorized-key lookup | `msshd/src/auth.zig` `AuthorizedKeys.allows` and `timingSafeAuthorizedValueEql` | A validated, equal-length candidate is zero-padded to a fixed-size array and compared with `std.crypto.timing_safe.eql`. The full authorized-key list is visited; matching does not exit the loop early. |
 | Password authorization | `msshd/src/auth.zig` `Policy.allows` | Production policies are `deny_all` and `authorized_keys`; neither compares passwords. The username-equals-password comparison exists only in the explicitly named `insecure_demo` policy and is not a production secret check. |

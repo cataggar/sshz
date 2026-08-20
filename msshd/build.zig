@@ -25,12 +25,12 @@ pub fn build(b: *std.Build) void {
 
     // These are diagnostic tools: their traces are the point, so they ask
     // for what the library no longer prints by default.
-    const misshod_dep = b.dependency("misshod", .{
+    const sshz_dep = b.dependency("sshz", .{
         .target = target,
         .optimize = optimize,
         .trace = .info,
     });
-    exe_mod.addImport("misshod", misshod_dep.module("misshod"));
+    exe_mod.addImport("sshz", sshz_dep.module("sshz"));
 
     const exe = b.addExecutable(.{
         .name = "msshd",
@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    auth_test_mod.addImport("misshod", misshod_dep.module("misshod"));
+    auth_test_mod.addImport("sshz", sshz_dep.module("sshz"));
     const auth_tests = b.addTest(.{
         .root_module = auth_test_mod,
     });

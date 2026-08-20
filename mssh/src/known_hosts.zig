@@ -1,6 +1,6 @@
 //! `known_hosts`, backed by a file.
 //!
-//! The parsing, matching, and entry encoding are `misshod.known_hosts`, which
+//! The parsing, matching, and entry encoding are `sshz.known_hosts`, which
 //! does no I/O. This adds the part that is specific to storing the database
 //! in `~/.ssh/known_hosts`: locking, bounded reads, and creating the file and
 //! its directory without a window in which either is world-readable.
@@ -19,14 +19,14 @@
 //!
 //! `checkFile` is unaffected -- it takes a shared lock on an existing file --
 //! and every pure operation works everywhere. An embedder that wants
-//! `known_hosts` on Windows should use `misshod.known_hosts` against bytes it
+//! `known_hosts` on Windows should use `sshz.known_hosts` against bytes it
 //! read itself.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const misshod = @import("misshod");
+const sshz = @import("sshz");
 
-const known_hosts = misshod.known_hosts;
+const known_hosts = sshz.known_hosts;
 
 pub const Match = known_hosts.Match;
 pub const max_file_size = known_hosts.max_file_size;

@@ -7,7 +7,7 @@ comptime {
     _ = @import("hasher.zig");
     _ = @import("aesctr.zig");
     _ = @import("protocol.zig");
-    _ = @import("misshod.zig");
+    _ = @import("sshz.zig");
     _ = @import("channel.zig");
     _ = @import("key.zig");
     _ = @import("known_hosts.zig");

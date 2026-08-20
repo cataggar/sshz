@@ -3,7 +3,7 @@
     .version = "0.1.0",
     .fingerprint = 0xf9c4e594f592e3c3,
     .dependencies = .{
-        .misshod = .{ .path = ".." },
+        .sshz = .{ .path = ".." },
     },
     .paths = .{
         "build.zig",

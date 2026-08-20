@@ -1,5 +1,5 @@
 const std = @import("std");
-const misshod = @import("misshod");
+const sshz = @import("sshz");
 
 const MiB: u64 = 1024 * 1024;
 const channel_count = 4;
@@ -175,8 +175,8 @@ fn fillPayload(buf: []u8, seed: u64, direction: Direction, channel: usize, offse
 }
 
 const Pair = struct {
-    client: misshod.MisshodClient,
-    server: misshod.MisshodServer,
+    client: sshz.SshzClient,
+    server: sshz.SshzServer,
     c2s: BytePipe = .{},
     s2c: BytePipe = .{},
     transport_state: u64,
@@ -202,10 +202,10 @@ const Pair = struct {
         server_random: std.Random,
         transport_seed: u64,
         allocator: std.mem.Allocator,
-        client_limits: misshod.ResourceLimits,
-        server_limits: misshod.ResourceLimits,
+        client_limits: sshz.ResourceLimits,
+        server_limits: sshz.ResourceLimits,
     ) !Pair {
-        var client = try misshod.MisshodClient.initWithLimits(
+        var client = try sshz.SshzClient.initWithLimits(
             client_random,
             "stress-user",
             allocator,
@@ -213,7 +213,7 @@ const Pair = struct {
         );
         errdefer client.deinit();
         try client.setTryNoneAuth(true);
-        var server = try misshod.MisshodServer.initWithLimits(
+        var server = try sshz.SshzServer.initWithLimits(
             server_random,
             host_key,
             allocator,
@@ -468,7 +468,7 @@ const Pair = struct {
     }
 };
 
-fn stressLimits(rekey_after_bytes: ?u64) misshod.ResourceLimits {
+fn stressLimits(rekey_after_bytes: ?u64) sshz.ResourceLimits {
     return .{
         .initial_channel_window = 2 * chunk_size,
         .max_channel_window = 2 * chunk_size,
@@ -836,7 +836,7 @@ pub fn main(init: std.process.Init) !void {
     };
     const started = std.Io.Clock.Timestamp.now(init.io, .awake);
 
-    std.debug.print("misshod deterministic stress seed={d}\n", .{seed});
+    std.debug.print("sshz deterministic stress seed={d}\n", .{seed});
     std.debug.print(
         "acceptance cycles=100 channels=4 bytes_per_direction={d} race_schedules=8 rekey_threshold_bytes={d}\n",
         .{ transfer_bytes_per_direction, 2 * MiB },

@@ -43,10 +43,10 @@ jobs:
         peer: [openssh]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout misshod
+      - name: Checkout sshz
         uses: actions/checkout@v5
         with:
-          path: misshod
+          path: sshz
       - &install-zig
         name: Install Zig
         shell: bash
@@ -66,15 +66,15 @@ jobs:
           sudo apt-get install -y dropbear-bin gcc libssh-dev openssh-client openssh-server pkg-config time
           sudo mkdir -p /run/sshd
       - name: Run 20-minute OpenSSH soak
-        working-directory: misshod
+        working-directory: sshz
         env:
-          MISSHOD_SOAK_ARTIFACTS: ${{ runner.temp }}/misshod-soak
+          SSHZ_SOAK_ARTIFACTS: ${{ runner.temp }}/sshz-soak
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/misshod-soak-safe"
+          mkdir -p "${RUNNER_TEMP}/sshz-soak-safe"
           zig build soak -Doptimize=ReleaseSafe -- \
             --duration-seconds 1200 --seed 1751547392 --peer "${{ matrix.peer }}" \
-            2>&1 | tee "${RUNNER_TEMP}/misshod-soak-safe/soak.log"
+            2>&1 | tee "${RUNNER_TEMP}/sshz-soak-safe/soak.log"
       - &upload-safe
         name: Upload safe failure diagnostics
         if: failure()
@@ -82,8 +82,8 @@ jobs:
         with:
           name: soak-failure-${{ github.job }}-${{ matrix.peer }}
           path: |
-            ${{ runner.temp }}/misshod-soak-safe/soak.log
-            ${{ runner.temp }}/misshod-soak/**/logs/**
+            ${{ runner.temp }}/sshz-soak-safe/soak.log
+            ${{ runner.temp }}/sshz-soak/**/logs/**
           if-no-files-found: ignore
           retention-days: 7
 
@@ -96,22 +96,22 @@ jobs:
         peer: [dropbear, libssh]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout misshod
+      - name: Checkout sshz
         uses: actions/checkout@v5
         with:
-          path: misshod
+          path: sshz
       - *install-zig
       - *install-peers
       - name: Run 20-minute extended peer soak
-        working-directory: misshod
+        working-directory: sshz
         env:
-          MISSHOD_SOAK_ARTIFACTS: ${{ runner.temp }}/misshod-soak
+          SSHZ_SOAK_ARTIFACTS: ${{ runner.temp }}/sshz-soak
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/misshod-soak-safe"
+          mkdir -p "${RUNNER_TEMP}/sshz-soak-safe"
           zig build soak -Doptimize=ReleaseSafe -- \
             --duration-seconds 1200 --seed 1751547392 --peer "${{ matrix.peer }}" \
-            2>&1 | tee "${RUNNER_TEMP}/misshod-soak-safe/soak.log"
+            2>&1 | tee "${RUNNER_TEMP}/sshz-soak-safe/soak.log"
       - *upload-safe
 
   manual:
@@ -123,22 +123,22 @@ jobs:
         peer: ["${{ inputs.peer }}"]
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout misshod
+      - name: Checkout sshz
         uses: actions/checkout@v5
         with:
-          path: misshod
+          path: sshz
       - *install-zig
       - *install-peers
       - name: Run selected manual soak
-        working-directory: misshod
+        working-directory: sshz
         env:
-          MISSHOD_SOAK_ARTIFACTS: ${{ runner.temp }}/misshod-soak
+          SSHZ_SOAK_ARTIFACTS: ${{ runner.temp }}/sshz-soak
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/misshod-soak-safe"
+          mkdir -p "${RUNNER_TEMP}/sshz-soak-safe"
           zig build soak -Doptimize=ReleaseSafe -- \
             --duration-seconds "${{ inputs.duration_seconds }}" \
             --seed "${{ inputs.seed }}" \
             --peer "${{ matrix.peer }}" \
-            2>&1 | tee "${RUNNER_TEMP}/misshod-soak-safe/soak.log"
+            2>&1 | tee "${RUNNER_TEMP}/sshz-soak-safe/soak.log"
       - *upload-safe

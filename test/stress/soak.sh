@@ -76,7 +76,7 @@ else
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ARTIFACT_ROOT="${MISSHOD_SOAK_ARTIFACTS:-$ROOT/.zig-cache/misshod-soak}"
+ARTIFACT_ROOT="${SSHZ_SOAK_ARTIFACTS:-$ROOT/.zig-cache/sshz-soak}"
 mkdir -p "$ARTIFACT_ROOT"
 
 started="$(date +%s)"
@@ -137,7 +137,7 @@ run_peer() {
     run_measured "interop-$PEER" env "${env_args[@]}" bash "$ROOT/interop/run.sh"
 }
 
-printf 'misshod soak seed=%s duration_seconds=%s peer=%s\n' "$SEED" "$DURATION_SECONDS" "$PEER"
+printf 'sshz soak seed=%s duration_seconds=%s peer=%s\n' "$SEED" "$DURATION_SECONDS" "$PEER"
 printf 'rerun: zig build soak -Doptimize=ReleaseSafe -- --duration-seconds %s --seed %s --peer %s\n' \
     "$DURATION_SECONDS" "$SEED" "$PEER"
 printf 'artifacts: only */logs directories are safe for CI upload\n'

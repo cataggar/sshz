@@ -1,5 +1,5 @@
 const std = @import("std");
-const misshod = @import("misshod");
+const sshz = @import("sshz");
 
 pub const MaxAuthorizedKeysFileBytes = 1024 * 1024;
 pub const MaxAuthorizedKeysLineBytes = 8192;
@@ -308,7 +308,7 @@ fn validateKeyBlob(blob: []const u8, expected_kind: ?KeyKind) BlobValidationErro
     }
 
     if (position != blob.len) return error.MalformedKeyBlob;
-    misshod.validateUserPublicKeyBlob(blob) catch return error.MalformedKeyBlob;
+    sshz.validateUserPublicKeyBlob(blob) catch return error.MalformedKeyBlob;
     return kind;
 }
 

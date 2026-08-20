@@ -381,8 +381,8 @@ test "decode OpenSSH private key algorithms and sign/verify" {
 
         var sig_blob: Key.SignatureBlob = .{};
         defer sig_blob.clear();
-        const sig = try private_key.sign(private_key.defaultSignatureAlgorithm(), "misshod message", &sig_blob);
-        try Key.verifySignature(public_key, sig, "misshod message");
+        const sig = try private_key.sign(private_key.defaultSignatureAlgorithm(), "sshz message", &sig_blob);
+        try Key.verifySignature(public_key, sig, "sshz message");
         try std.testing.expectError(Key.KeyError.InvalidSignature, Key.verifySignature(public_key, sig, "tampered message"));
     }
 }

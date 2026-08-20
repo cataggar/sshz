@@ -1,6 +1,6 @@
 # Stress and soak testing
 
-The required stress test drives `MisshodClient` and `MisshodServer` through
+The required stress test drives `SshzClient` and `SshzServer` through
 their public APIs over a deterministic, in-memory full-duplex transport. Core
 acceptance does not depend on the `mssh` or `msshd` process lifecycle.
 
@@ -88,7 +88,7 @@ scenario byte counts, hashes, window counts, and endpoint epochs. A hash or
 ordering failure identifies a deterministic library/transport failure rather
 than a shell-process timing failure.
 
-Set `MISSHOD_SOAK_ARTIFACTS` to choose an artifact root. The interop fixture
+Set `SSHZ_SOAK_ARTIFACTS` to choose an artifact root. The interop fixture
 retains its existing per-run logs and runtime directory on failure. **Only
 `*/logs/**` and the top-level stress/soak console log are approved for CI
 upload.** Never upload the artifact root or runtime/private directories: they

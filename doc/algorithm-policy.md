@@ -3,8 +3,8 @@
 ## Status and scope
 
 This document defines the algorithm allowlist intended for a future production
-MiSSHod release and records what the current implementation actually enforces.
-It is not a production-readiness claim. **MiSSHod is not secure and must not be
+sshz release and records what the current implementation actually enforces.
+It is not a production-readiness claim. **sshz is not secure and must not be
 used in real-world systems.** See the [production threat model](threat-model.md)
 for the wider security boundary and release blockers.
 
@@ -19,7 +19,7 @@ used below have these meanings:
 
 ## Current transport allowlist
 
-MiSSHod has no API for broadening these lists at runtime.
+sshz has no API for broadening these lists at runtime.
 
 | Purpose | SSH name and construction | Role and direction | Current rationale and status |
 | --- | --- | --- | --- |
@@ -42,7 +42,7 @@ It is not accepted as a signature algorithm: RSA signatures use PKCS#1 v1.5
 with SHA-512 or SHA-256 under the `rsa-sha2-*` names.
 
 The same signature families are accepted for server-side public-key user
-authentication. The MiSSHod client signs user authentication with Ed25519,
+authentication. The sshz client signs user authentication with Ed25519,
 ECDSA P-256/SHA-256, or RSA/SHA-512 according to the loaded key; it does not
 currently negotiate an RSA/SHA-256 fallback from `server-sig-algs`.
 
@@ -110,7 +110,7 @@ Compression selection follows client order. The exchange hash and host
 signature checks prevent an unauthenticated algorithm substitution when the
 embedding client also validates the host identity.
 
-When a peer sets `first_kex_packet_follows`, MiSSHod compares that peer's first
+When a peer sets `first_kex_packet_follows`, sshz compares that peer's first
 KEX and host-key names with the negotiated pair. A wrong guess causes exactly
 the following packet to be discarded; a correct guess is processed normally.
 Malformed packets are not treated as guesses. The client also binds every
@@ -160,7 +160,7 @@ be reset safely when algorithms change during rekey.
 Delayed compression can still expose post-authentication secrets when an
 attacker can influence plaintext compressed in the same stream. Embedders must
 not combine secrets with attacker-controlled reflection in a compressed
-channel. **Gap:** MiSSHod advertises delayed zlib before `none` and offers no
+channel. **Gap:** sshz advertises delayed zlib before `none` and offers no
 application control to disable it. The production review must either provide a
 safe opt-out/default and deployment guidance or remove delayed compression
 from the production allowlist.
@@ -202,11 +202,11 @@ clock, and close the transport after terminal errors.
 
 ## Dependencies and randomness
 
-MiSSHod currently has no package dependency in `build.zig.zon`. It depends on:
+sshz currently has no package dependency in `build.zig.zon`. It depends on:
 
 - Zig standard-library implementations of SHA-2, HMAC, X25519, Ed25519,
   ECDSA P-256, AES, bcrypt, and finite-field operations used for RSA;
-- MiSSHod's own AES-CTR state wrapper, SSH key derivation, RSA PKCS#1 v1.5
+- sshz's own AES-CTR state wrapper, SSH key derivation, RSA PKCS#1 v1.5
   encoding, parsing, and protocol composition;
 - system zlib for `zlib@openssh.com`; and
 - a cryptographically secure `std.Random` supplied by the embedding
@@ -299,6 +299,6 @@ The algorithm-policy part of a production release is complete only when:
 - the algorithm review finds no unresolved critical or high-severity issue.
 
 These criteria satisfy only the algorithm-policy slice of
-[issue #66](https://github.com/cataggar/misshod/issues/66). Every other blocker
+[issue #66](https://github.com/cataggar/sshz/issues/66). Every other blocker
 in the [production threat model](threat-model.md#production-release-blockers)
 must also be cleared. The README production warning must remain until then.
