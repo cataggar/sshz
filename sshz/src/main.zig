@@ -636,17 +636,17 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .GetKeyPassphrase => {
                                 var password_buf: [128]u8 = undefined;
-                                try sshz.setPrivateKeyPassphrase(try envOrReadPassphrase(init, "MSSH_KEY_PASSPHRASE", "Password for private key decrypt: ", &password_buf));
+                                try sshz.setPrivateKeyPassphrase(try envOrReadPassphrase(init, "SSHZ_KEY_PASSPHRASE", "Password for private key decrypt: ", &password_buf));
                                 try sshz.clearEvent(eventCode);
                             },
                             .GetAuthPassphrase => {
                                 var password_buf: [128]u8 = undefined;
-                                try sshz.setAuthPassphrase(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", "Password for auth: ", &password_buf));
+                                try sshz.setAuthPassphrase(try envOrReadPassphrase(init, "SSHZ_AUTH_PASSWORD", "Password for auth: ", &password_buf));
                                 try sshz.clearEvent(eventCode);
                             },
                             .KeyboardInteractive => |prompt| {
                                 var password_buf: [128]u8 = undefined;
-                                try sshz.session.setKeyboardInteractiveResponse(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", prompt.prompt, &password_buf));
+                                try sshz.session.setKeyboardInteractiveResponse(try envOrReadPassphrase(init, "SSHZ_AUTH_PASSWORD", prompt.prompt, &password_buf));
                                 try sshz.clearEvent(eventCode);
                             },
                             .ChannelOpened,

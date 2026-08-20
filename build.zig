@@ -30,8 +30,8 @@ fn linkZlib(b: *std.Build, mod: *std.Build.Module) void {
 /// How much the library is allowed to print.
 ///
 /// `off` by default because an application that links sshz owns its own
-/// stderr -- and, if it draws a terminal UI, its own screen. `mssh` and
-/// `msshd` ask for `info`.
+/// stderr -- and, if it draws a terminal UI, its own screen. `sshz` and
+/// `sshzd` ask for `info`.
 pub const TraceLevel = enum { off, info, debug };
 
 /// What a build gets when it does not ask. Named so `trace_off_test` can

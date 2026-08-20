@@ -25,7 +25,7 @@ zig build production-examples
 ```
 
 See [getting started](doc/getting-started.md) for library commands and the
-`mssh` and `msshd` demo programs.
+`sshz` and `sshzd` demo programs.
 
 ## Documentation
 
@@ -42,5 +42,5 @@ See [getting started](doc/getting-started.md) for library commands and the
 
 sshz is pre-1.0, and its API may change between minor releases. The
 [release checklist](doc/release-checklist.md) defines the evidence and review
-required for a supported release. `mssh` and `msshd` are interoperability demos,
+required for a supported release. `sshz` and `sshzd` are interoperability demos,
 not deployment templates.

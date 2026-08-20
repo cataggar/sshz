@@ -19,7 +19,7 @@ const TraceLevel = enum {
 /// A library does not get to decide that its host writes to stderr. `.Info`
 /// fires during entirely successful sessions -- stock OpenSSH sends a global
 /// request sshz does not handle, every time -- and an application that
-/// owns the terminal has its screen corrupted by it. `mssh` and `msshd` ask
+/// owns the terminal has its screen corrupted by it. `sshz` and `sshzd` ask
 /// for `info` in their own `build.zig`, so their output is unchanged.
 const trace_level: TraceLevel = blk: {
     const name = build_options.trace_level;

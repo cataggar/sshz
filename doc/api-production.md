@@ -5,7 +5,7 @@
 This document describes the intended embedding boundary; it is not a release
 or support claim. The [threat model](threat-model.md) records unresolved
 release blockers, and the [release checklist](release-checklist.md) defines
-the evidence required for a supported release. `mssh` and `msshd` are demos,
+the evidence required for a supported release. `sshz` and `sshzd` are demos,
 not deployment templates. The examples under
 [`examples/production/`](../examples/production/) demonstrate fail-closed
 integration patterns.

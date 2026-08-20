@@ -11,11 +11,11 @@ The model applies to the client and server library in `src/` when embedded in an
 application. The checked-in programs are deliberately not production
 implementations:
 
-- `mssh` is an integration example. It verifies a bounded `known_hosts` file
+- `sshz` is an integration example. It verifies a bounded `known_hosts` file
   strictly by default, but it can read credentials from environment variables
   and offers explicitly unsafe demo host-key acceptance. Agent forwarding is
   off by default but can be enabled explicitly.
-- `msshd` is a toy, single-connection-at-a-time echo server. It rejects all
+- `sshzd` is a toy, single-connection-at-a-time echo server. It rejects all
   authentication by default and can load a bounded `authorized_keys` file, but
   it also offers an explicitly unsafe demo mode that accepts every
   cryptographically valid public key and uses `password == username`.
@@ -152,7 +152,7 @@ This prevents an unauthenticated network attacker from impersonating a server
 only when the application validates that key against an independently trusted
 identity.
 
-`mssh` applies a bounded `known_hosts` policy and fails closed by default; its
+`sshz` applies a bounded `known_hosts` policy and fails closed by default; its
 unsafe behavior requires an explicit demo flag. The core API requires an
 explicit accept or reject decision and exposes typed rejection. It still
 delegates hostname, port, alias, trust-store, and replacement policy to the
@@ -171,13 +171,13 @@ the presented private key before the server application makes its authorization
 decision. These protections still rely on correct host-key validation.
 
 The server library deliberately delegates account policy to its application.
-`msshd` now fails closed by default and can authorize complete public-key blobs
+`sshzd` now fails closed by default and can authorize complete public-key blobs
 from a bounded `authorized_keys` file; its legacy unsafe behavior requires an
 explicit demo flag. Per-user policy integration, configurable method
 advertisement, and complete keyboard-interactive server behavior remain
 unfinished. Passwords and key passphrases are copied into session memory;
-`mssh` optionally obtains them from environment variables. Agent forwarding is
-disabled by default in `mssh`, but enabling it gives the authenticated server
+`sshz` optionally obtains them from environment variables. Agent forwarding is
+disabled by default in `sshz`, but enabling it gives the authenticated server
 access to the local agent for the session and must be limited to trusted
 servers.
 

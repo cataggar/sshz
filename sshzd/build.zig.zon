@@ -1,7 +1,7 @@
 .{
-    .name = .mssh,
+    .name = .sshzd,
     .version = "0.1.0",
-    .fingerprint = 0xf9c4e594f592e3c3,
+    .fingerprint = 0xd811ccd545c2a0f4,
     .dependencies = .{
         .sshz = .{ .path = ".." },
     },

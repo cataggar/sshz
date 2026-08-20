@@ -79,7 +79,7 @@ supported only when a release marks every required cell green.
 | Platform | Architecture | CI today | Production-release requirement | Current status |
 | --- | --- | --- | --- | --- |
 | Linux (Ubuntu runner, glibc) | x86_64 | Unit/root builds, malformed corpus, deterministic stress, OpenSSH/Dropbear/libssh interop; scheduled soak | Debug + ReleaseSafe, fuzz/sanitizer evidence, interop and soak | Candidate coverage only |
-| macOS runner | arm64 or x86_64, as supplied by GitHub | Unit/root, library, `mssh`, and `msshd` builds | Debug + ReleaseSafe, platform lifecycle/cleanup tests and supported-peer interop | Candidate coverage only |
+| macOS runner | arm64 or x86_64, as supplied by GitHub | Unit/root, library, `sshz`, and `sshzd` builds | Debug + ReleaseSafe, platform lifecycle/cleanup tests and supported-peer interop | Candidate coverage only |
 | Linux | arm64 | None required today | Native unit/malformed/stress/interop/soak plus resource budgets | Unsupported |
 | Windows | x86_64/arm64 | None | Port, native lifecycle tests, zlib/toolchain packaging, interop, security review | Unsupported |
 | BSD/other Unix | any | None | Native full matrix and documented dependency/toolchain support | Unsupported |

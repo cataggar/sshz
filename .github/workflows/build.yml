@@ -119,14 +119,14 @@ jobs:
       - name: Build lib
         run: zig build
         working-directory: sshz
-      - name: Build mssh
+      - name: Build sshz
         if: runner.os != 'Windows'
         run: zig build
-        working-directory: sshz/mssh
-      - name: Build msshd
+        working-directory: sshz/sshz
+      - name: Build sshzd
         if: runner.os != 'Windows'
         run: zig build
-        working-directory: sshz/msshd
+        working-directory: sshz/sshzd
       - name: Install interop dependencies
         if: runner.os == 'Linux'
         run: |
@@ -138,9 +138,9 @@ jobs:
         run: zig build interop
         working-directory: sshz
         env:
-          MSSH_INTEROP_ARTIFACTS: ${{ runner.temp }}/sshz-interop
-          MSSH_INTEROP_REQUIRE_DROPBEAR: "1"
-          MSSH_INTEROP_REQUIRE_LIBSSH: "1"
+          SSHZ_INTEROP_ARTIFACTS: ${{ runner.temp }}/sshz-interop
+          SSHZ_INTEROP_REQUIRE_DROPBEAR: "1"
+          SSHZ_INTEROP_REQUIRE_LIBSSH: "1"
       - name: Upload interop failure logs
         if: failure() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4

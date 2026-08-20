@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("sshz", sshz_dep.module("sshz"));
 
     const exe = b.addExecutable(.{
-        .name = "mssh",
+        .name = "sshz",
         .root_module = exe_mod,
     });
 
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_known_hosts_tests = b.addRunArtifact(known_hosts_tests);
-    const test_step = b.step("test", "Run mssh tests");
+    const test_step = b.step("test", "Run sshz tests");
     test_step.dependOn(&run_known_hosts_tests.step);
 }
 
