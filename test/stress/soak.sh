@@ -119,17 +119,17 @@ run_peer() {
     local iteration_seed="$1"
     local peer_artifacts="$ARTIFACT_ROOT/${PEER}-${iteration}-${iteration_seed}"
     local -a env_args=(
-        "MSSH_INTEROP_ARTIFACTS=$peer_artifacts"
-        "MSSH_INTEROP_TIMEOUT=30"
+        "SSHZ_INTEROP_ARTIFACTS=$peer_artifacts"
+        "SSHZ_INTEROP_TIMEOUT=30"
     )
     case "$PEER" in
         openssh) ;;
-        dropbear) env_args+=("MSSH_INTEROP_REQUIRE_DROPBEAR=1") ;;
-        libssh) env_args+=("MSSH_INTEROP_REQUIRE_LIBSSH=1") ;;
+        dropbear) env_args+=("SSHZ_INTEROP_REQUIRE_DROPBEAR=1") ;;
+        libssh) env_args+=("SSHZ_INTEROP_REQUIRE_LIBSSH=1") ;;
         all)
             env_args+=(
-                "MSSH_INTEROP_REQUIRE_DROPBEAR=1"
-                "MSSH_INTEROP_REQUIRE_LIBSSH=1"
+                "SSHZ_INTEROP_REQUIRE_DROPBEAR=1"
+                "SSHZ_INTEROP_REQUIRE_LIBSSH=1"
             )
             ;;
         internal) return ;;

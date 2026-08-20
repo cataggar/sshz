@@ -2,7 +2,7 @@
 
 The required stress test drives `SshzClient` and `SshzServer` through
 their public APIs over a deterministic, in-memory full-duplex transport. Core
-acceptance does not depend on the `mssh` or `msshd` process lifecycle.
+acceptance does not depend on the `sshz` or `sshzd` process lifecycle.
 
 ## Commands
 

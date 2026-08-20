@@ -186,7 +186,7 @@ fn acceptNewAt(
     raw_key: []const u8,
 ) !AcceptResult {
     // The exclusive lock covers both the recheck and append so concurrent
-    // mssh processes cannot add duplicates or replace a key that just changed.
+    // sshz processes cannot add duplicates or replace a key that just changed.
     var file = try openLockedForUpdate(io, dir, path);
     defer file.close(io);
     try file.setPermissions(io, private_file);

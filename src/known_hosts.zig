@@ -17,7 +17,7 @@
 //! `known_hosts` file and `encodeEntry` produces the line that would trust a
 //! new key; where those bytes come from and where the line goes are the
 //! caller's, which is what keeps this module usable on a target that has no
-//! filesystem at all. `mssh/src/known_hosts.zig` is the file-backed version,
+//! filesystem at all. `sshz/src/known_hosts.zig` is the file-backed version,
 //! and is a small enough wrapper to be worth copying rather than depending on
 //! if your storage is not `~/.ssh/known_hosts`.
 //!

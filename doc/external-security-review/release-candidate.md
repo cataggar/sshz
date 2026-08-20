@@ -149,10 +149,10 @@ zig build malformed -Doptimize=ReleaseSafe -Dunsafe-secret-tracing=false \
   | tee "$EVIDENCE_DIR/malformed-release-safe.log"
 zig build -Doptimize=ReleaseSafe -Dunsafe-secret-tracing=false 2>&1 \
   | tee "$EVIDENCE_DIR/library-release-safe.log"
-(cd mssh && zig build -Doptimize=ReleaseSafe) \
-  2>&1 | tee "$EVIDENCE_DIR/mssh-release-safe.log"
-(cd msshd && zig build -Doptimize=ReleaseSafe) \
-  2>&1 | tee "$EVIDENCE_DIR/msshd-release-safe.log"
+(cd sshz && zig build -Doptimize=ReleaseSafe) \
+  2>&1 | tee "$EVIDENCE_DIR/sshz-release-safe.log"
+(cd sshzd && zig build -Doptimize=ReleaseSafe) \
+  2>&1 | tee "$EVIDENCE_DIR/sshzd-release-safe.log"
 
 /usr/bin/time \
   -f "resource elapsed_seconds=%e max_rss_kib=%M exit=%x" \
@@ -160,10 +160,10 @@ zig build -Doptimize=ReleaseSafe -Dunsafe-secret-tracing=false 2>&1 \
   zig build stress -Doptimize=ReleaseSafe -Dunsafe-secret-tracing=false -- \
     --seed 1751547392 2>&1 | tee "$EVIDENCE_DIR/stress/stress.log"
 
-MSSH_INTEROP_ARTIFACTS="$EVIDENCE_DIR/interop" \
-MSSH_INTEROP_KEEP_ARTIFACTS=1 \
-MSSH_INTEROP_REQUIRE_DROPBEAR=1 \
-MSSH_INTEROP_REQUIRE_LIBSSH=1 \
+SSHZ_INTEROP_ARTIFACTS="$EVIDENCE_DIR/interop" \
+SSHZ_INTEROP_KEEP_ARTIFACTS=1 \
+SSHZ_INTEROP_REQUIRE_DROPBEAR=1 \
+SSHZ_INTEROP_REQUIRE_LIBSSH=1 \
 zig build interop 2>&1 | tee "$EVIDENCE_DIR/interop.log"
 
 find "$EVIDENCE_DIR" -type f ! -name SHA256SUMS -print0 \
