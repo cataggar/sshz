@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("misshod_build_options");
+const build_options = @import("sshz_build_options");
 const BufferReader = @import("buffer.zig").BufferReader;
 const BufferWriter = @import("buffer.zig").BufferWriter;
 
@@ -18,7 +18,7 @@ const TraceLevel = enum {
 ///
 /// A library does not get to decide that its host writes to stderr. `.Info`
 /// fires during entirely successful sessions -- stock OpenSSH sends a global
-/// request misshod does not handle, every time -- and an application that
+/// request sshz does not handle, every time -- and an application that
 /// owns the terminal has its screen corrupted by it. `mssh` and `msshd` ask
 /// for `info` in their own `build.zig`, so their output is unchanged.
 const trace_level: TraceLevel = blk: {

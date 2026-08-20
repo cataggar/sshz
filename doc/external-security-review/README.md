@@ -2,12 +2,12 @@
 
 ## Status and use
 
-This package prepares an external review of a pinned MiSSHod release candidate.
+This package prepares an external review of a pinned sshz release candidate.
 It is a scope and evidence request, not evidence that a reviewer has been
 engaged, that a review has finished, or that any finding or approval exists.
-MiSSHod remains experimental and is not suitable for production use.
+sshz remains experimental and is not suitable for production use.
 No independent external review has occurred. The work in
-[issue #70](https://github.com/cataggar/misshod/issues/70) remains blocked on
+[issue #70](https://github.com/cataggar/sshz/issues/70) remains blocked on
 engaging an external reviewer and creating the signed, pinned release candidate
 required by this package.
 
@@ -30,7 +30,7 @@ accepted risks.
 
 ## Architecture and data flow
 
-MiSSHod is a client/server SSH library over an application-owned reliable,
+sshz is a client/server SSH library over an application-owned reliable,
 ordered byte stream. It neither opens sockets nor supplies deployment policy.
 
 ```text
@@ -38,9 +38,9 @@ untrusted peer/network bytes
         |
 application transport loop (socket, deadlines, concurrency, rate limits)
         |
-MisshodClient / MisshodServer event and readiness API (src/misshod.zig)
+SshzClient / SshzServer event and readiness API (src/sshz.zig)
         |
-identification + packet framing/MAC/compression (src/misshod.zig,
+identification + packet framing/MAC/compression (src/sshz.zig,
 src/protocol.zig, src/buffer.zig)
         |
 client/server protocol state machine (src/client_session.zig,
@@ -124,7 +124,7 @@ the production library implementation and its tests:
 
 | Code | In-scope responsibility |
 | --- | --- |
-| `src/misshod.zig` | Public event/readiness API; identification and packet I/O; framing, encryption/MAC verification, host-key and application decision APIs; channel/forwarding entry points |
+| `src/sshz.zig` | Public event/readiness API; identification and packet I/O; framing, encryption/MAC verification, host-key and application decision APIs; channel/forwarding entry points |
 | `src/client_session.zig` | Client KEX/rekey, host identity, authentication, global requests, channel/agent handling, and state transitions |
 | `src/server_session.zig` | Server KEX/rekey, host signing, authentication proof/application handoff, global requests, channel/agent handling, and state transitions |
 | `src/protocol.zig` | SSH constants and bounds, packet/key derivation, centralized algorithm offer validation and client-order selection, system-zlib streams, wrap/unwrap support |
@@ -241,7 +241,7 @@ added to a signed scope amendment:
   infrastructure and fixtures;
 - generated `.zig-cache/`, `zig-out/`, local evidence, and editor files;
 - internal correctness of Zig cryptographic primitives, the compiler, libc,
-  system zlib, OpenSSH, Dropbear, and libssh. MiSSHod's selection, composition,
+  system zlib, OpenSSH, Dropbear, and libssh. sshz's selection, composition,
   inputs, outputs, and failure handling remain in scope;
 - unimplemented SSH algorithms, extensions, services, and application
   protocols;
@@ -251,5 +251,5 @@ added to a signed scope amendment:
   of the selected primitives.
 
 An exclusion is not an accepted risk. If review work shows an excluded
-component is necessary to support a MiSSHod security claim, maintainers must
+component is necessary to support a sshz security claim, maintainers must
 amend and re-pin the scope before relying on that claim.

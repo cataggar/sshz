@@ -10,7 +10,7 @@ const util = @import("util.zig");
 comptime {
     if (util.traces_are_printed) {
         @compileError("default builds must not print traces: an application that " ++
-            "links misshod owns its own stderr, and a terminal UI owns its screen");
+            "links sshz owns its own stderr, and a terminal UI owns its screen");
     }
 }
 

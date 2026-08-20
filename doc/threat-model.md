@@ -2,9 +2,9 @@
 
 ## Status
 
-This document describes the security boundary of the current MiSSHod repository
+This document describes the security boundary of the current sshz repository
 and the work required before a production release. It is not a statement that
-MiSSHod is production-ready. **MiSSHod is not secure and must not be used in
+sshz is production-ready. **sshz is not secure and must not be used in
 real-world systems.**
 
 The model applies to the client and server library in `src/` when embedded in an
@@ -25,13 +25,13 @@ implementations:
 GitHub issue state is authoritative for tracked work. A link below means that
 the gap is tracked; it does not mean the issue is fixed or closed. In
 particular, no independent external security review has occurred. The review
-requested by [#70](https://github.com/cataggar/misshod/issues/70) remains
+requested by [#70](https://github.com/cataggar/sshz/issues/70) remains
 blocked on engaging an external reviewer and pinning a signed release
 candidate.
 
 ## Intended users and deployment modes
 
-Today, MiSSHod is intended for protocol study, testing, interoperability work,
+Today, sshz is intended for protocol study, testing, interoperability work,
 and embedders prepared to audit the implementation. It is not intended for
 production operators or end users until the [release blockers](#production-release-blockers)
 are cleared.
@@ -114,7 +114,7 @@ protections.
 Credential files, environment variables, the SSH agent socket, allocator,
 logging, crash dumps, and transport file descriptors cross from the process
 into the host OS. Their permissions and lifecycle are operator
-responsibilities. MiSSHod relies on Zig standard-library cryptography and system
+responsibilities. sshz relies on Zig standard-library cryptography and system
 zlib; those implementations, the compiler, and the build/dependency chain are
 trusted dependencies.
 
@@ -137,7 +137,7 @@ The model includes attackers who can:
   deployment's OS policy, such as carelessly exposed environment variables.
 
 The model does not assume that attackers can break the underlying cryptographic
-primitives. Compromise of the MiSSHod process, privileged OS access, malicious
+primitives. Compromise of the sshz process, privileged OS access, malicious
 build inputs, or physical/hardware attacks is outside the library's defensive
 boundary.
 
@@ -160,8 +160,8 @@ application. Rekey does not prompt again: after signature verification, the clie
 compares the complete host-key blob with the initially application-approved
 identity and fails with `HostKeyChanged` on any change. Remaining
 production-safe host-trust and integration work is tracked by
-[#65](https://github.com/cataggar/misshod/issues/65), with negotiation policy
-covered by [#66](https://github.com/cataggar/misshod/issues/66).
+[#65](https://github.com/cataggar/sshz/issues/65), with negotiation policy
+covered by [#66](https://github.com/cataggar/sshz/issues/66).
 
 ### Authentication, credential theft, and agent forwarding
 
@@ -186,10 +186,10 @@ public-key, and keyboard-interactive requests. Applications resolve them with
 an atomic allow/deny decision; undecided clears deny, and public-key probes
 require policy approval without authenticating. The sample server defaults to
 deny-all and provides a bounded `authorized_keys` policy. Review and release
-evidence remain tracked by [#64](https://github.com/cataggar/misshod/issues/64).
+evidence remain tracked by [#64](https://github.com/cataggar/sshz/issues/64).
 Credential ownership, zeroization, and logging are tracked by
-[#63](https://github.com/cataggar/misshod/issues/63); safe integration guidance
-is tracked by [#69](https://github.com/cataggar/misshod/issues/69).
+[#63](https://github.com/cataggar/sshz/issues/63); safe integration guidance
+is tracked by [#69](https://github.com/cataggar/sshz/issues/69).
 
 ### Timing side channels
 
@@ -199,7 +199,7 @@ rule uses ordinary equality and authentication failure paths may have
 distinguishable work and errors. Constant-time behavior of all relevant
 library and dependency operations has not been established. This remains a
 production blocker tracked by
-[#62](https://github.com/cataggar/misshod/issues/62).
+[#62](https://github.com/cataggar/sshz/issues/62).
 
 ### Algorithm negotiation and downgrade
 
@@ -224,7 +224,7 @@ both roles use it, and selection follows the client's order independently for
 each category and direction. Its remaining complete key validation,
 strict-KEX decision, vectors, compression default, and dependency decisions
 remain release blockers under
-[#66](https://github.com/cataggar/misshod/issues/66).
+[#66](https://github.com/cataggar/sshz/issues/66).
 
 ### Malformed packets and state-machine attacks
 
@@ -245,7 +245,7 @@ The pinned Zig 0.16 fuzz runner currently cannot compile because its
 `builtin.StackTrace` type is incompatible with the `debug.StackTrace` expected
 by `std.debug.writeStackTrace`; the deterministic corpus is used until that
 compiler defect is resolved. Broader parser/state assurance remains tracked by
-[#60](https://github.com/cataggar/misshod/issues/60).
+[#60](https://github.com/cataggar/sshz/issues/60).
 
 ### Resource exhaustion
 
@@ -265,7 +265,7 @@ embedding application must retain network admission and operational limits.
 The library portion of automatic key lifetime is implemented; application-wide
 admission limits and selection/driving of a production key-age clock remain
 deployment responsibilities tracked by
-[#67](https://github.com/cataggar/misshod/issues/67).
+[#67](https://github.com/cataggar/sshz/issues/67).
 
 ### Rekey and key lifetime
 
@@ -283,11 +283,11 @@ incorrectly reset the session-global SSH sequence number. Read-only diagnostics
 expose epochs, usage, activation tick/age, next sequence number, and rekey state
 without cryptographic material.
 
-The per-session library work is covered by [#67](https://github.com/cataggar/misshod/issues/67).
+The per-session library work is covered by [#67](https://github.com/cataggar/sshz/issues/67).
 Applications still must choose the production one-hour-equivalent tick duration,
 drive `tick` regularly, enforce process-wide limits, and close terminal
 transports. Broader long-running validation remains tracked by
-[#68](https://github.com/cataggar/misshod/issues/68).
+[#68](https://github.com/cataggar/sshz/issues/68).
 
 ### Secret lifetime and diagnostics
 
@@ -299,7 +299,7 @@ the caller releases the event, and raw secret/plaintext diagnostics require the
 explicit unsafe trace build option. The complete contract and unavoidable
 compiler, dependency, allocator, and crash-dump limits are documented in
 [Sensitive data lifetimes](sensitive-data-lifetimes.md). Tracking remains under
-[#63](https://github.com/cataggar/misshod/issues/63).
+[#63](https://github.com/cataggar/sshz/issues/63).
 
 ### Interoperability and long-lived correctness
 
@@ -317,16 +317,16 @@ weekly Dropbear/libssh soaks, with manual seed/duration/peer selection. These
 tests provide useful positive and long-lived evidence, but do not replace
 independent review. Commands, scenarios, and artifact rules are documented in
 [Stress and soak testing](stress-and-soak.md). Remaining interoperability and
-soak confidence is tracked by [#58](https://github.com/cataggar/misshod/issues/58),
-[#59](https://github.com/cataggar/misshod/issues/59), and
-[#68](https://github.com/cataggar/misshod/issues/68).
+soak confidence is tracked by [#58](https://github.com/cataggar/sshz/issues/58),
+[#59](https://github.com/cataggar/sshz/issues/59), and
+[#68](https://github.com/cataggar/sshz/issues/68).
 
 ## Accepted and out-of-scope risks
 
 These exclusions define the intended library boundary; they do not relax the
 production blockers below:
 
-- MiSSHod does not protect secrets after compromise of its process, allocator,
+- sshz does not protect secrets after compromise of its process, allocator,
   OS kernel, privileged account, compiler, or cryptographic dependencies.
 - Endpoint commands and channel data are visible to the authorized client,
   server application, and destination process. SSH does not sandbox them.
@@ -349,18 +349,18 @@ current state.
 
 | Blocker | Required evidence | Tracking |
 | --- | --- | --- |
-| Parser and state-machine robustness | Retain the required deterministic malformed transport/state corpus; add usable coverage-guided fuzzing when the Zig runner is fixed; establish no peer-controlled panic, corruption, leak, or hang | [#60](https://github.com/cataggar/misshod/issues/60) |
-| Timing behavior | Inventory and hardening of MAC, credential, key, signature, and failure paths | [#62](https://github.com/cataggar/misshod/issues/62) |
-| Secret lifecycle | Documented ownership, minimized copies/lifetimes, verified cleanup, and diagnostics that cannot emit secrets in production | [#63](https://github.com/cataggar/misshod/issues/63) |
-| Server authorization | Production application hooks and fail-closed examples/tests for every authentication method | [#64](https://github.com/cataggar/misshod/issues/64) |
-| Client host identity | Fail-closed host-key validation, changed-key handling, rekey identity binding, and safe defaults/examples | [#65](https://github.com/cataggar/misshod/issues/65) |
-| Algorithm policy | Reviewed policy, negative negotiation/downgrade tests, vectors, and dependency decision | [#66](https://github.com/cataggar/misshod/issues/66) |
-| Resource and key-lifetime limits | Application-wide connection/FD/process admission limits and a driven production key-age policy; per-session limits, automatic local rekey, hard bounds, and key-lifetime tests are documented and enforced | [#67](https://github.com/cataggar/misshod/issues/67) |
-| Interoperability and stress confidence | Retain required OpenSSH/Dropbear/libssh Linux CI, deterministic ReleaseSafe stress, and scheduled peer soaks; accumulate and review long-run evidence | [#58](https://github.com/cataggar/misshod/issues/58), [#59](https://github.com/cataggar/misshod/issues/59), [#68](https://github.com/cataggar/misshod/issues/68) |
-| Safe, stable integration surface | Documented ownership/lifecycle/error semantics, compatibility policy, and separate production-oriented client/server examples | [#69](https://github.com/cataggar/misshod/issues/69) |
-| Independent review | Engage an external reviewer, pin a signed RC, review transport, crypto use, authentication, channels, memory hygiene, and side channels, and leave no unresolved critical/high finding | [#70](https://github.com/cataggar/misshod/issues/70) |
+| Parser and state-machine robustness | Retain the required deterministic malformed transport/state corpus; add usable coverage-guided fuzzing when the Zig runner is fixed; establish no peer-controlled panic, corruption, leak, or hang | [#60](https://github.com/cataggar/sshz/issues/60) |
+| Timing behavior | Inventory and hardening of MAC, credential, key, signature, and failure paths | [#62](https://github.com/cataggar/sshz/issues/62) |
+| Secret lifecycle | Documented ownership, minimized copies/lifetimes, verified cleanup, and diagnostics that cannot emit secrets in production | [#63](https://github.com/cataggar/sshz/issues/63) |
+| Server authorization | Production application hooks and fail-closed examples/tests for every authentication method | [#64](https://github.com/cataggar/sshz/issues/64) |
+| Client host identity | Fail-closed host-key validation, changed-key handling, rekey identity binding, and safe defaults/examples | [#65](https://github.com/cataggar/sshz/issues/65) |
+| Algorithm policy | Reviewed policy, negative negotiation/downgrade tests, vectors, and dependency decision | [#66](https://github.com/cataggar/sshz/issues/66) |
+| Resource and key-lifetime limits | Application-wide connection/FD/process admission limits and a driven production key-age policy; per-session limits, automatic local rekey, hard bounds, and key-lifetime tests are documented and enforced | [#67](https://github.com/cataggar/sshz/issues/67) |
+| Interoperability and stress confidence | Retain required OpenSSH/Dropbear/libssh Linux CI, deterministic ReleaseSafe stress, and scheduled peer soaks; accumulate and review long-run evidence | [#58](https://github.com/cataggar/sshz/issues/58), [#59](https://github.com/cataggar/sshz/issues/59), [#68](https://github.com/cataggar/sshz/issues/68) |
+| Safe, stable integration surface | Documented ownership/lifecycle/error semantics, compatibility policy, and separate production-oriented client/server examples | [#69](https://github.com/cataggar/sshz/issues/69) |
+| Independent review | Engage an external reviewer, pin a signed RC, review transport, crypto use, authentication, channels, memory hygiene, and side channels, and leave no unresolved critical/high finding | [#70](https://github.com/cataggar/sshz/issues/70) |
 
 This checked-in model is the concrete mitigation requested by
-[#61](https://github.com/cataggar/misshod/issues/61). It must be updated when
+[#61](https://github.com/cataggar/sshz/issues/61). It must be updated when
 the supported algorithms, trust boundaries, deployment modes, examples, or
 release blockers change.

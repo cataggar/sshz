@@ -1,8 +1,8 @@
 # Per-session resource limits
 
-MiSSHod exposes `ResourceLimits`, `ResourceCapacities`, `DeadlineLimits`, and
-`TimeoutOutcome` from `src/misshod.zig`. `MisshodClient.init` and
-`MisshodServer.init` retain their existing signatures and use the defaults.
+sshz exposes `ResourceLimits`, `ResourceCapacities`, `DeadlineLimits`, and
+`TimeoutOutcome` from `src/sshz.zig`. `SshzClient.init` and
+`SshzServer.init` retain their existing signatures and use the defaults.
 Callers that need an explicit policy use `initWithLimits`. Initialization
 validates every runtime value against the fixed storage capacities and returns
 a typed `ResourceLimitConfigError`; invalid values are never clamped.
@@ -69,7 +69,7 @@ compatibility defaults do.
 
 ## Timeout-driving contract
 
-MiSSHod never reads a wall or monotonic clock.
+sshz never reads a wall or monotonic clock.
 
 1. Call `initializeDeadlines(now)` exactly once after session initialization.
 2. Call `noteActivity(now)` after transport or application progress that the

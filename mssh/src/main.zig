@@ -1,8 +1,8 @@
 const std = @import("std");
 const posix = std.posix;
-const Misshod = @import("misshod");
-const MisshodClient = Misshod.MisshodClient;
-const SshOpenFailureReason = Misshod.SshOpenFailureReason;
+const Sshz = @import("sshz");
+const SshzClient = Sshz.SshzClient;
+const SshOpenFailureReason = Sshz.SshOpenFailureReason;
 const known_hosts = @import("known_hosts.zig");
 
 const HostKeyMode = enum {
@@ -456,10 +456,10 @@ pub fn main(init: std.process.Init) !void {
             try init.io.randomSecure(&seed);
             var prng = std.Random.DefaultCsprng.init(seed);
 
-            var misshod = try MisshodClient.init(prng.random(), user, allocator);
-            defer misshod.deinit();
+            var sshz = try SshzClient.init(prng.random(), user, allocator);
+            defer sshz.deinit();
             if (agent_forwarding) {
-                try misshod.enableAgentForwarding();
+                try sshz.enableAgentForwarding();
             }
 
             defer raw_mode_stop();
@@ -473,7 +473,7 @@ pub fn main(init: std.process.Init) !void {
             const stdin_fd = std.c.STDIN_FILENO;
 
             outer: while (!quit) {
-                const ev = misshod.getNextEvent() catch |err| switch (err) {
+                const ev = sshz.getNextEvent() catch |err| switch (err) {
                     error.NotReady => {
                         try init.io.sleep(.fromNanoseconds(1 * std.time.ns_per_ms), .awake);
                         continue :outer;
@@ -484,29 +484,29 @@ pub fn main(init: std.process.Init) !void {
                     .Event => |eventCode| {
                         switch (eventCode) {
                             .ServerIdentification => {
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .AuthMethodStarted => |method| {
                                 std.debug.print("Trying authentication method: {s}\n", .{method.name()});
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .Connected => {
                                 std.debug.print("Connected!\n", .{});
                                 connected = true;
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                                 try raw_mode_start();
                             },
                             .RxData => |channel_data| {
                                 try writeAllFd(std.c.STDOUT_FILENO, channel_data.data);
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .RxExtendedData => |ext| {
                                 _ = ext;
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .Banner => |banner| {
                                 std.debug.print("{s}\n", .{banner});
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .EndSession => |reason| {
                                 switch (reason) {
@@ -538,7 +538,7 @@ pub fn main(init: std.process.Init) !void {
                                         "HOST KEY VERIFICATION FAILED for {s}: the server supplied no host key blob\n",
                                         .{endpoint},
                                     );
-                                    try misshod.rejectHostKey();
+                                    try sshz.rejectHostKey();
                                     exit_code = 1;
                                     quit = true;
                                     continue :outer;
@@ -560,7 +560,7 @@ pub fn main(init: std.process.Init) !void {
                                                 \\Could not safely parse or read known_hosts: {any}
                                                 \\
                                             , .{ endpoint, known_hosts_path.?, fingerprint, err });
-                                            try misshod.rejectHostKey();
+                                            try sshz.rejectHostKey();
                                             exit_code = 1;
                                             quit = true;
                                             continue :outer;
@@ -569,14 +569,14 @@ pub fn main(init: std.process.Init) !void {
                                             .match => {},
                                             .unknown => {
                                                 printHostKeyUnknown(endpoint, known_hosts_path.?, fingerprint);
-                                                try misshod.rejectHostKey();
+                                                try sshz.rejectHostKey();
                                                 exit_code = 1;
                                                 quit = true;
                                                 continue :outer;
                                             },
                                             .changed => {
                                                 printHostKeyMismatch(endpoint, known_hosts_path.?, fingerprint);
-                                                try misshod.rejectHostKey();
+                                                try sshz.rejectHostKey();
                                                 exit_code = 1;
                                                 quit = true;
                                                 continue :outer;
@@ -602,7 +602,7 @@ pub fn main(init: std.process.Init) !void {
                                                     \\
                                                 , .{ endpoint, known_hosts_path.?, fingerprint, err });
                                             }
-                                            try misshod.rejectHostKey();
+                                            try sshz.rejectHostKey();
                                             exit_code = 1;
                                             quit = true;
                                             continue :outer;
@@ -621,7 +621,7 @@ pub fn main(init: std.process.Init) !void {
                                         );
                                     },
                                 }
-                                try misshod.acceptHostKey();
+                                try sshz.acceptHostKey();
                             },
                             .GetPrivateKey => {
                                 if (idfile) |path| {
@@ -629,25 +629,25 @@ pub fn main(init: std.process.Init) !void {
                                         std.debug.print("Failed to open idfile {s}\n", .{path});
                                         std.process.exit(1);
                                     };
-                                    try misshod.setPrivateKey(keydata_ascii);
+                                    try sshz.setPrivateKey(keydata_ascii);
                                     allocator.free(keydata_ascii);
                                 }
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .GetKeyPassphrase => {
                                 var password_buf: [128]u8 = undefined;
-                                try misshod.setPrivateKeyPassphrase(try envOrReadPassphrase(init, "MSSH_KEY_PASSPHRASE", "Password for private key decrypt: ", &password_buf));
-                                try misshod.clearEvent(eventCode);
+                                try sshz.setPrivateKeyPassphrase(try envOrReadPassphrase(init, "MSSH_KEY_PASSPHRASE", "Password for private key decrypt: ", &password_buf));
+                                try sshz.clearEvent(eventCode);
                             },
                             .GetAuthPassphrase => {
                                 var password_buf: [128]u8 = undefined;
-                                try misshod.setAuthPassphrase(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", "Password for auth: ", &password_buf));
-                                try misshod.clearEvent(eventCode);
+                                try sshz.setAuthPassphrase(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", "Password for auth: ", &password_buf));
+                                try sshz.clearEvent(eventCode);
                             },
                             .KeyboardInteractive => |prompt| {
                                 var password_buf: [128]u8 = undefined;
-                                try misshod.session.setKeyboardInteractiveResponse(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", prompt.prompt, &password_buf));
-                                try misshod.clearEvent(eventCode);
+                                try sshz.session.setKeyboardInteractiveResponse(try envOrReadPassphrase(init, "MSSH_AUTH_PASSWORD", prompt.prompt, &password_buf));
+                                try sshz.clearEvent(eventCode);
                             },
                             .ChannelOpened,
                             .ChannelOpenFailure,
@@ -656,20 +656,20 @@ pub fn main(init: std.process.Init) !void {
                             .CancelTcpipForwardSuccess,
                             .CancelTcpipForwardFailure,
                             => {
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                             .ChannelOpenRequest => |request| {
-                                try misshod.rejectChannelOpen(
+                                try sshz.rejectChannelOpen(
                                     request.channel,
                                     SshOpenFailureReason.AdministrativelyProhibited,
                                     "unsupported channel open",
                                 );
                             },
                             .AgentChannelOpen => |channel| {
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                                 addAgentSocket(&agent_sockets, channel, agent_sock_path.?) catch |err| {
                                     std.debug.print("Failed to connect SSH_AUTH_SOCK for agent channel {d}: {any}\n", .{ channel, err });
-                                    try misshod.sendChannelEof(channel);
+                                    try sshz.sendChannelEof(channel);
                                 };
                             },
                             .AgentData => |agent_data| {
@@ -683,12 +683,12 @@ pub fn main(init: std.process.Init) !void {
                                 } else {
                                     close_channel = true;
                                 }
-                                try misshod.clearEvent(eventCode);
-                                if (close_channel) try misshod.sendChannelEof(agent_data.channel);
+                                try sshz.clearEvent(eventCode);
+                                if (close_channel) try sshz.sendChannelEof(agent_data.channel);
                             },
                             .AgentChannelClosed => |channel| {
                                 closeAgentSocket(&agent_sockets, channel);
-                                try misshod.clearEvent(eventCode);
+                                try sshz.clearEvent(eventCode);
                             },
                         }
                     },
@@ -741,22 +741,22 @@ pub fn main(init: std.process.Init) !void {
                                 }
                                 const nbytes = try readFd(stream.socket.handle, iobuf[0..bytes_to_read]);
                                 if (nbytes > 0) {
-                                    try misshod.write(iobuf[0..nbytes]);
+                                    try sshz.write(iobuf[0..nbytes]);
                                     continue :outer;
                                 }
                             }
                             if (fds[0].revents & std.posix.POLL.OUT > 0) { // socket is writeable
-                                const towrite = try misshod.peek(4);
+                                const towrite = try sshz.peek(4);
                                 const bytes_written = try writeFd(stream.socket.handle, towrite);
-                                try misshod.consumed(bytes_written);
+                                try sshz.consumed(bytes_written);
                                 continue :outer;
                             }
                             if (fds[1].revents & std.posix.POLL.IN > 0) { // keyboard data in
-                                const buf = try misshod.getChannelWriteBuffer(0);
+                                const buf = try sshz.getChannelWriteBuffer(0);
                                 if (buf.len > 0) {
                                     const count = readFd(stdin_fd, buf) catch 0;
                                     if (count > 0) {
-                                        try misshod.channelWriteComplete(0, count);
+                                        try sshz.channelWriteComplete(0, count);
                                         continue :outer;
                                     }
                                 }
@@ -767,20 +767,20 @@ pub fn main(init: std.process.Init) !void {
                                     const revents = fds[poll_idx].revents;
                                     poll_idx += 1;
                                     if (revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) > 0) {
-                                        const buf = try misshod.getChannelWriteBuffer(agent.channel);
+                                        const buf = try sshz.getChannelWriteBuffer(agent.channel);
                                         if (buf.len > 0) {
                                             const count = readFd(agent.fd, buf) catch |err| {
                                                 std.debug.print("Failed to read SSH_AUTH_SOCK for channel {d}: {any}\n", .{ agent.channel, err });
                                                 closeAgentSocket(&agent_sockets, agent.channel);
-                                                try misshod.sendChannelEof(agent.channel);
+                                                try sshz.sendChannelEof(agent.channel);
                                                 continue;
                                             };
                                             if (count > 0) {
-                                                try misshod.channelWriteComplete(agent.channel, count);
+                                                try sshz.channelWriteComplete(agent.channel, count);
                                                 continue :outer;
                                             }
                                             closeAgentSocket(&agent_sockets, agent.channel);
-                                            try misshod.sendChannelEof(agent.channel);
+                                            try sshz.sendChannelEof(agent.channel);
                                         }
                                     }
                                 }

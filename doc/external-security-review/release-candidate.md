@@ -1,7 +1,7 @@
 # Pinned security-review release candidate
 
 No such candidate has yet been pinned and no independent external review has
-occurred. [Issue #70](https://github.com/cataggar/misshod/issues/70) remains
+occurred. [Issue #70](https://github.com/cataggar/sshz/issues/70) remains
 blocked on an external reviewer and completion of this signed-RC procedure.
 
 ## Candidate record
@@ -11,7 +11,7 @@ An unfilled field means the candidate is not pinned.
 
 ```text
 review_id: <REVIEW-ID>
-repository: https://github.com/cataggar/misshod
+repository: https://github.com/cataggar/sshz
 candidate_commit_sha: <FULL-40-HEX-COMMIT>
 candidate_tag: <ANNOTATED-SIGNED-RC-TAG>
 tag_object_sha: <FULL-TAG-OBJECT-SHA>
@@ -118,7 +118,7 @@ EVIDENCE_DIR="$PWD/review-evidence"
 RC_COMMIT="$(git rev-parse HEAD)"
 mkdir -p "$EVIDENCE_DIR/interop" "$EVIDENCE_DIR/stress"
 
-git archive --format=tar --prefix="misshod-$RC_COMMIT/" "$RC_COMMIT" \
+git archive --format=tar --prefix="sshz-$RC_COMMIT/" "$RC_COMMIT" \
   | gzip -n >"$EVIDENCE_DIR/source.tar.gz"
 sha256sum "$EVIDENCE_DIR/source.tar.gz" \
   >"$EVIDENCE_DIR/source.tar.gz.sha256"
@@ -177,7 +177,7 @@ and libssh lanes are all release evidence; `zig build interop` is made
 fail-closed for Dropbear/libssh by the required environment variables above.
 
 The packaged libssh on the current Azure Linux development host is locally
-defective. Record that as an environment failure rather than a MiSSHod protocol
+defective. Record that as an environment failure rather than a sshz protocol
 finding; the required Ubuntu CI libssh implementation is conforming. A
 candidate still needs a passing required Ubuntu lane—local failure does not
 waive it.

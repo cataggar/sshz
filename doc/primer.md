@@ -3,7 +3,7 @@
 I use SSH every day. I login to remote machines, push code changes to github and scp files.
 Like many programmers, I know how to use SSH to get things done but had never looked deeper to understand the protocol itself.
 
-I recently wrote a [minimal SSH](https://github.com/ringtailsoftware/misshod) client to help demystify the protocol. In this post, I'll explain some of the core concepts to help anyone else doing the same. This will be a 10,000ft overview with references to some interesting parts - not an implementation guide.
+I recently wrote a [minimal SSH](https://github.com/cataggar/sshz) client to help demystify the protocol. In this post, I'll explain some of the core concepts to help anyone else doing the same. This will be a 10,000ft overview with references to some interesting parts - not an implementation guide.
 
 SSH was designed as a replacement for the venerable telnet. Back in the day, we really would just open a TCP socket and type our password in plaintext to gain access to remote machines. It's probably clear why something more secure is needed for the modern Internet age.
 
@@ -123,7 +123,7 @@ After sending the `SSH_MSG_KEXINIT` packet, the SSH server is waiting for a resp
 ## Helper functions
 
 Now that we have a grasp on how to decode a packet, we can use exactly the same logic to construct our own.
-But, before we do that - let's look at some code I'm using to make handling SSH packets easier. Here is an extract from my [`BufferReader`](https://github.com/ringtailsoftware/misshod/blob/main/src/buffer.zig).
+But, before we do that - let's look at some code I'm using to make handling SSH packets easier. Here is an extract from my [`BufferReader`](https://github.com/cataggar/sshz/blob/main/src/buffer.zig).
 
 The `init` function takes a slice of bytes and starts the offset `off` at 0. Each other function then attempts to read from the current offset, returning an error if there isn't enough data. We can now safely chew through incoming packets.
 
@@ -366,10 +366,9 @@ Once the packet has been decrypted, the receiver can generate what they think th
 
 Hopefully this article has dispelled some of the mystery around how SSH establishes a secure link and time you run `ssh -vvv user@host` you'll know what's being talked about.
 
-For more detail and runnable code, check out https://github.com/ringtailsoftware/misshod
+For more detail and runnable code, check out https://github.com/cataggar/sshz
 
 https://mastodon.me.uk/@tobyjaffey
-
 
 
 

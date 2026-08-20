@@ -19,7 +19,7 @@ const Protocol = @import("protocol.zig");
 const Hasher = @import("hasher.zig").Hasher;
 const Channel = @import("channel.zig");
 
-pub const MisshodError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError ||
+pub const SshzError = std.crypto.errors.Error || std.mem.Allocator.Error || BufferError || IoError ||
     ResourceLimitConfigError || Channel.ChannelError || DeadlineError || PrivKeyError || Key.KeyError;
 
 pub const IoError = error{
@@ -378,9 +378,9 @@ pub fn inspectEcdhPublicKeyString(encoded: []const u8) EcdhInputError!void {
     }
 }
 
-pub fn exerciseEcdhReplyPublicKey(public_key: []const u8, allocator: std.mem.Allocator) MisshodError!void {
+pub fn exerciseEcdhReplyPublicKey(public_key: []const u8, allocator: std.mem.Allocator) SshzError!void {
     var prng = std.Random.DefaultPrng.init(0x60);
-    var client = try MisshodClient.init(prng.random(), "malformed-corpus", allocator);
+    var client = try SshzClient.init(prng.random(), "malformed-corpus", allocator);
     defer client.deinit();
 
     var payload_backing: [128]u8 = undefined;
@@ -525,8 +525,8 @@ fn sessionType(role: Role) type {
 
 fn eventCodeType(role: Role) type {
     return switch (role) {
-        .Client => MisshodClientEventCodes,
-        .Server => MisshodServerEventCodes,
+        .Client => SshzClientEventCodes,
+        .Server => SshzServerEventCodes,
     };
 }
 
@@ -546,7 +546,7 @@ pub const HostKeyInfo = struct {
     }
 };
 
-pub const MisshodClientEventCodes = union(enum) {
+pub const SshzClientEventCodes = union(enum) {
     ServerIdentification: []const u8,
     CheckHostKey: HostKeyInfo,
     AuthMethodStarted: AuthMethod,
@@ -668,7 +668,7 @@ pub const AuthorizationDecision = enum {
     Allow,
 };
 
-pub fn validateUserPublicKeyBlob(blob: []const u8) MisshodError!void {
+pub fn validateUserPublicKeyBlob(blob: []const u8) SshzError!void {
     _ = try Key.parsePublicKeyBlob(blob);
 }
 
@@ -709,7 +709,7 @@ pub const ChannelExtendedData = struct {
     data: []const u8,
 };
 
-pub const MisshodServerEventCodes = union(enum) {
+pub const SshzServerEventCodes = union(enum) {
     EndSession: EndSessionReason,
     UserAuth: UserCredentials,
     GetPubkeyForUser: []const u8,
@@ -728,7 +728,7 @@ pub const MisshodServerEventCodes = union(enum) {
     CancelTcpipForward: TcpipForwardRequest,
 };
 
-pub fn MisshodEvent(role: Role) type {
+pub fn SshzEvent(role: Role) type {
     return union(enum) {
         Event: eventCodeType(role),
         ReadyToConsume: usize,
@@ -762,8 +762,8 @@ pub fn IoState(role: Role) type {
     };
 }
 
-pub const MisshodClient = MisshodImpl(.Client);
-pub const MisshodServer = MisshodImpl(.Server);
+pub const SshzClient = SshzImpl(.Client);
+pub const SshzServer = SshzImpl(.Server);
 
 const DeadlinePhase = enum {
     Handshake,
@@ -781,7 +781,7 @@ const DeadlineState = struct {
     timeout: ?TimeoutOutcome = null,
 };
 
-pub fn MisshodImpl(role: Role) type {
+pub fn SshzImpl(role: Role) type {
     return struct {
         const Self = @This();
 
@@ -1068,13 +1068,13 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        fn gateApplicationInitiation(self: *Self) MisshodError!void {
+        fn gateApplicationInitiation(self: *Self) SshzError!void {
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
             if (self.local_rekey_pending or self.session.is_rekeying) return IoError.NotReady;
         }
 
-        fn latchKeyLifetimeError(self: *Self, err: MisshodError) void {
+        fn latchKeyLifetimeError(self: *Self, err: SshzError) void {
             if (err == IoError.KeyLifetimeExceeded) self.failClosed();
         }
 
@@ -1101,7 +1101,7 @@ pub fn MisshodImpl(role: Role) type {
             self.rd_off = 0;
         }
 
-        pub fn accountInboundMessage(self: *Self, msgid: u8) MisshodError!void {
+        pub fn accountInboundMessage(self: *Self, msgid: u8) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
             if (self.packets_received == std.math.maxInt(u64)) {
                 self.failClosed();
@@ -1157,7 +1157,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         // for session use
-        pub fn requestWrite(self: *Self, wbuf: []const u8, next_state: Protocol.IoSessionState) MisshodError!void {
+        pub fn requestWrite(self: *Self, wbuf: []const u8, next_state: Protocol.IoSessionState) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
             if (wbuf.len == 0 or wbuf.len > self.limits.max_packet_size)
                 return IoError.ResourceLimitExceeded;
@@ -1193,7 +1193,7 @@ pub fn MisshodImpl(role: Role) type {
         /// Resolves and clears the current server UserAuth event in one step.
         /// Allow accepts a public-key probe with PK_OK, but only accepts a signed
         /// public-key request as authentication. All other outcomes remain denied.
-        pub fn decideUserAuth(self: *Self, decision: AuthorizationDecision) MisshodError!void {
+        pub fn decideUserAuth(self: *Self, decision: AuthorizationDecision) SshzError!void {
             switch (role) {
                 .Client => return IoError.UnimplementedService,
                 .Server => {
@@ -1218,14 +1218,14 @@ pub fn MisshodImpl(role: Role) type {
 
         /// Compatibility API for setting the current server UserAuth decision.
         /// The application must subsequently clear the UserAuth event.
-        pub fn grantAccess(self: *Self, allow: bool) MisshodError!void {
+        pub fn grantAccess(self: *Self, allow: bool) SshzError!void {
             switch (role) {
                 .Client => return IoError.UnimplementedService, // FIXME something more tailored
                 .Server => return try self.session.grantAccess(allow),
             }
         }
 
-        pub fn clearEvent(self: *Self, clearEventCode: eventCodeType(role)) MisshodError!void {
+        pub fn clearEvent(self: *Self, clearEventCode: eventCodeType(role)) SshzError!void {
             TRACE(.Debug, "clearEvent tag={s}", .{@tagName(clearEventCode)});
 
             switch (self.iostate_wr) {
@@ -1267,14 +1267,14 @@ pub fn MisshodImpl(role: Role) type {
             return IoError.badClearEvent;
         }
 
-        pub fn getNextEvent(self: *Self) MisshodError!MisshodEvent(role) {
+        pub fn getNextEvent(self: *Self) SshzError!SshzEvent(role) {
             if (self.terminated) return IoError.SessionTerminated;
             // if eventing, send an event
             switch (self.iostate_wr) {
                 .Active => |iotype| {
                     switch (iotype.action) {
                         .Eventing => |eventCode| {
-                            return MisshodEvent(role){ .Event = eventCode };
+                            return SshzEvent(role){ .Event = eventCode };
                         },
                         else => {},
                     }
@@ -1289,17 +1289,17 @@ pub fn MisshodImpl(role: Role) type {
             try self.getIoReq(&can_consume_nbytes, &can_produce_nbytes);
 
             if (can_consume_nbytes > 0 and can_produce_nbytes > 0) {
-                return MisshodEvent(role){ .ReadyToConsumeAndProduce = .{ .consume = can_consume_nbytes, .produce = can_produce_nbytes } };
+                return SshzEvent(role){ .ReadyToConsumeAndProduce = .{ .consume = can_consume_nbytes, .produce = can_produce_nbytes } };
             } else if (can_consume_nbytes > 0) {
-                return MisshodEvent(role){ .ReadyToConsume = can_consume_nbytes };
+                return SshzEvent(role){ .ReadyToConsume = can_consume_nbytes };
             } else if (can_produce_nbytes > 0) {
-                return MisshodEvent(role){ .ReadyToProduce = can_produce_nbytes };
+                return SshzEvent(role){ .ReadyToProduce = can_produce_nbytes };
             } else {
                 return IoError.NotReady;
             }
         }
 
-        fn getIoReq(self: *Self, can_consume: *usize, can_produce: *usize) MisshodError!void {
+        fn getIoReq(self: *Self, can_consume: *usize, can_produce: *usize) SshzError!void {
             try self.advance();
 
             // check read side
@@ -1338,9 +1338,9 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        pub fn write(self: *Self, wbuf: []const u8) MisshodError!void {
+        pub fn write(self: *Self, wbuf: []const u8) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
-            TRACE(.Debug, "misshod.write len={d} .rd_nbytes={d}", .{ wbuf.len, self.rd_nbytes });
+            TRACE(.Debug, "sshz.write len={d} .rd_nbytes={d}", .{ wbuf.len, self.rd_nbytes });
             switch (self.iostate_rd) {
                 .Active => |iotype| {
                     switch (iotype.action) {
@@ -1366,7 +1366,7 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        pub fn peek(self: *Self, nbytes: usize) MisshodError![]const u8 {
+        pub fn peek(self: *Self, nbytes: usize) SshzError![]const u8 {
             if (self.terminated) return IoError.SessionTerminated;
             TRACE(.Debug, "peek nbytes={d} .wr_off={d} .wr_nbytes={d}", .{ nbytes, self.wr_off, self.wr_nbytes });
             // sanity check
@@ -1389,7 +1389,7 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        pub fn consumed(self: *Self, nbytes: usize) MisshodError!void {
+        pub fn consumed(self: *Self, nbytes: usize) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
             TRACE(.Debug, "consumed nbytes={d} wr_off={d} .wr_nbytes={d}", .{ nbytes, self.wr_off, self.wr_nbytes });
 
@@ -1442,7 +1442,7 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        pub fn getRecvBuffer(self: *Self, iobuf: []u8, inkeys: *Protocol.KeyDataUni) MisshodError!BufferReader {
+        pub fn getRecvBuffer(self: *Self, iobuf: []u8, inkeys: *Protocol.KeyDataUni) SshzError!BufferReader {
             const frame = try inspectPacketWithLimits(
                 iobuf,
                 self.session.inbound_encrypted,
@@ -1506,7 +1506,7 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        fn advanceIoSession(self: *Self, inkeys: *Protocol.KeyDataUni) MisshodError!void {
+        fn advanceIoSession(self: *Self, inkeys: *Protocol.KeyDataUni) SshzError!void {
             switch (self.session.ioSessionState) {
                 .Idle => {
                     TRACE(.Debug, "ioSessionState Idle", .{});
@@ -1647,7 +1647,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn advance(self: *Self) MisshodError!void {
+        pub fn advance(self: *Self) SshzError!void {
             if (self.terminated) return IoError.SessionTerminated;
             errdefer self.failClosed();
             if (role == .Client) _ = try self.session.flushPendingWindowChange(self);
@@ -1671,28 +1671,28 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) MisshodError!void {
+        pub fn setPrivateKey(self: *Self, keydata_ascii: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setPrivateKey(keydata_ascii),
                 .Server => IoError.UnimplementedService,
             };
         }
 
-        pub fn setPrivateKeyPassphrase(self: *Self, data: []const u8) MisshodError!void {
+        pub fn setPrivateKeyPassphrase(self: *Self, data: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setPrivateKeyPassphrase(data),
                 .Server => IoError.UnimplementedService,
             };
         }
 
-        pub fn setAuthPassphrase(self: *Self, data: []const u8) MisshodError!void {
+        pub fn setAuthPassphrase(self: *Self, data: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAuthPassphrase(data),
                 .Server => IoError.UnimplementedService,
             };
         }
 
-        pub fn setTryNoneAuth(self: *Self, enabled: bool) MisshodError!void {
+        pub fn setTryNoneAuth(self: *Self, enabled: bool) SshzError!void {
             return switch (role) {
                 .Client => self.session.setTryNoneAuth(enabled),
                 .Server => IoError.UnimplementedService,
@@ -1703,11 +1703,11 @@ pub fn MisshodImpl(role: Role) type {
             return self.session.isActive();
         }
 
-        pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) MisshodError![]u8 {
+        pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) SshzError![]u8 {
             return self.session.getChannelWriteBuffer(channel_id);
         }
 
-        pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) MisshodError!void {
+        pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) SshzError!void {
             if (self.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
             self.updateLocalRekeyPending(null);
             if (self.local_rekey_pending or self.session.is_rekeying) {
@@ -1726,7 +1726,7 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        pub fn openSessionChannel(self: *Self) MisshodError!u32 {
+        pub fn openSessionChannel(self: *Self) SshzError!u32 {
             try self.gateApplicationInitiation();
             return switch (role) {
                 .Client => self.session.openSessionChannel(self) catch |err| {
@@ -1737,14 +1737,14 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn setAutoExecCommand(self: *Self, command: []const u8) MisshodError!void {
+        pub fn setAutoExecCommand(self: *Self, command: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoExecCommand(command),
                 .Server => IoError.UnimplementedService,
             };
         }
 
-        pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) MisshodError!void {
+        pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoPty(term, cols, rows, width_px, height_px),
                 .Server => IoError.UnimplementedService,
@@ -1757,7 +1757,7 @@ pub fn MisshodImpl(role: Role) type {
             port: u32,
             originator_host: []const u8,
             originator_port: u32,
-        ) MisshodError!u32 {
+        ) SshzError!u32 {
             try self.gateApplicationInitiation();
             return switch (role) {
                 .Client => self.session.openDirectTcpipChannel(
@@ -1780,11 +1780,11 @@ pub fn MisshodImpl(role: Role) type {
             port: u32,
             originator_host: []const u8,
             originator_port: u32,
-        ) MisshodError!u32 {
+        ) SshzError!u32 {
             return try self.openDirectTcpipChannel(host, port, originator_host, originator_port);
         }
 
-        pub fn requestRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) MisshodError!void {
+        pub fn requestRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) SshzError!void {
             try self.gateApplicationInitiation();
             return switch (role) {
                 .Client => self.session.requestRemoteForward(self, bind_address, bind_port) catch |err| {
@@ -1795,7 +1795,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn cancelRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) MisshodError!void {
+        pub fn cancelRemoteForward(self: *Self, bind_address: []const u8, bind_port: u32) SshzError!void {
             try self.gateApplicationInitiation();
             return switch (role) {
                 .Client => self.session.cancelRemoteForward(self, bind_address, bind_port) catch |err| {
@@ -1812,7 +1812,7 @@ pub fn MisshodImpl(role: Role) type {
             connected_port: u32,
             originator_host: []const u8,
             originator_port: u32,
-        ) MisshodError!u32 {
+        ) SshzError!u32 {
             try self.gateApplicationInitiation();
             return switch (role) {
                 .Client => IoError.UnimplementedService,
@@ -1829,7 +1829,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        fn clearPendingChannelOpenRequest(self: *Self, channel_id: u32) MisshodError!void {
+        fn clearPendingChannelOpenRequest(self: *Self, channel_id: u32) SshzError!void {
             switch (self.iostate_wr) {
                 .Idle => return,
                 .Active => |iotype| switch (iotype.action) {
@@ -1848,7 +1848,7 @@ pub fn MisshodImpl(role: Role) type {
             }
         }
 
-        fn clearPendingHostKeyEvent(self: *Self) MisshodError!void {
+        fn clearPendingHostKeyEvent(self: *Self) SshzError!void {
             return switch (role) {
                 .Server => IoError.UnimplementedService,
                 .Client => switch (self.iostate_wr) {
@@ -1869,7 +1869,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         /// Accepts the signature-verified host key from the pending CheckHostKey event.
-        pub fn acceptHostKey(self: *Self) MisshodError!void {
+        pub fn acceptHostKey(self: *Self) SshzError!void {
             try self.clearPendingHostKeyEvent();
             return switch (role) {
                 .Client => {
@@ -1881,7 +1881,7 @@ pub fn MisshodImpl(role: Role) type {
         }
 
         /// Rejects the pending host key and ends the client session before authentication.
-        pub fn rejectHostKey(self: *Self) MisshodError!void {
+        pub fn rejectHostKey(self: *Self) SshzError!void {
             try self.clearPendingHostKeyEvent();
             return switch (role) {
                 .Client => {
@@ -1892,7 +1892,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        fn clearPendingTcpipForwardEvent(self: *Self) MisshodError!void {
+        fn clearPendingTcpipForwardEvent(self: *Self) SshzError!void {
             return switch (role) {
                 .Client => IoError.UnimplementedService,
                 .Server => {
@@ -1914,7 +1914,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        fn clearPendingCancelTcpipForwardEvent(self: *Self) MisshodError!void {
+        fn clearPendingCancelTcpipForwardEvent(self: *Self) SshzError!void {
             return switch (role) {
                 .Client => IoError.UnimplementedService,
                 .Server => {
@@ -1936,7 +1936,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn acceptTcpipForward(self: *Self, bound_port: u32) MisshodError!void {
+        pub fn acceptTcpipForward(self: *Self, bound_port: u32) SshzError!void {
             try self.clearPendingTcpipForwardEvent();
             return switch (role) {
                 .Client => IoError.UnimplementedService,
@@ -1947,7 +1947,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn rejectTcpipForward(self: *Self) MisshodError!void {
+        pub fn rejectTcpipForward(self: *Self) SshzError!void {
             try self.clearPendingTcpipForwardEvent();
             return switch (role) {
                 .Client => IoError.UnimplementedService,
@@ -1958,7 +1958,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn acceptCancelTcpipForward(self: *Self) MisshodError!void {
+        pub fn acceptCancelTcpipForward(self: *Self) SshzError!void {
             try self.clearPendingCancelTcpipForwardEvent();
             return switch (role) {
                 .Client => IoError.UnimplementedService,
@@ -1969,7 +1969,7 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn rejectCancelTcpipForward(self: *Self) MisshodError!void {
+        pub fn rejectCancelTcpipForward(self: *Self) SshzError!void {
             try self.clearPendingCancelTcpipForwardEvent();
             return switch (role) {
                 .Client => IoError.UnimplementedService,
@@ -1980,19 +1980,19 @@ pub fn MisshodImpl(role: Role) type {
             };
         }
 
-        pub fn acceptChannelOpen(self: *Self, channel_id: u32) MisshodError!void {
+        pub fn acceptChannelOpen(self: *Self, channel_id: u32) SshzError!void {
             try self.clearPendingChannelOpenRequest(channel_id);
             try self.session.acceptChannelOpen(channel_id);
             try self.advance();
         }
 
-        pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) MisshodError!void {
+        pub fn rejectChannelOpen(self: *Self, channel_id: u32, reason_code: u32, description: []const u8) SshzError!void {
             try self.clearPendingChannelOpenRequest(channel_id);
             try self.session.rejectChannelOpen(channel_id, reason_code, description);
             try self.advance();
         }
 
-        pub fn sendChannelEof(self: *Self, channel_id: u32) MisshodError!void {
+        pub fn sendChannelEof(self: *Self, channel_id: u32) SshzError!void {
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
             self.session.sendChannelEof(channel_id, self) catch |err| {
@@ -2002,7 +2002,7 @@ pub fn MisshodImpl(role: Role) type {
             try self.advance();
         }
 
-        pub fn sendChannelClose(self: *Self, channel_id: u32) MisshodError!void {
+        pub fn sendChannelClose(self: *Self, channel_id: u32) SshzError!void {
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
             self.session.sendChannelClose(channel_id, self) catch |err| {
@@ -2012,14 +2012,14 @@ pub fn MisshodImpl(role: Role) type {
             try self.advance();
         }
 
-        pub fn enableAgentForwarding(self: *Self) MisshodError!void {
+        pub fn enableAgentForwarding(self: *Self) SshzError!void {
             switch (role) {
                 .Client => return try self.session.enableAgentForwarding(),
                 .Server => return IoError.UnimplementedService,
             }
         }
 
-        pub fn openAgentChannel(self: *Self) MisshodError!u32 {
+        pub fn openAgentChannel(self: *Self) SshzError!u32 {
             try self.gateApplicationInitiation();
             switch (role) {
                 .Client => return IoError.UnimplementedService,
@@ -2035,7 +2035,7 @@ pub fn MisshodImpl(role: Role) type {
     };
 }
 
-fn feedClientIdentificationBytes(client: *MisshodClient, bytes: []const u8) !void {
+fn feedClientIdentificationBytes(client: *SshzClient, bytes: []const u8) !void {
     for (bytes) |byte| {
         const evt = try client.getNextEvent();
         const can_consume = switch (evt) {
@@ -2048,7 +2048,7 @@ fn feedClientIdentificationBytes(client: *MisshodClient, bytes: []const u8) !voi
     }
 }
 
-fn startClientIdentificationRead(client: *MisshodClient) !void {
+fn startClientIdentificationRead(client: *SshzClient) !void {
     const initial = try client.getNextEvent();
     switch (initial) {
         .ReadyToProduce => {},
@@ -2142,7 +2142,7 @@ test "AuthFailureInfo public API is value-owned for apk2" {
 
 test "client retains exact server identification after RFC preamble" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
 
     const initial = try client.getNextEvent();
@@ -2173,7 +2173,7 @@ test "client retains exact server identification after RFC preamble" {
 
 test "client accepts 255 byte pre-identification and identification lines" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     try startClientIdentificationRead(&client);
 
@@ -2213,7 +2213,7 @@ test "client accepts 255 byte pre-identification and identification lines" {
 
 test "client accepts and hashes exact 255 byte LF-only SSH 1.99 identification" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     try startClientIdentificationRead(&client);
 
@@ -2249,7 +2249,7 @@ test "client accepts and hashes exact 255 byte LF-only SSH 1.99 identification" 
 
 test "client rejects identification line whose CRLF would exceed 255 bytes" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     try startClientIdentificationRead(&client);
 
@@ -2266,7 +2266,7 @@ test "client rejects identification line whose CRLF would exceed 255 bytes" {
 
 test "client rejects unterminated 255 byte identification line" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     try startClientIdentificationRead(&client);
 
@@ -2291,7 +2291,7 @@ test "client rejects malformed SSH identification grammar and bytes" {
 
     for (malformed) |line| {
         var prng = std.Random.DefaultPrng.init(42);
-        var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+        var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
         defer client.deinit();
         try startClientIdentificationRead(&client);
         try std.testing.expectError(
@@ -2303,7 +2303,7 @@ test "client rejects malformed SSH identification grammar and bytes" {
 
 test "client bounds pre-identification lines" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
 
     _ = try client.getNextEvent();
@@ -2435,7 +2435,7 @@ test "runtime packet limit enforces below at and above wire size" {
 test "identification byte limit accepts exact boundary then terminates" {
     const limits = ResourceLimits{ .max_identification_bytes = 4 };
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer client.deinit();
     try startClientIdentificationRead(&client);
 
@@ -2456,7 +2456,7 @@ test "pre-auth packet work and rekey limits fail closed at boundaries" {
         .min_packets_between_rekeys = 1,
     };
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer client.deinit();
 
     try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
@@ -2469,7 +2469,7 @@ test "pre-auth packet work and rekey limits fail closed at boundaries" {
 
     limits.max_pre_auth_packets = 20;
     limits.max_pre_auth_work = 9;
-    var work_client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var work_client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer work_client.deinit();
     try work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
     try work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
@@ -2480,7 +2480,7 @@ test "pre-auth packet work and rekey limits fail closed at boundaries" {
 
     limits.max_pre_auth_work = 100;
     limits.min_packets_between_rekeys = 1;
-    var frequency_client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var frequency_client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer frequency_client.deinit();
     try frequency_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
     try std.testing.expectError(
@@ -2489,7 +2489,7 @@ test "pre-auth packet work and rekey limits fail closed at boundaries" {
     );
 
     limits.min_packets_between_rekeys = 0;
-    var count_client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var count_client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer count_client.deinit();
     try count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
     try count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
@@ -2503,7 +2503,7 @@ test "server authentication attempt limit is independent of client attempts" {
     const privkey = @import("privkey.zig");
     const limits = ResourceLimits{ .max_server_auth_attempts = 2 };
     var prng = std.Random.DefaultPrng.init(42);
-    var server = try MisshodServer.initWithLimits(
+    var server = try SshzServer.initWithLimits(
         prng.random(),
         privkey.testkey_valid,
         std.testing.allocator,
@@ -2518,7 +2518,7 @@ test "server authentication attempt limit is independent of client attempts" {
         server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)),
     );
 
-    var client = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer client.deinit();
     try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
     try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
@@ -2541,7 +2541,7 @@ test "automatic rekey thresholds are deterministic below at and above" {
         .rekey_after_monotonic_ticks = 20,
     } };
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.initWithLimits(
+    var client = try SshzClient.initWithLimits(
         prng.random(),
         "test",
         std.testing.allocator,
@@ -2581,7 +2581,7 @@ test "client and server initiate automatic rekey and expose safe status" {
         .rekey_after_encrypted_packets = 1,
     } };
     var cprng = std.Random.DefaultPrng.init(43);
-    var client = try MisshodClient.initWithLimits(
+    var client = try SshzClient.initWithLimits(
         cprng.random(),
         "test",
         std.testing.allocator,
@@ -2607,7 +2607,7 @@ test "client and server initiate automatic rekey and expose safe status" {
     try std.testing.expectEqual(@as(u64, 2), client_status.outbound.encrypted_packets);
 
     var sprng = std.Random.DefaultPrng.init(44);
-    var server = try MisshodServer.initWithLimits(
+    var server = try SshzServer.initWithLimits(
         sprng.random(),
         privkey.testkey_valid,
         std.testing.allocator,
@@ -2638,7 +2638,7 @@ test "automatic rekey gates channel data until a committed read finishes" {
         .rekey_after_encrypted_packets = 1,
     } };
     var prng = std.Random.DefaultPrng.init(45);
-    var client = try MisshodClient.initWithLimits(
+    var client = try SshzClient.initWithLimits(
         prng.random(),
         "test",
         std.testing.allocator,
@@ -2675,7 +2675,7 @@ test "caller monotonic time initiates rekey without changing timeout meaning" {
         .rekey_after_monotonic_ticks = 10,
     } };
     var prng = std.Random.DefaultPrng.init(46);
-    var client = try MisshodClient.initWithLimits(
+    var client = try SshzClient.initWithLimits(
         prng.random(),
         "test",
         std.testing.allocator,
@@ -2699,7 +2699,7 @@ test "caller monotonic time initiates rekey without changing timeout meaning" {
         .deadlines = .{ .idle = 10 },
         .key_lifetime = .{ .rekey_after_monotonic_ticks = 10 },
     };
-    var timed_out = try MisshodClient.initWithLimits(
+    var timed_out = try SshzClient.initWithLimits(
         prng.random(),
         "test",
         std.testing.allocator,
@@ -2719,7 +2719,7 @@ test "caller monotonic time initiates rekey without changing timeout meaning" {
 
 test "inbound sequence hard bound terminates before wrap" {
     var prng = std.Random.DefaultPrng.init(47);
-    var client = try MisshodClient.init(prng.random(), "test", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "test", std.testing.allocator);
     defer client.deinit();
     client.session.keydata.s2c.seq = std.math.maxInt(u32);
     client.session.setIoSessionState(.{ .ReadPktBody = client.iobuf_rd[0..Protocol.sizeof_PktHdr] });
@@ -2732,7 +2732,7 @@ test "inbound sequence hard bound terminates before wrap" {
 
 test "direct application write latches key hard-bound failure" {
     var prng = std.Random.DefaultPrng.init(48);
-    var client = try MisshodClient.init(prng.random(), "test", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "test", std.testing.allocator);
     defer client.deinit();
     try installAutomaticRekeyTestKeys(&client.session.keydata);
     client.session.encrypted = true;
@@ -2761,7 +2761,7 @@ test "caller-driven deadlines use monotonic fake time and typed outcomes" {
     } };
     var prng = std.Random.DefaultPrng.init(42);
 
-    var handshake = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var handshake = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer handshake.deinit();
     try std.testing.expectError(error.DeadlinesNotInitialized, handshake.checkDeadlines(0));
     try handshake.initializeDeadlines(100);
@@ -2769,7 +2769,7 @@ test "caller-driven deadlines use monotonic fake time and typed outcomes" {
     try std.testing.expectEqual(TimeoutOutcome.Handshake, (try handshake.tick(110)).?);
     try std.testing.expectEqual(TimeoutOutcome.Handshake, handshake.timeoutOutcome().?);
 
-    var auth = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var auth = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer auth.deinit();
     auth.session.setSessionState(.AuthServReq);
     try auth.initializeDeadlines(200);
@@ -2777,7 +2777,7 @@ test "caller-driven deadlines use monotonic fake time and typed outcomes" {
     try std.testing.expect((try auth.tick(219)) == null);
     try std.testing.expectEqual(TimeoutOutcome.Authentication, (try auth.tick(220)).?);
 
-    var idle = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var idle = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer idle.deinit();
     idle.session.setSessionState(.ChannelActive);
     try idle.initializeDeadlines(300);
@@ -2786,7 +2786,7 @@ test "caller-driven deadlines use monotonic fake time and typed outcomes" {
     try std.testing.expectEqual(TimeoutOutcome.TotalSession, (try idle.tick(340)).?);
 
     const idle_limits = ResourceLimits{ .deadlines = .{ .idle = 30, .total_session = 100 } };
-    var idle_only = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, idle_limits);
+    var idle_only = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, idle_limits);
     defer idle_only.deinit();
     idle_only.session.setSessionState(.ChannelActive);
     try idle_only.initializeDeadlines(400);
@@ -2794,7 +2794,7 @@ test "caller-driven deadlines use monotonic fake time and typed outcomes" {
     try std.testing.expect((try idle_only.tick(439)) == null);
     try std.testing.expectEqual(TimeoutOutcome.Idle, (try idle_only.tick(440)).?);
 
-    var monotonic = try MisshodClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
+    var monotonic = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer monotonic.deinit();
     try monotonic.initializeDeadlines(500);
     try std.testing.expectError(error.DeadlinesAlreadyInitialized, monotonic.initializeDeadlines(501));
@@ -2808,7 +2808,7 @@ test "deadline phase transition precedes expiration of the prior phase" {
         .authentication = 20,
     } };
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.initWithLimits(
+    var client = try SshzClient.initWithLimits(
         prng.random(),
         "test",
         std.testing.allocator,
@@ -2826,8 +2826,8 @@ test "deadline phase transition precedes expiration of the prior phase" {
     try std.testing.expectEqual(TimeoutOutcome.Authentication, (try client.tick(30)).?);
 }
 
-test "MisshodClientEventCodes Banner variant" {
-    const banner: MisshodClientEventCodes = .{ .Banner = "Welcome to the server" };
+test "SshzClientEventCodes Banner variant" {
+    const banner: SshzClientEventCodes = .{ .Banner = "Welcome to the server" };
     switch (banner) {
         .Banner => |text| {
             try std.testing.expectEqualStrings("Welcome to the server", text);
@@ -2836,14 +2836,14 @@ test "MisshodClientEventCodes Banner variant" {
     }
 }
 
-test "MisshodClientEventCodes agent forwarding variants" {
-    const open_evt: MisshodClientEventCodes = .{ .AgentChannelOpen = 3 };
+test "SshzClientEventCodes agent forwarding variants" {
+    const open_evt: SshzClientEventCodes = .{ .AgentChannelOpen = 3 };
     switch (open_evt) {
         .AgentChannelOpen => |channel| try std.testing.expectEqual(@as(u32, 3), channel),
         else => return error.TestUnexpectedResult,
     }
 
-    const data_evt: MisshodClientEventCodes = .{ .AgentData = .{ .channel = 3, .data = "agent-data" } };
+    const data_evt: SshzClientEventCodes = .{ .AgentData = .{ .channel = 3, .data = "agent-data" } };
     switch (data_evt) {
         .AgentData => |data| {
             try std.testing.expectEqual(@as(u32, 3), data.channel);
@@ -2852,7 +2852,7 @@ test "MisshodClientEventCodes agent forwarding variants" {
         else => return error.TestUnexpectedResult,
     }
 
-    const closed_evt: MisshodClientEventCodes = .{ .AgentChannelClosed = 3 };
+    const closed_evt: SshzClientEventCodes = .{ .AgentChannelClosed = 3 };
     switch (closed_evt) {
         .AgentChannelClosed => |channel| try std.testing.expectEqual(@as(u32, 3), channel),
         else => return error.TestUnexpectedResult,
@@ -2871,8 +2871,8 @@ test "WindowSize struct" {
     try std.testing.expectEqual(@as(u32, 40), ws.rows);
 }
 
-test "MisshodServerEventCodes WindowChange variant" {
-    const evt: MisshodServerEventCodes = .{ .WindowChange = .{ .channel = 0, .cols = 80, .rows = 24, .width_px = 640, .height_px = 480 } };
+test "SshzServerEventCodes WindowChange variant" {
+    const evt: SshzServerEventCodes = .{ .WindowChange = .{ .channel = 0, .cols = 80, .rows = 24, .width_px = 640, .height_px = 480 } };
     switch (evt) {
         .WindowChange => |ws| {
             try std.testing.expectEqual(@as(u32, 80), ws.cols);
@@ -2881,8 +2881,8 @@ test "MisshodServerEventCodes WindowChange variant" {
     }
 }
 
-test "MisshodServerEventCodes Signal variant" {
-    const evt: MisshodServerEventCodes = .{ .Signal = .{ .channel = 0, .name = "INT" } };
+test "SshzServerEventCodes Signal variant" {
+    const evt: SshzServerEventCodes = .{ .Signal = .{ .channel = 0, .name = "INT" } };
     switch (evt) {
         .Signal => |sig| {
             try std.testing.expectEqualStrings("INT", sig.name);
@@ -2959,10 +2959,10 @@ test "client-server full handshake round-trip" {
     var cprng = std.Random.DefaultPrng.init(1);
     var sprng = std.Random.DefaultPrng.init(2);
 
-    var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(cprng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     try client.setTryNoneAuth(true);
-    var server = try MisshodServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
+    var server = try SshzServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
     defer server.deinit();
 
     var c2s_buf: [16384]u8 = undefined;
@@ -3108,12 +3108,12 @@ test "client-server full handshake round-trip" {
 }
 
 test "HostKeyInfo fingerprint computation" {
-    const Misshod = @import("misshod.zig");
+    const Sshz = @import("sshz.zig");
     const key_data = "test-host-key-data";
     var fp: [Protocol.hash_algo.digest_length]u8 = undefined;
     Protocol.hash_algo.hash(key_data, &fp, .{});
 
-    const info: Misshod.HostKeyInfo = .{
+    const info: Sshz.HostKeyInfo = .{
         .raw_key = key_data,
         .fingerprint = fp,
     };
@@ -3134,7 +3134,7 @@ test "HostKeyInfo fingerprint is deterministic" {
     try std.testing.expectEqualSlices(u8, &fp1, &fp2);
 }
 
-fn prepareHostKeyDecision(client: *MisshodClient, raw_key: []const u8) !HostKeyInfo {
+fn prepareHostKeyDecision(client: *SshzClient, raw_key: []const u8) !HostKeyInfo {
     client.session.hostkey_ks = try std.testing.allocator.dupe(u8, raw_key);
     var fingerprint: [Protocol.hash_algo.digest_length]u8 = undefined;
     Protocol.hash_algo.hash(raw_key, &fingerprint, .{});
@@ -3150,7 +3150,7 @@ fn prepareHostKeyDecision(client: *MisshodClient, raw_key: []const u8) !HostKeyI
 
 test "client explicitly accepts a pending host key" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     _ = try prepareHostKeyDecision(&client, "accepted-host-key");
 
@@ -3163,7 +3163,7 @@ test "client explicitly accepts a pending host key" {
 
 test "client explicitly rejects a pending host key before authentication" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     const expected = try prepareHostKeyDecision(&client, "rejected-host-key");
 
@@ -3189,7 +3189,7 @@ test "client explicitly rejects a pending host key before authentication" {
 
 test "clearing a host key event without a decision fails closed" {
     var prng = std.Random.DefaultPrng.init(42);
-    var client = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
     _ = try prepareHostKeyDecision(&client, "pending-host-key");
 
@@ -3211,7 +3211,7 @@ test "clearing a host key event without a decision fails closed" {
 
 test "init sets both iostates to Idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     try std.testing.expectEqual(IoState(.Client).Idle, m.iostate_rd);
@@ -3224,7 +3224,7 @@ test "init sets both iostates to Idle" {
 
 test "deinit zeros both buffers" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
 
     @memset(&m.iobuf_rd, 0xAA);
     @memset(&m.iobuf_wr, 0xBB);
@@ -3238,7 +3238,7 @@ test "deinit zeros both buffers" {
 test "deadline fail-closed scrubs session credentials keys and packet buffers" {
     const limits = ResourceLimits{ .deadlines = .{ .handshake = 1 } };
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
+    var m = try SshzClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
 
     try m.setPrivateKey("copied-private-key");
     try m.setPrivateKeyPassphrase("copied-key-passphrase");
@@ -3270,7 +3270,7 @@ test "deadline fail-closed scrubs session credentials keys and packet buffers" {
 
 test "requestRead sets iostate_rd, leaves iostate_wr unchanged" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.requestRead(0, 10, .ReadPktHdr);
@@ -3283,7 +3283,7 @@ test "requestRead sets iostate_rd, leaves iostate_wr unchanged" {
 
 test "requestWrite sets iostate_wr, leaves iostate_rd unchanged" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     // Simulate data in write buffer
@@ -3299,7 +3299,7 @@ test "requestWrite sets iostate_wr, leaves iostate_rd unchanged" {
 
 test "requestEvent sets iostate_wr to Eventing" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.requestEvent(.Connected, .Idle);
@@ -3318,7 +3318,7 @@ test "requestEvent sets iostate_wr to Eventing" {
 
 test "write feeds data into iobuf_rd" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.requestRead(0, 5, .ReadPktHdr);
@@ -3329,7 +3329,7 @@ test "write feeds data into iobuf_rd" {
 
 test "write rejects data when iostate_rd is Idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     const result = m.write("data");
@@ -3338,7 +3338,7 @@ test "write rejects data when iostate_rd is Idle" {
 
 test "peek reads from iobuf_wr" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     const msg = "world";
@@ -3351,7 +3351,7 @@ test "peek reads from iobuf_wr" {
 
 test "peek fails when iostate_wr is Idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     const result = m.peek(1);
@@ -3360,7 +3360,7 @@ test "peek fails when iostate_wr is Idle" {
 
 test "consumed advances wr_off" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     const msg = "abcde";
@@ -3373,7 +3373,7 @@ test "consumed advances wr_off" {
 
 test "consumed fails when iostate_wr is Idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     const result = m.consumed(1);
@@ -3382,7 +3382,7 @@ test "consumed fails when iostate_wr is Idle" {
 
 test "getNextEvent returns Event when Eventing" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.requestEvent(.Connected, .Idle);
@@ -3398,7 +3398,7 @@ test "getNextEvent returns Event when Eventing" {
 
 test "getNextEvent returns ReadyToConsume when only read is active" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     // Set ioSessionState to ReadPktHdr so advance() doesn't try to process Idle
@@ -3413,7 +3413,7 @@ test "getNextEvent returns ReadyToConsume when only read is active" {
 
 test "getNextEvent returns ReadyToProduce when only write is active" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     // Set ioSessionState to Idle; with write active, canProcessIoSessionState(.Idle)
@@ -3431,7 +3431,7 @@ test "getNextEvent returns ReadyToProduce when only write is active" {
 
 test "getNextEvent returns ReadyToConsumeAndProduce when both active" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.session.setIoSessionState(.ReadPktHdr);
@@ -3452,7 +3452,7 @@ test "getNextEvent returns ReadyToConsumeAndProduce when both active" {
 
 test "clearEvent resets iostate_wr from Eventing to Idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.requestEvent(.Connected, .Idle);
@@ -3465,7 +3465,7 @@ test "clearEvent resets iostate_wr from Eventing to Idle" {
 
 test "clearEvent fails for wrong event code" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.requestEvent(.Connected, .Idle);
@@ -3475,7 +3475,7 @@ test "clearEvent fails for wrong event code" {
 
 test "clearEvent fails when not eventing" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     const result = m.clearEvent(.Connected);
@@ -3484,7 +3484,7 @@ test "clearEvent fails when not eventing" {
 
 test "read and write buffers are independent" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     // Fill read buffer
@@ -3500,7 +3500,7 @@ test "read and write buffers are independent" {
 
 test "simultaneous read and write I/O: data does not cross-contaminate" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.session.setIoSessionState(.ReadPktHdr);
@@ -3530,7 +3530,7 @@ test "simultaneous read and write I/O: data does not cross-contaminate" {
 
 test "canProcessIoSessionState: Idle requires both sides idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.session.setIoSessionState(.Idle);
@@ -3545,7 +3545,7 @@ test "canProcessIoSessionState: Idle requires both sides idle" {
 
 test "canProcessIoSessionState: ReadPktHdr only needs read idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.session.setIoSessionState(.ReadPktHdr);
@@ -3560,7 +3560,7 @@ test "canProcessIoSessionState: ReadPktHdr only needs read idle" {
 
 test "canProcessIoSessionState: VersionWrite needs write idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.session.setIoSessionState(.VersionWrite);
@@ -3575,7 +3575,7 @@ test "canProcessIoSessionState: VersionWrite needs write idle" {
 
 test "canProcessIoSessionState: ReadPktCompletion needs write idle" {
     var prng = std.Random.DefaultPrng.init(42);
-    var m = try MisshodClient.init(prng.random(), "testuser", std.testing.allocator);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
     m.session.setIoSessionState(.{ .ReadPktCompletion = m.iobuf_rd[0..0] });
@@ -3590,7 +3590,7 @@ test "canProcessIoSessionState: ReadPktCompletion needs write idle" {
 }
 
 test "ReadyToConsumeAndProduce struct fields" {
-    const ev = MisshodEvent(.Client){ .ReadyToConsumeAndProduce = .{ .consume = 100, .produce = 50 } };
+    const ev = SshzEvent(.Client){ .ReadyToConsumeAndProduce = .{ .consume = 100, .produce = 50 } };
     switch (ev) {
         .ReadyToConsumeAndProduce => |s| {
             try std.testing.expectEqual(@as(usize, 100), s.consume);
@@ -3615,14 +3615,14 @@ test "full handshake round-trip handles multiple large compressed channel packet
     var cprng = std.Random.DefaultPrng.init(10);
     var sprng = std.Random.DefaultPrng.init(20);
 
-    var client = try MisshodClient.initWithLimits(
+    var client = try SshzClient.initWithLimits(
         cprng.random(),
         "testuser",
         std.testing.allocator,
         limits,
     );
     defer client.deinit();
-    var server = try MisshodServer.initWithLimits(
+    var server = try SshzServer.initWithLimits(
         sprng.random(),
         privkey.testkey_valid,
         std.testing.allocator,
@@ -3790,9 +3790,9 @@ test "client channelWriteComplete uses direct write when read is active" {
     var cprng = std.Random.DefaultPrng.init(100);
     var sprng = std.Random.DefaultPrng.init(200);
 
-    var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(cprng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
-    var server = try MisshodServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
+    var server = try SshzServer.init(sprng.random(), privkey.testkey_valid, std.testing.allocator);
     defer server.deinit();
 
     var c2s_buf: [16384]u8 = undefined;
@@ -3910,9 +3910,9 @@ fn driveHandshakeForKeys(hostkey_ascii: []const u8, client_key_ascii: ?[]const u
     var cprng = std.Random.DefaultPrng.init(1000);
     var sprng = std.Random.DefaultPrng.init(2000);
 
-    var client = try MisshodClient.init(cprng.random(), "testuser", std.testing.allocator);
+    var client = try SshzClient.init(cprng.random(), "testuser", std.testing.allocator);
     defer client.deinit();
-    var server = try MisshodServer.init(sprng.random(), hostkey_ascii, std.testing.allocator);
+    var server = try SshzServer.init(sprng.random(), hostkey_ascii, std.testing.allocator);
     defer server.deinit();
 
     var c2s_buf: [65536]u8 = undefined;

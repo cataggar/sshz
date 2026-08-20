@@ -13,10 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 12
     steps:
-      - name: Checkout misshod
+      - name: Checkout sshz
         uses: actions/checkout@v5
         with:
-          path: misshod
+          path: sshz
       - name: Install Zig
         shell: bash
         run: |
@@ -34,18 +34,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y time
       - name: Run deterministic stress acceptance
-        working-directory: misshod
+        working-directory: sshz
         run: |
           set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/misshod-stress-safe"
+          mkdir -p "${RUNNER_TEMP}/sshz-stress-safe"
           /usr/bin/time \
             -f "resource elapsed_seconds=%e max_rss_kib=%M exit=%x" \
-            -o "${RUNNER_TEMP}/misshod-stress-safe/resource.txt" \
+            -o "${RUNNER_TEMP}/sshz-stress-safe/resource.txt" \
             zig build stress -Doptimize=ReleaseSafe -- --seed 1751547392 \
-            2>&1 | tee "${RUNNER_TEMP}/misshod-stress-safe/stress.log"
-          cat "${RUNNER_TEMP}/misshod-stress-safe/resource.txt"
-          elapsed="$(sed -n 's/.*elapsed_seconds=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/misshod-stress-safe/resource.txt")"
-          rss="$(sed -n 's/.*max_rss_kib=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/misshod-stress-safe/resource.txt")"
+            2>&1 | tee "${RUNNER_TEMP}/sshz-stress-safe/stress.log"
+          cat "${RUNNER_TEMP}/sshz-stress-safe/resource.txt"
+          elapsed="$(sed -n 's/.*elapsed_seconds=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/sshz-stress-safe/resource.txt")"
+          rss="$(sed -n 's/.*max_rss_kib=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/sshz-stress-safe/resource.txt")"
           awk -v value="$elapsed" 'BEGIN { exit !(value <= 600) }' || {
             echo "stress elapsed-time budget exceeded: ${elapsed}s > 600s" >&2
             exit 1
@@ -59,7 +59,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stress-failure-logs
-          path: ${{ runner.temp }}/misshod-stress-safe/
+          path: ${{ runner.temp }}/sshz-stress-safe/
           if-no-files-found: ignore
           retention-days: 7
 
@@ -69,10 +69,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{matrix.os}}
     steps:
-      - name: Checkout misshod
+      - name: Checkout sshz
         uses: actions/checkout@v5
         with:
-          path: misshod
+          path: sshz
       - name: Install Zig
         shell: bash
         run: |
@@ -108,25 +108,25 @@ jobs:
           "${zig_dir}/zig" version
       - name: Build test
         run: zig build test
-        working-directory: misshod
+        working-directory: sshz
       - name: Bounded malformed-input corpus (Debug and ReleaseSafe)
         if: runner.os == 'Linux'
         timeout-minutes: 3
         run: |
           zig build malformed -Doptimize=Debug --test-timeout 30s --seed 0
           zig build malformed -Doptimize=ReleaseSafe --test-timeout 30s --seed 0
-        working-directory: misshod
+        working-directory: sshz
       - name: Build lib
         run: zig build
-        working-directory: misshod
+        working-directory: sshz
       - name: Build mssh
         if: runner.os != 'Windows'
         run: zig build
-        working-directory: misshod/mssh
+        working-directory: sshz/mssh
       - name: Build msshd
         if: runner.os != 'Windows'
         run: zig build
-        working-directory: misshod/msshd
+        working-directory: sshz/msshd
       - name: Install interop dependencies
         if: runner.os == 'Linux'
         run: |
@@ -136,9 +136,9 @@ jobs:
       - name: Interop test
         if: runner.os == 'Linux'
         run: zig build interop
-        working-directory: misshod
+        working-directory: sshz
         env:
-          MSSH_INTEROP_ARTIFACTS: ${{ runner.temp }}/misshod-interop
+          MSSH_INTEROP_ARTIFACTS: ${{ runner.temp }}/sshz-interop
           MSSH_INTEROP_REQUIRE_DROPBEAR: "1"
           MSSH_INTEROP_REQUIRE_LIBSSH: "1"
       - name: Upload interop failure logs
@@ -146,6 +146,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: interop-failure-logs
-          path: ${{ runner.temp }}/misshod-interop/logs/
+          path: ${{ runner.temp }}/sshz-interop/logs/
           if-no-files-found: ignore
           retention-days: 7

@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
     }
 
     const char *payload =
-        "misshod-libssh-probe:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\n";
+        "sshz-libssh-probe:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ\n";
     if (write_all(channel, payload, strlen(payload)) != 0) {
         goto cleanup;
     }

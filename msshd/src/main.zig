@@ -1,7 +1,7 @@
 const std = @import("std");
-const Misshod = @import("misshod");
-const MisshodServer = Misshod.MisshodServer;
-const SshOpenFailureReason = Misshod.SshOpenFailureReason;
+const Sshz = @import("sshz");
+const SshzServer = Sshz.SshzServer;
+const SshOpenFailureReason = Sshz.SshOpenFailureReason;
 const auth = @import("auth.zig");
 
 fn printUsage(program: []const u8) void {
@@ -176,8 +176,8 @@ pub fn main(init: std.process.Init) !void {
         try init.io.randomSecure(&seed);
         var prng = std.Random.DefaultCsprng.init(seed);
 
-        var misshod = try MisshodServer.init(prng.random(), hostkey_ascii, allocator);
-        defer misshod.deinit();
+        var sshz = try SshzServer.init(prng.random(), hostkey_ascii, allocator);
+        defer sshz.deinit();
 
         var iobuf: [8]u8 = undefined; // could be any size
         var quit = false;
@@ -189,13 +189,13 @@ pub fn main(init: std.process.Init) !void {
         defer _ = std.c.close(pipe[1]);
 
         ioloop: while (!quit) {
-            const ev = try misshod.getNextEvent();
+            const ev = try sshz.getNextEvent();
             switch (ev) {
                 .Event => |eventCode| {
                     switch (eventCode) {
                         .Connected => {
                             std.debug.print("Connected!\n", .{});
-                            try misshod.clearEvent(eventCode);
+                            try sshz.clearEvent(eventCode);
                         },
                         .RxData => |rxdata| {
                             try writeAllFd(std.c.STDOUT_FILENO, rxdata.data);
@@ -204,7 +204,7 @@ pub fn main(init: std.process.Init) !void {
                             const response = try std.fmt.bufPrint(&response_buf, "You said '{s}'\r\n", .{rxdata.data});
                             try writeAllFd(pipe[1], response);
 
-                            try misshod.clearEvent(eventCode);
+                            try sshz.clearEvent(eventCode);
                             pending_eof_channel = rxdata.channel;
                         },
                         .EndSession => |reason| {
@@ -221,7 +221,7 @@ pub fn main(init: std.process.Init) !void {
                                 } },
                                 .KeyboardInteractive => .keyboard_interactive,
                             } else .none;
-                            try misshod.decideUserAuth(
+                            try sshz.decideUserAuth(
                                 if (policy.allows(credentials.username, attempt)) .Allow else .Deny,
                             );
                         },
@@ -238,20 +238,20 @@ pub fn main(init: std.process.Init) !void {
                         .AgentChannelOpen,
                         .AgentChannelClosed,
                         => {
-                            try misshod.clearEvent(eventCode);
+                            try sshz.clearEvent(eventCode);
                         },
                         .ChannelOpenRequest => |request| {
-                            try misshod.rejectChannelOpen(
+                            try sshz.rejectChannelOpen(
                                 request.channel,
                                 SshOpenFailureReason.AdministrativelyProhibited,
                                 "unsupported channel open",
                             );
                         },
                         .TcpipForward => {
-                            try misshod.rejectTcpipForward();
+                            try sshz.rejectTcpipForward();
                         },
                         .CancelTcpipForward => {
-                            try misshod.rejectCancelTcpipForward();
+                            try sshz.rejectCancelTcpipForward();
                         },
                     }
                 },
@@ -294,34 +294,34 @@ pub fn main(init: std.process.Init) !void {
                             }
                             const nbytes = try readFd(stream.socket.handle, iobuf[0..bytes_to_read]);
                             if (nbytes > 0) {
-                                try misshod.write(iobuf[0..nbytes]);
+                                try sshz.write(iobuf[0..nbytes]);
                                 continue :ioloop;
                             } else {
                                 continue :nextclient;
                             }
                         }
                         if (fds[0].revents & std.posix.POLL.OUT > 0) { // socket is writeable
-                            const towrite = try misshod.peek(4);
+                            const towrite = try sshz.peek(4);
                             const bytes_written = try writeFd(stream.socket.handle, towrite);
-                            try misshod.consumed(bytes_written);
+                            try sshz.consumed(bytes_written);
                             if (bytes_written == towrite.len) {
                                 if (pending_eof_channel) |channel| {
                                     pending_eof_channel = null;
                                     pending_close_channel = channel;
-                                    try misshod.sendChannelEof(channel);
+                                    try sshz.sendChannelEof(channel);
                                 } else if (pending_close_channel) |channel| {
                                     pending_close_channel = null;
-                                    try misshod.sendChannelClose(channel);
+                                    try sshz.sendChannelClose(channel);
                                 }
                             }
                             continue :ioloop;
                         }
                         if (fds[1].revents & std.posix.POLL.IN > 0) { // data to be sent (from pipe)
-                            const buf = try misshod.getChannelWriteBuffer(0);
+                            const buf = try sshz.getChannelWriteBuffer(0);
                             if (buf.len > 0) {
                                 const count = readFd(pipe[0], buf) catch 0;
                                 if (count > 0) {
-                                    try misshod.channelWriteComplete(0, count);
+                                    try sshz.channelWriteComplete(0, count);
                                     continue :ioloop;
                                 }
                             }

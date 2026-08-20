@@ -1,10 +1,10 @@
 const std = @import("std");
-const misshod = @import("misshod");
+const sshz = @import("sshz");
 const common = @import("common.zig");
 
 pub const HostKeyPolicy = struct {
     context: *anyopaque,
-    verify_fn: *const fn (*anyopaque, []const u8, misshod.HostKeyInfo) anyerror!bool,
+    verify_fn: *const fn (*anyopaque, []const u8, sshz.HostKeyInfo) anyerror!bool,
 };
 
 pub const Credentials = struct {
@@ -24,7 +24,7 @@ pub const Config = struct {
     username: []const u8,
     endpoint: []const u8,
     command: []const u8,
-    limits: misshod.ResourceLimits,
+    limits: sshz.ResourceLimits,
     host_keys: HostKeyPolicy,
     credentials: Credentials,
     sink: Sink,
@@ -35,12 +35,12 @@ pub fn init(
     allocator: std.mem.Allocator,
     config: *const Config,
     now: u64,
-) !misshod.MisshodClient {
+) !sshz.SshzClient {
     if (config.username.len == 0 or config.endpoint.len == 0 or config.command.len == 0)
         return error.InvalidConfiguration;
     try common.requireProductionLimits(config.limits);
 
-    var client = try misshod.MisshodClient.initWithLimits(
+    var client = try sshz.SshzClient.initWithLimits(
         random,
         config.username,
         allocator,
@@ -53,8 +53,8 @@ pub fn init(
 }
 
 fn provideOptional(
-    client: *misshod.MisshodClient,
-    event: misshod.MisshodClientEventCodes,
+    client: *sshz.SshzClient,
+    event: sshz.SshzClientEventCodes,
     provider: ?*const fn (*anyopaque) anyerror!?[]const u8,
     context: *anyopaque,
     comptime setter: enum { private_key, private_key_passphrase, password },
@@ -73,9 +73,9 @@ fn provideOptional(
 }
 
 fn handleEvent(
-    client: *misshod.MisshodClient,
+    client: *sshz.SshzClient,
     config: *const Config,
-    event: misshod.MisshodClientEventCodes,
+    event: sshz.SshzClientEventCodes,
 ) !common.PumpResult {
     switch (event) {
         .CheckHostKey => |key| {
@@ -122,7 +122,7 @@ fn handleEvent(
         },
         .ChannelOpenRequest => |request| try client.rejectChannelOpen(
             request.channel,
-            misshod.SshOpenFailureReason.AdministrativelyProhibited,
+            sshz.SshOpenFailureReason.AdministrativelyProhibited,
             "client policy rejects peer channel opens",
         ),
         .TcpipForwardSuccess,
@@ -146,7 +146,7 @@ fn handleEvent(
 }
 
 fn consume(
-    client: *misshod.MisshodClient,
+    client: *sshz.SshzClient,
     transport: common.Transport,
     scratch: []u8,
     requested: usize,
@@ -160,7 +160,7 @@ fn consume(
 }
 
 fn produce(
-    client: *misshod.MisshodClient,
+    client: *sshz.SshzClient,
     transport: common.Transport,
     requested: usize,
     now: u64,
@@ -175,7 +175,7 @@ fn produce(
 /// Call only after polling the transport. The caller owns transport closure
 /// and must `defer client.deinit()`; any returned error is terminal.
 pub fn pumpOnce(
-    client: *misshod.MisshodClient,
+    client: *sshz.SshzClient,
     config: *const Config,
     transport: common.Transport,
     scratch: []u8,
@@ -207,7 +207,7 @@ pub fn pumpOnce(
 }
 
 pub fn sendChannelData(
-    client: *misshod.MisshodClient,
+    client: *sshz.SshzClient,
     channel: u32,
     data: []const u8,
 ) !usize {
@@ -226,7 +226,7 @@ pub fn main(_: std.process.Init) !void {
 
 test "production client pump is compile-checked without network I/O" {
     const Mock = struct {
-        fn verify(_: *anyopaque, _: []const u8, _: misshod.HostKeyInfo) !bool {
+        fn verify(_: *anyopaque, _: []const u8, _: sshz.HostKeyInfo) !bool {
             return false;
         }
 
@@ -246,7 +246,7 @@ test "production client pump is compile-checked without network I/O" {
     };
 
     var context: u8 = 0;
-    const limits: misshod.ResourceLimits = .{
+    const limits: sshz.ResourceLimits = .{
         .deadlines = .{
             .handshake = 100,
             .authentication = 100,
