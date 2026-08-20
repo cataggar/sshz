@@ -101,8 +101,9 @@ stress diagnostics.
 
 ## Environmental limits
 
-- Peer modes require the same OpenSSH, Dropbear, libssh, compiler, account,
-  and non-interactive privilege facilities documented by `interop/run.sh`.
+- Peer modes require the OpenSSH, Dropbear, libssh, compiler, account, and
+  non-interactive privilege facilities documented by
+  [interoperability testing](interoperability.md).
 - Dropbear account creation is Linux-specific. RSS and FD evidence uses Linux
   `/proc`; other hosts still run the deterministic driver without that evidence.
 - Scheduled peer coverage supplements the in-process public-API acceptance.

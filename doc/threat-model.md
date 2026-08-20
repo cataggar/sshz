@@ -3,9 +3,9 @@
 ## Status
 
 This document describes the security boundary of the current sshz repository
-and the work required before a production release. It is not a statement that
-sshz is production-ready. **sshz is not secure and must not be used in
-real-world systems.**
+and the work required before a supported release. Unresolved blockers are
+listed below; release decisions require the evidence and review defined by the
+[release checklist](release-checklist.md).
 
 The model applies to the client and server library in `src/` when embedded in an
 application. The checked-in programs are deliberately not production
