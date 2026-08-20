@@ -1,8 +1,8 @@
 # Release checklist and platform matrix
 
-This checklist gates a future production claim. Completing a build alone is
-not sufficient. **sshz is currently not secure and must not be used in
-real-world systems.**
+This checklist gates a supported release. Completing a build alone is not
+sufficient; every applicable correctness, interoperability, security,
+documentation, platform, and review requirement below must be satisfied.
 
 ## Candidate checklist
 

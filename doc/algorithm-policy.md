@@ -4,8 +4,8 @@
 
 This document defines the algorithm allowlist intended for a future production
 sshz release and records what the current implementation actually enforces.
-It is not a production-readiness claim. **sshz is not secure and must not be
-used in real-world systems.** See the [production threat model](threat-model.md)
+It is not a release-readiness claim. See the
+[production threat model](threat-model.md)
 for the wider security boundary and release blockers.
 
 The policy applies to the client and server library in `src/`. The example

@@ -2,12 +2,13 @@
 
 ## Status
 
-This document describes the intended embedding boundary; it is not a security
-claim. **sshz is not secure and must not be used in real-world systems.**
-The [threat model](threat-model.md) lists release blockers. `mssh` and
-`msshd` are demos, not deployment templates. The examples under
+This document describes the intended embedding boundary; it is not a release
+or support claim. The [threat model](threat-model.md) records unresolved
+release blockers, and the [release checklist](release-checklist.md) defines
+the evidence required for a supported release. `mssh` and `msshd` are demos,
+not deployment templates. The examples under
 [`examples/production/`](../examples/production/) demonstrate fail-closed
-integration patterns, but do not make the library production-ready.
+integration patterns.
 
 ## Compatibility policy
 
