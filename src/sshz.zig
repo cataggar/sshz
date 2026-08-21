@@ -94,6 +94,12 @@ pub const KeyLifetimeLimits = struct {
     rekey_after_monotonic_ticks: ?u64 = null,
 };
 
+/// The channel receive window advertised by default, matching OpenSSH.
+///
+/// Named because tests assert on what goes out on the wire, and a literal
+/// repeated in four of them is four places to miss when it changes.
+pub const default_channel_window: u32 = 2 * 1024 * 1024;
+
 pub const ResourceCapacities = struct {
     pub const packet_size: usize = Protocol.MaxSSHPacket;
     pub const payload_size: usize = Protocol.MaxPayload;
@@ -123,7 +129,15 @@ pub const ResourceLimits = struct {
     max_packet_size: usize = ResourceCapacities.packet_size,
     max_payload_size: usize = ResourceCapacities.payload_size,
     max_channels: u8 = ResourceCapacities.channels,
-    initial_channel_window: u32 = Protocol.MaxChannelDataLen,
+    /// The receive window advertised on every channel this client opens.
+    ///
+    /// Two megabytes, which is what OpenSSH advertises. The obvious value is
+    /// one maximum-size packet, and it is the wrong one: it lets a peer send
+    /// exactly one packet before it must stop and wait to be credited, so
+    /// every packet of a large transfer depends on a window adjustment
+    /// arriving in time. A bulk download then spends its life in the one path
+    /// that has to be perfect, rather than in the one that is simply fast.
+    initial_channel_window: u32 = default_channel_window,
     max_channel_window: u32 = ResourceCapacities.channel_window,
     channel_packet_size: u32 = Protocol.MaxChannelDataLen,
     max_peer_packet_size: u32 = Protocol.MaxChannelDataLen,

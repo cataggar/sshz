@@ -3279,7 +3279,7 @@ test "openForwardedTcpipChannel writes forwarded-tcpip open payload" {
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try rdr.readU8());
     try std.testing.expectEqualStrings("forwarded-tcpip", try rdr.readU32LenString());
     try std.testing.expectEqual(channel_id, try rdr.readU32());
-    try std.testing.expectEqual(Protocol.MaxChannelDataLen, try rdr.readU32());
+    try std.testing.expectEqual(Sshz.default_channel_window, try rdr.readU32());
     try std.testing.expectEqual(Protocol.MaxChannelDataLen, try rdr.readU32());
     try std.testing.expectEqualStrings("127.0.0.1", try rdr.readU32LenString());
     try std.testing.expectEqual(@as(u32, 2200), try rdr.readU32());

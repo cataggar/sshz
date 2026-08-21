@@ -3185,7 +3185,7 @@ test "openSessionChannel writes channel open for new raw session channel" {
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try rdr.readU8());
     try std.testing.expectEqualStrings("session", try rdr.readU32LenString());
     try std.testing.expectEqual(channel_id, try rdr.readU32());
-    try std.testing.expectEqual(Protocol.MaxChannelDataLen, try rdr.readU32());
+    try std.testing.expectEqual(Sshz.default_channel_window, try rdr.readU32());
     try std.testing.expectEqual(Protocol.MaxChannelDataLen, try rdr.readU32());
 }
 
@@ -3207,7 +3207,7 @@ test "openDirectTcpipChannel writes direct-tcpip open payload" {
     try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try rdr.readU8());
     try std.testing.expectEqualStrings("direct-tcpip", try rdr.readU32LenString());
     try std.testing.expectEqual(channel_id, try rdr.readU32());
-    try std.testing.expectEqual(Protocol.MaxChannelDataLen, try rdr.readU32());
+    try std.testing.expectEqual(Sshz.default_channel_window, try rdr.readU32());
     try std.testing.expectEqual(Protocol.MaxChannelDataLen, try rdr.readU32());
     try std.testing.expectEqualStrings("example.com", try rdr.readU32LenString());
     try std.testing.expectEqual(@as(u32, 443), try rdr.readU32());
@@ -3785,7 +3785,13 @@ test "client receives exactly advertised maximum channel data" {
         },
         else => return error.TestUnexpectedResult,
     }
-    try std.testing.expectEqual(@as(u32, 0), chan.local_window);
+    // The window is consumed by exactly what arrived. Asserting it reaches
+    // zero would only be true when the whole window is one packet, which was
+    // the old default and is the reason large transfers stalled.
+    try std.testing.expectEqual(
+        Sshz.default_channel_window - Protocol.MaxChannelDataLen,
+        chan.local_window,
+    );
 }
 
 test "client runtime channel buffer pending and peer limits enforce boundaries" {
