@@ -1767,6 +1767,8 @@ pub fn SshzImpl(role: Role) type {
             };
         }
 
+        /// Configures the automatically opened session to send an `exec`
+        /// request. No PTY is requested unless `setAutoPty` is also called.
         pub fn setAutoExecCommand(self: *Self, command: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoExecCommand(command),
@@ -1774,6 +1776,10 @@ pub fn SshzImpl(role: Role) type {
             };
         }
 
+        /// Configures and explicitly requests a PTY for the automatic session.
+        ///
+        /// This may be called before or after `setAutoExecCommand`. Automatic
+        /// shells request a PTY even when this setter is not called.
         pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoPty(term, cols, rows, width_px, height_px),
