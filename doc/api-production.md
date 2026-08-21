@@ -130,6 +130,23 @@ processing. This automatic-session behavior is pre-1.0 and unsuitable as an
 implicit production policy. Configure the intended operation before driving
 the handshake.
 
+For an automatic shell or exec, save or query `automaticSessionChannelId()`.
+`channelExitResult(id)` returns the first valid RFC 4254 terminal result:
+`.Status`, `.Signal` (including core-dump, error-message, and language-tag
+fields), or `.NoResult` after a close without either request. Results survive
+channel removal and `EndSession`. Signal strings are allocator-owned by the
+client and borrowed until `clearChannelExitResult(id)` or `deinit`; copy them
+before that point if they must live longer.
+
+Completed results are never silently evicted. Each session channel reserves
+one fixed-capacity result slot before its open is sent. Once retained completed
+results consume the configured channel capacity, another session open returns
+`tooManyChannels` until the application calls
+`clearChannelExitResult(id)`. Clearing an open channel's reservation returns
+false, so close cannot lose its result. Open failures release their reservation
+automatically. The production client example treats status zero as success and
+reports nonzero, signal, and missing-result outcomes as terminal errors.
+
 ## Server authentication and authorization
 
 `UserAuth` means protocol-level parsing succeeded; it does **not** mean the
@@ -176,7 +193,9 @@ by connection cleanup, not acceptance or an indefinite pending event.
    return an empty buffer or `NotReady`.
 5. `sendChannelEof` ends the local data direction after queued data.
    `sendChannelClose` abandons unsent data and starts close exchange. After
-   close/end-session, release every application resource bound to that channel.
+   close/end-session, inspect `channelExitResult` for session channels, then
+   call `clearChannelExitResult` and release every application resource bound
+   to that channel.
 
 Reject forwarding and agent requests unless separately authorized. Validate
 resolved destinations too, preventing DNS rebinding and access to loopback,

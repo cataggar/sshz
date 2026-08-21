@@ -604,6 +604,20 @@ pub const ChannelOpenFailure = struct {
     description: []const u8,
 };
 
+pub const ChannelExitSignal = struct {
+    signal_name: []const u8,
+    core_dumped: bool,
+    error_message: []const u8,
+    language_tag: []const u8,
+};
+
+pub const ChannelExitResult = union(enum) {
+    Status: u32,
+    Signal: ChannelExitSignal,
+    /// The channel completed its close exchange without a terminal result.
+    NoResult,
+};
+
 pub const TcpipForwardRequest = struct {
     bind_address: []const u8,
     bind_port: u32,
@@ -1752,6 +1766,39 @@ pub fn SshzImpl(role: Role) type {
                     return err;
                 },
                 .Server => IoError.UnimplementedService,
+            };
+        }
+
+        /// Returns the automatic session channel ID once it has been allocated.
+        ///
+        /// The ID remains available after channel close and `EndSession`.
+        pub fn automaticSessionChannelId(self: *const Self) ?u32 {
+            return switch (role) {
+                .Client => self.session.automaticSessionChannelId(),
+                .Server => null,
+            };
+        }
+
+        /// Returns a session channel's terminal result when one is available.
+        ///
+        /// Signal strings are owned by the client. Returned slices remain valid
+        /// until `clearChannelExitResult(channel_id)` or `deinit`.
+        pub fn channelExitResult(self: *const Self, channel_id: u32) ?ChannelExitResult {
+            return switch (role) {
+                .Client => self.session.channelExitResult(channel_id),
+                .Server => null,
+            };
+        }
+
+        /// Releases a completed session channel result and its reserved slot.
+        ///
+        /// Returns false while the channel is still open or when no reservation
+        /// exists. Applications must release completed results before opening
+        /// more session channels once the configured channel capacity is used.
+        pub fn clearChannelExitResult(self: *Self, channel_id: u32) bool {
+            return switch (role) {
+                .Client => self.session.clearChannelExitResult(channel_id),
+                .Server => false,
             };
         }
 
