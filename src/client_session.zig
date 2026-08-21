@@ -27,6 +27,30 @@ const ClientChannelOpenMode = @import("channel.zig").ClientChannelOpenMode;
 const ChannelType = @import("channel.zig").ChannelType;
 const TcpipOpen = @import("channel.zig").TcpipOpen;
 
+const OwnedExitSignal = struct {
+    signal_name: []u8,
+    core_dumped: bool,
+    error_message: []u8,
+    language_tag: []u8,
+};
+
+const OwnedExitResult = union(enum) {
+    Status: u32,
+    Signal: OwnedExitSignal,
+    NoResult,
+};
+
+const ExitResultSlot = struct {
+    channel_id: u32,
+    completed: bool = false,
+    result: ?OwnedExitResult = null,
+};
+
+const PendingChannelReply = struct {
+    remote_id: u32,
+    success: bool,
+};
+
 pub const SessionState = enum {
     Init,
     KexInitWrite,
@@ -100,6 +124,11 @@ pub const Session = struct {
     inbound_encrypted: bool,
     channel_table: ChannelTable,
     active_channel_id: ?u32,
+    automatic_session_channel_id: ?u32,
+    exit_results: [MaxChannels]?ExitResultSlot,
+    pending_channel_replies: [MaxChannels]PendingChannelReply,
+    pending_channel_replies_head: usize,
+    pending_channel_replies_len: usize,
     pending_window_change: ?[4]u32,
     pending_global_request: ?PendingGlobalRequest,
     pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
@@ -167,6 +196,11 @@ pub const Session = struct {
             .private_key = null,
             .channel_table = ChannelTable{ .limits = limits.channelLimits() },
             .active_channel_id = null,
+            .automatic_session_channel_id = null,
+            .exit_results = .{null} ** MaxChannels,
+            .pending_channel_replies = undefined,
+            .pending_channel_replies_head = 0,
+            .pending_channel_replies_len = 0,
             .pending_window_change = null,
             .pending_global_request = null,
             .agent_forwarding_enabled = false,
@@ -218,6 +252,10 @@ pub const Session = struct {
         }
         self.channel_table.secureZeroAll();
         self.active_channel_id = null;
+        self.automatic_session_channel_id = null;
+        self.clearAllExitResults();
+        self.pending_channel_replies_head = 0;
+        self.pending_channel_replies_len = 0;
         self.pending_global_request = null;
         self.keydata.clear();
         self.clearKexState();
@@ -271,6 +309,7 @@ pub const Session = struct {
             self.private_key = null;
         }
         self.channel_table.secureZeroAll();
+        self.clearAllExitResults();
         self.keydata.clear();
     }
 
@@ -280,6 +319,106 @@ pub const Session = struct {
             self.allocator.free(slice);
             field.* = null;
         }
+    }
+
+    fn clearOwnedExitResult(self: *Self, result: *OwnedExitResult) void {
+        switch (result.*) {
+            .Signal => |signal| {
+                self.allocator.free(signal.signal_name);
+                self.allocator.free(signal.error_message);
+                self.allocator.free(signal.language_tag);
+            },
+            .Status, .NoResult => {},
+        }
+        result.* = .NoResult;
+    }
+
+    fn clearAllExitResults(self: *Self) void {
+        for (&self.exit_results) |*entry| {
+            if (entry.*) |*slot| {
+                if (slot.result) |*result| self.clearOwnedExitResult(result);
+                entry.* = null;
+            }
+        }
+    }
+
+    fn findExitResultSlot(self: *Self, channel_id: u32) ?*ExitResultSlot {
+        for (&self.exit_results) |*entry| {
+            if (entry.*) |*slot| {
+                if (slot.channel_id == channel_id) return slot;
+            }
+        }
+        return null;
+    }
+
+    fn findExitResultSlotConst(self: *const Self, channel_id: u32) ?*const ExitResultSlot {
+        for (&self.exit_results) |*entry| {
+            if (entry.*) |*slot| {
+                if (slot.channel_id == channel_id) return slot;
+            }
+        }
+        return null;
+    }
+
+    fn reserveExitResult(self: *Self, channel_id: u32) SshzError!void {
+        if (self.findExitResultSlot(channel_id) != null) return IoError.tooManyChannels;
+        for (&self.exit_results, 0..) |*entry, index| {
+            if (index >= self.limits.max_channels) break;
+            if (entry.* == null) {
+                entry.* = .{ .channel_id = channel_id };
+                return;
+            }
+        }
+        return IoError.tooManyChannels;
+    }
+
+    fn releaseExitResultReservation(self: *Self, channel_id: u32) void {
+        for (&self.exit_results) |*entry| {
+            if (entry.*) |*slot| {
+                if (slot.channel_id != channel_id) continue;
+                if (slot.result) |*result| self.clearOwnedExitResult(result);
+                entry.* = null;
+                return;
+            }
+        }
+    }
+
+    fn completeExitResult(self: *Self, channel_id: u32) void {
+        const slot = self.findExitResultSlot(channel_id) orelse return;
+        if (slot.result == null) slot.result = .NoResult;
+        slot.completed = true;
+    }
+
+    pub fn automaticSessionChannelId(self: *const Self) ?u32 {
+        return self.automatic_session_channel_id;
+    }
+
+    pub fn channelExitResult(self: *const Self, channel_id: u32) ?Sshz.ChannelExitResult {
+        const slot = self.findExitResultSlotConst(channel_id) orelse return null;
+        const result = slot.result orelse return null;
+        return switch (result) {
+            .Status => |status| .{ .Status = status },
+            .Signal => |signal| .{ .Signal = .{
+                .signal_name = signal.signal_name,
+                .core_dumped = signal.core_dumped,
+                .error_message = signal.error_message,
+                .language_tag = signal.language_tag,
+            } },
+            .NoResult => .NoResult,
+        };
+    }
+
+    pub fn clearChannelExitResult(self: *Self, channel_id: u32) bool {
+        for (&self.exit_results) |*entry| {
+            if (entry.*) |*slot| {
+                if (slot.channel_id != channel_id) continue;
+                if (!slot.completed) return false;
+                if (slot.result) |*result| self.clearOwnedExitResult(result);
+                entry.* = null;
+                return true;
+            }
+        }
+        return false;
     }
 
     fn clearEphemeralKeyPair(self: *Self) void {
@@ -562,7 +701,12 @@ pub const Session = struct {
     }
 
     fn allocateClientSessionChannel(self: *Self, mode: ClientChannelOpenMode) SshzError!*Channel {
-        return self.allocateClientChannel(mode, .Session, .{});
+        const chan = try self.allocateClientChannel(mode, .Session, .{});
+        self.reserveExitResult(chan.local_id) catch |err| {
+            self.channel_table.freeChannel(chan.local_id);
+            return err;
+        };
+        return chan;
     }
 
     fn activateDelayedCompression(self: *Self) SshzError!void {
@@ -887,6 +1031,7 @@ pub const Session = struct {
                 }
                 const mode: ClientChannelOpenMode = if (self.auto_exec_command != null) .AutoExec else .AutoShell;
                 const chan = try self.allocateClientSessionChannel(mode);
+                self.automatic_session_channel_id = chan.local_id;
                 self.active_channel_id = chan.local_id;
                 self.setSessionState(.ChannelActive);
             },
@@ -894,6 +1039,7 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelActive => {
+                if (try self.flushPendingChannelReply(sshz)) return;
                 try self.advanceChannel(sshz, outkeys);
             },
         }
@@ -1112,6 +1258,9 @@ pub const Session = struct {
             .Closed => {
                 const local_id = chan.local_id;
                 const kind = chan.kind;
+                if (kind == .Session and chan.channel_type == .Session) {
+                    self.completeExitResult(local_id);
+                }
                 self.channel_table.freeChannel(local_id);
                 self.active_channel_id = null;
                 if (kind == .AgentForward) {
@@ -1444,7 +1593,8 @@ pub const Session = struct {
     /// there is nothing to wait for.
     pub fn flushPendingWindowChange(self: *Self, sshz: *SshzClient) SshzError!bool {
         if (self.pending_window_change == null) return false;
-        if (self.sessionState != .ChannelActive or self.is_rekeying or
+        if (self.pending_channel_replies_len != 0 or
+            self.sessionState != .ChannelActive or self.is_rekeying or
             sshz.local_rekey_pending or sshz.iostate_wr != .Idle)
         {
             return false;
@@ -1502,6 +1652,7 @@ pub const Session = struct {
     pub fn dispatchDeferredChannelWrite(self: *Self, sshz: *SshzClient) SshzError!bool {
         if (self.sessionState != .ChannelActive or self.is_rekeying or sshz.local_rekey_pending or
             sshz.iostate_wr != .Idle) return false;
+        if (try self.flushPendingChannelReply(sshz)) return true;
         for (0..MaxChannels) |_| {
             const chan = self.channel_table.findNextDeferredWrite() orelse return false;
             if ((chan.close_received or chan.close_pending) and chan.tx_in_flight_len == 0) {
@@ -1679,6 +1830,127 @@ pub const Session = struct {
         try pkt.writeU32LenString(description);
         try pkt.writeU32LenString("");
         try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.c2s, &pkt, &sshz.iobuf_wr), .Idle);
+    }
+
+    fn queueChannelReply(self: *Self, remote_id: u32, success: bool) SshzError!void {
+        if (self.pending_channel_replies_len >= self.limits.max_channels)
+            return IoError.ResourceLimitExceeded;
+        const index = (self.pending_channel_replies_head + self.pending_channel_replies_len) % MaxChannels;
+        self.pending_channel_replies[index] = .{ .remote_id = remote_id, .success = success };
+        self.pending_channel_replies_len += 1;
+    }
+
+    fn flushPendingChannelReply(self: *Self, sshz: *SshzClient) SshzError!bool {
+        if (self.pending_channel_replies_len == 0 or self.is_rekeying or
+            sshz.local_rekey_pending or sshz.iostate_wr != .Idle)
+        {
+            return false;
+        }
+
+        const reply = self.pending_channel_replies[self.pending_channel_replies_head];
+        var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
+        try pkt.writeU8(@intFromEnum(if (reply.success)
+            Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS
+        else
+            Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE));
+        try pkt.writeU32(reply.remote_id);
+        try sshz.requestWrite(
+            try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.c2s, &pkt, &sshz.iobuf_wr),
+            .WriteCompletePreserveState,
+        );
+        self.pending_channel_replies_head = (self.pending_channel_replies_head + 1) % MaxChannels;
+        self.pending_channel_replies_len -= 1;
+        return true;
+    }
+
+    fn recordExitStatus(self: *Self, channel_id: u32, status: u32) void {
+        const slot = self.findExitResultSlot(channel_id) orelse return;
+        if (slot.result == null) slot.result = .{ .Status = status };
+    }
+
+    fn recordExitSignal(
+        self: *Self,
+        channel_id: u32,
+        signal_name: []const u8,
+        core_dumped: bool,
+        error_message: []const u8,
+        language_tag: []const u8,
+    ) SshzError!void {
+        const slot = self.findExitResultSlot(channel_id) orelse return;
+        if (slot.result != null) return;
+
+        const owned_signal_name = try self.allocator.dupe(u8, signal_name);
+        errdefer self.allocator.free(owned_signal_name);
+        const owned_error_message = try self.allocator.dupe(u8, error_message);
+        errdefer self.allocator.free(owned_error_message);
+        const owned_language_tag = try self.allocator.dupe(u8, language_tag);
+        errdefer self.allocator.free(owned_language_tag);
+        slot.result = .{ .Signal = .{
+            .signal_name = owned_signal_name,
+            .core_dumped = core_dumped,
+            .error_message = owned_error_message,
+            .language_tag = owned_language_tag,
+        } };
+    }
+
+    fn handleChannelRequestPacket(
+        self: *Self,
+        rdr: *BufferReader,
+        sshz: *SshzClient,
+    ) SshzError!void {
+        const channel_id = try rdr.readU32();
+        const request_name = try rdr.readU32LenString();
+        const want_reply = try rdr.readBoolean();
+        const recognized_status = std.mem.eql(u8, request_name, Protocol.channel_request_exit_status);
+        const recognized_signal = std.mem.eql(u8, request_name, Protocol.channel_request_exit_signal);
+
+        var status: u32 = 0;
+        var signal_name: []const u8 = "";
+        var core_dumped = false;
+        var error_message: []const u8 = "";
+        var language_tag: []const u8 = "";
+        if (recognized_status) {
+            status = try rdr.readU32();
+            if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+        } else if (recognized_signal) {
+            signal_name = try rdr.readU32LenString();
+            core_dumped = try rdr.readBoolean();
+            error_message = try rdr.readU32LenString();
+            language_tag = try rdr.readU32LenString();
+            if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+        }
+
+        const chan = self.channel_table.findByLocalId(channel_id);
+        const valid_session = if (chan) |channel|
+            channel.kind == .Session and channel.channel_type == .Session and channel.remote_id_known and
+                !channel.close_pending and !channel.close_sent and !channel.close_received
+        else
+            false;
+
+        if (valid_session and recognized_status) {
+            self.recordExitStatus(channel_id, status);
+        } else if (valid_session and recognized_signal) {
+            try self.recordExitSignal(
+                channel_id,
+                signal_name,
+                core_dumped,
+                error_message,
+                language_tag,
+            );
+        }
+
+        if (want_reply) {
+            if (chan) |channel| {
+                if (channel.remote_id_known and !channel.close_sent and !channel.close_received) {
+                    try self.queueChannelReply(
+                        channel.remote_id,
+                        valid_session and (recognized_status or recognized_signal),
+                    );
+                    _ = try self.flushPendingChannelReply(sshz);
+                }
+            }
+        }
+        self.setIoSessionState(.ReadPktHdr);
     }
 
     fn readTcpipOpen(rdr: *BufferReader) SshzError!TcpipOpen {
@@ -2121,6 +2393,9 @@ pub const Session = struct {
 
                 if (self.channel_table.findByLocalId(recipient)) |chan| {
                     const local_id = chan.local_id;
+                    if (chan.kind == .Session and chan.channel_type == .Session) {
+                        self.releaseExitResultReservation(local_id);
+                    }
                     self.channel_table.freeChannel(local_id);
                     self.active_channel_id = null;
                     self.resumeChannelActive();
@@ -2183,6 +2458,9 @@ pub const Session = struct {
                 self.active_channel_id = chan.local_id;
                 self.resumeChannelActive();
             },
+            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST) => {
+                try self.handleChannelRequestPacket(&rdr, sshz);
+            },
             @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
                 // RFC 4253 §11.1
                 const reason_code = try rdr.readU32();
@@ -2223,6 +2501,9 @@ pub const Session = struct {
                         self.resumeChannelActive();
                         self.setIoSessionState(.Idle);
                     } else {
+                        if (chan.channel_type == .Session) {
+                            self.completeExitResult(chan.local_id);
+                        }
                         self.channel_table.freeChannel(chan.local_id);
                         self.active_channel_id = null;
                         if (self.channel_table.activeCount() == 0) {
@@ -2329,6 +2610,34 @@ fn buildAuthFailurePacket(m: *SshzClient, methods: []const u8, partial_success: 
     try payload.writeU32LenString(methods);
     try payload.writeBoolean(partial_success);
     return buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+}
+
+fn deliverChannelRequestForTest(
+    m: *SshzClient,
+    channel_id: u32,
+    request_name: []const u8,
+    want_reply: bool,
+    request_payload: []const u8,
+) !void {
+    var payload_backing: [512]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+    try payload.writeU32(channel_id);
+    try payload.writeU32LenString(request_name);
+    try payload.writeBoolean(want_reply);
+    try payload.writeBytes(request_payload);
+    const packet_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+    m.session.user_authenticated = true;
+    try m.session.handlePacket(m.iobuf_rd[0..packet_len], m);
+}
+
+fn expectChannelReplyForTest(m: *SshzClient, msgid: Protocol.MsgId, remote_id: u32) !void {
+    const packet = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(packet));
+    try std.testing.expectEqual(@intFromEnum(msgid), try rdr.readU8());
+    try std.testing.expectEqual(remote_id, try rdr.readU32());
+    try std.testing.expectEqual(rdr.payload.len, rdr.off);
+    try m.consumed(packet.len);
 }
 
 fn writeKexInitPayload(writer: *BufferWriter) !void {
@@ -4805,6 +5114,7 @@ test "handlePacket: channel open failure frees channel and emits event" {
     chan.client_open_mode = .RawSession;
     chan.state = .OpenWrite;
     const local_id = chan.local_id;
+    try m.session.reserveExitResult(local_id);
 
     var payload_backing: [128]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
@@ -4821,6 +5131,7 @@ test "handlePacket: channel open failure frees channel and emits event" {
 
     try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
     try std.testing.expect(m.session.channel_table.findByLocalId(local_id) == null);
+    try std.testing.expect(m.session.findExitResultSlot(local_id) == null);
 
     const evt = try m.getNextEvent();
     switch (evt) {
@@ -5076,4 +5387,257 @@ test "is_rekeying starts false" {
     var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
     defer session.deinit();
     try std.testing.expect(!session.is_rekeying);
+}
+
+test "client records durable exit status and first terminal result wins" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(77, 32768, 32768).?;
+    const channel_id = chan.local_id;
+    chan.state = .DataRx;
+    try m.session.reserveExitResult(channel_id);
+    m.session.setSessionState(.ChannelActive);
+
+    var status_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &status_payload, 3, .big);
+    try deliverChannelRequestForTest(&m, channel_id, Protocol.channel_request_exit_status, true, &status_payload);
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_SUCCESS, chan.remote_id);
+
+    std.mem.writeInt(u32, &status_payload, 9, .big);
+    try deliverChannelRequestForTest(&m, channel_id, Protocol.channel_request_exit_status, false, &status_payload);
+    var signal_backing: [64]u8 = undefined;
+    var signal = BufferWriter.init(&signal_backing, 0);
+    try signal.writeU32LenString("KILL");
+    try signal.writeBoolean(false);
+    try signal.writeU32LenString("");
+    try signal.writeU32LenString("");
+    try deliverChannelRequestForTest(&m, channel_id, Protocol.channel_request_exit_signal, false, signal.active());
+    switch (m.channelExitResult(channel_id).?) {
+        .Status => |status| try std.testing.expectEqual(@as(u32, 3), status),
+        else => return error.TestUnexpectedResult,
+    }
+
+    chan.close_sent = true;
+    var close_payload: [5]u8 = undefined;
+    close_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
+    std.mem.writeInt(u32, close_payload[1..5], channel_id, .big);
+    const close_len = buildUnencryptedPacket(&m.iobuf_rd, &close_payload);
+    try m.session.handlePacket(m.iobuf_rd[0..close_len], &m);
+    switch (m.channelExitResult(channel_id).?) {
+        .Status => |status| try std.testing.expectEqual(@as(u32, 3), status),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(m.clearChannelExitResult(channel_id));
+}
+
+test "client owns exit signal fields after receive buffer reuse" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(81, 32768, 32768).?;
+    chan.state = .DataRx;
+    try m.session.reserveExitResult(chan.local_id);
+    m.session.setSessionState(.ChannelActive);
+
+    var signal_backing: [128]u8 = undefined;
+    var signal = BufferWriter.init(&signal_backing, 0);
+    try signal.writeU32LenString("TERM");
+    try signal.writeBoolean(true);
+    try signal.writeU32LenString("terminated");
+    try signal.writeU32LenString("en-US");
+    try deliverChannelRequestForTest(&m, chan.local_id, Protocol.channel_request_exit_signal, false, signal.active());
+    @memset(&m.iobuf_rd, 0xa5);
+
+    switch (m.channelExitResult(chan.local_id).?) {
+        .Signal => |result| {
+            try std.testing.expectEqualStrings("TERM", result.signal_name);
+            try std.testing.expect(result.core_dumped);
+            try std.testing.expectEqualStrings("terminated", result.error_message);
+            try std.testing.expectEqualStrings("en-US", result.language_tag);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "client channel requests reply safely and reject invalid recipients" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const session_chan = m.session.channel_table.allocChannel(91, 32768, 32768).?;
+    session_chan.state = .DataRx;
+    try m.session.reserveExitResult(session_chan.local_id);
+    const tcp_chan = m.session.channel_table.allocChannel(92, 32768, 32768).?;
+    tcp_chan.channel_type = .DirectTcpip;
+    tcp_chan.state = .DataRx;
+    m.session.setSessionState(.ChannelActive);
+
+    try deliverChannelRequestForTest(&m, session_chan.local_id, "unknown@example", true, "opaque");
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_FAILURE, session_chan.remote_id);
+    try deliverChannelRequestForTest(&m, session_chan.local_id, "unknown@example", false, "opaque");
+
+    var status_payload: [4]u8 = undefined;
+    std.mem.writeInt(u32, &status_payload, 0, .big);
+    try deliverChannelRequestForTest(&m, tcp_chan.local_id, Protocol.channel_request_exit_status, true, &status_payload);
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_FAILURE, tcp_chan.remote_id);
+    try std.testing.expect(m.channelExitResult(tcp_chan.local_id) == null);
+
+    session_chan.close_pending = true;
+    try deliverChannelRequestForTest(&m, session_chan.local_id, Protocol.channel_request_exit_status, true, &status_payload);
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_FAILURE, session_chan.remote_id);
+    try std.testing.expect(m.channelExitResult(session_chan.local_id) == null);
+
+    try deliverChannelRequestForTest(&m, 9999, "unknown@example", true, "opaque");
+    try std.testing.expectEqual(@as(usize, 0), m.session.pending_channel_replies_len);
+}
+
+test "client exit results are isolated and replies retain wire order across rekey" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const first = m.session.channel_table.allocChannel(121, 32768, 32768).?;
+    const second = m.session.channel_table.allocChannel(122, 32768, 32768).?;
+    first.state = .DataRx;
+    second.state = .DataRx;
+    try m.session.reserveExitResult(first.local_id);
+    try m.session.reserveExitResult(second.local_id);
+    m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
+
+    var zero: [4]u8 = undefined;
+    std.mem.writeInt(u32, &zero, 0, .big);
+    try deliverChannelRequestForTest(&m, first.local_id, Protocol.channel_request_exit_status, false, &zero);
+    switch (m.channelExitResult(first.local_id).?) {
+        .Status => |status| try std.testing.expectEqual(@as(u32, 0), status),
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(m.channelExitResult(second.local_id) == null);
+
+    m.session.is_rekeying = true;
+    try m.session.queueChannelReply(first.remote_id, false);
+    try m.session.queueChannelReply(second.remote_id, true);
+    try std.testing.expect(!try m.session.flushPendingChannelReply(&m));
+    m.session.is_rekeying = false;
+
+    try std.testing.expect(try m.session.dispatchDeferredChannelWrite(&m));
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_FAILURE, first.remote_id);
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_SUCCESS, second.remote_id);
+}
+
+test "channel request replies precede deferred data and channel control" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(131, 32768, 32768).?;
+    chan.state = .DataRx;
+    chan.write_buf[0] = 'x';
+    chan.write_buf_nbytes = 1;
+    chan.eof_pending = true;
+    m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
+    try m.session.queueChannelReply(chan.remote_id, false);
+
+    try std.testing.expect(try m.session.dispatchDeferredChannelWrite(&m));
+    try expectChannelReplyForTest(&m, .SSH_MSG_CHANNEL_FAILURE, chan.remote_id);
+
+    const data_packet = try m.peek(Protocol.MaxSSHPacket);
+    var data_reader = BufferReader.init(unencryptedPayload(data_packet));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA), try data_reader.readU8());
+    try std.testing.expectEqual(chan.remote_id, try data_reader.readU32());
+    try std.testing.expectEqualStrings("x", try data_reader.readU32LenString());
+    try m.consumed(data_packet.len);
+
+    const eof_packet = try m.peek(Protocol.MaxSSHPacket);
+    var eof_reader = BufferReader.init(unencryptedPayload(eof_packet));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
+    try std.testing.expectEqual(chan.remote_id, try eof_reader.readU32());
+}
+
+test "client exit result reservations provide backpressure and no-result completion" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const limits = Sshz.ResourceLimits{ .max_channels = 1 };
+    var m = try SshzClient.initWithLimits(prng.random(), "testuser", std.testing.allocator, limits);
+    defer m.deinit();
+
+    const first = m.session.channel_table.allocChannel(101, 32768, 32768).?;
+    const first_id = first.local_id;
+    try m.session.reserveExitResult(first_id);
+    first.close_sent = true;
+    var close_payload: [5]u8 = undefined;
+    close_payload[0] = @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE);
+    std.mem.writeInt(u32, close_payload[1..5], first_id, .big);
+    const close_len = buildUnencryptedPacket(&m.iobuf_rd, &close_payload);
+    m.session.user_authenticated = true;
+    try m.session.handlePacket(m.iobuf_rd[0..close_len], &m);
+    switch (m.channelExitResult(first_id).?) {
+        .NoResult => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    const second = m.session.channel_table.allocChannel(102, 32768, 32768).?;
+    try std.testing.expectError(IoError.tooManyChannels, m.session.reserveExitResult(second.local_id));
+    try std.testing.expect(m.clearChannelExitResult(first_id));
+    try m.session.reserveExitResult(second.local_id);
+}
+
+test "client exposes automatic session channel id durably" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    m.session.setSessionState(.ChannelOpenReq);
+    m.session.setIoSessionState(.Idle);
+    try m.session.advanceSession(&m);
+    const id = m.automaticSessionChannelId().?;
+    m.session.completeExitResult(id);
+    m.session.channel_table.freeChannel(id);
+    try std.testing.expectEqual(id, m.automaticSessionChannelId().?);
+}
+
+test "client rejects malformed and trailing terminal channel requests" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(111, 32768, 32768).?;
+    chan.state = .DataRx;
+    try m.session.reserveExitResult(chan.local_id);
+    m.session.setSessionState(.ChannelActive);
+
+    try std.testing.expectError(
+        BufferError.ReaderOutOfDataErr,
+        deliverChannelRequestForTest(&m, chan.local_id, Protocol.channel_request_exit_status, false, &.{ 0, 0, 0 }),
+    );
+    try std.testing.expectError(
+        IoError.UnexpectedResponse,
+        deliverChannelRequestForTest(&m, chan.local_id, Protocol.channel_request_exit_status, false, &.{ 0, 0, 0, 0, 1 }),
+    );
+    const truncated_signal = [_]u8{ 0, 0, 0, 4, 'T', 'E', 'R', 'M', 0, 0 };
+    try std.testing.expectError(
+        BufferError.ReaderOutOfDataErr,
+        deliverChannelRequestForTest(&m, chan.local_id, Protocol.channel_request_exit_signal, false, &truncated_signal),
+    );
+
+    var trailing_signal_backing: [64]u8 = undefined;
+    var trailing_signal = BufferWriter.init(&trailing_signal_backing, 0);
+    try trailing_signal.writeU32LenString("TERM");
+    try trailing_signal.writeBoolean(false);
+    try trailing_signal.writeU32LenString("");
+    try trailing_signal.writeU32LenString("");
+    try trailing_signal.writeU8(1);
+    try std.testing.expectError(
+        IoError.UnexpectedResponse,
+        deliverChannelRequestForTest(
+            &m,
+            chan.local_id,
+            Protocol.channel_request_exit_signal,
+            false,
+            trailing_signal.active(),
+        ),
+    );
 }

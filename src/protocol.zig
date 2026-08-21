@@ -367,6 +367,8 @@ pub const channel_type_session = "session";
 pub const channel_type_auth_agent_openssh = "auth-agent@openssh.com";
 pub const channel_type_auth_agent = "auth-agent";
 pub const channel_request_auth_agent = "auth-agent-req@openssh.com";
+pub const channel_request_exit_status = "exit-status";
+pub const channel_request_exit_signal = "exit-signal";
 
 pub fn isAgentChannelType(channel_type: []const u8) bool {
     return std.mem.eql(u8, channel_type, channel_type_auth_agent_openssh) or

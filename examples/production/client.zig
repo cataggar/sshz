@@ -30,6 +30,16 @@ pub const Config = struct {
     sink: Sink,
 };
 
+/// Returns the automatic command's durable terminal result.
+///
+/// Signal strings borrow client-owned storage through
+/// `clearChannelExitResult(channel)` or `client.deinit()`.
+pub fn commandExitResult(client: *const sshz.SshzClient) !sshz.ChannelExitResult {
+    const channel = client.automaticSessionChannelId() orelse
+        return error.AutomaticSessionNotOpened;
+    return client.channelExitResult(channel) orelse error.RemoteCommandResultPending;
+}
+
 pub fn init(
     random: std.Random,
     allocator: std.mem.Allocator,
@@ -137,7 +147,15 @@ fn handleEvent(
         .ChannelOpened,
         => return error.UnexpectedChannelEvent,
         .ChannelOpenFailure => return error.ChannelOpenFailed,
-        .EndSession => return .finished,
+        .EndSession => {
+            const result = try commandExitResult(client);
+            switch (result) {
+                .Status => |status| if (status != 0) return error.RemoteCommandFailed,
+                .Signal => return error.RemoteCommandSignaled,
+                .NoResult => return error.RemoteCommandResultMissing,
+            }
+            return .finished;
+        },
         .ServerIdentification,
         .AuthMethodStarted,
         .Connected,
