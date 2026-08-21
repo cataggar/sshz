@@ -189,27 +189,31 @@ pub const BufferWriter = struct {
     }
 
     pub fn writeMpint(self: *Self, v: []const u8) BufferError!void {
+        var first_nonzero: usize = 0;
+        while (first_nonzero < v.len and v[first_nonzero] == 0) : (first_nonzero += 1) {}
+        const value = v[first_nonzero..];
+
         // if MSB of first byte is set, mpint must be padded
         // https://datatracker.ietf.org/doc/html/rfc4251#section-5
-        const pad = v.len != 0 and v[0] & 0x80 > 0;
+        const pad = value.len != 0 and value[0] & 0x80 > 0;
         const prefix_len: usize = 4 + @as(usize, @intFromBool(pad));
-        if (v.len > @as(usize, std.math.maxInt(u32)) - @as(usize, @intFromBool(pad))) {
+        if (value.len > @as(usize, std.math.maxInt(u32)) - @as(usize, @intFromBool(pad))) {
             return BufferError.WriterOutOfDataErr;
         }
         if (self.off > self.payload_buf.len) return BufferError.WriterOutOfDataErr;
         const remaining = self.payload_buf.len - self.off;
-        if (prefix_len > remaining or v.len > remaining - prefix_len) {
+        if (prefix_len > remaining or value.len > remaining - prefix_len) {
             return BufferError.WriterOutOfDataErr;
         } else {
             if (pad) {
-                try self.writeU32(@intCast(v.len + 1));
+                try self.writeU32(@intCast(value.len + 1));
             } else {
-                try self.writeU32(@intCast(v.len));
+                try self.writeU32(@intCast(value.len));
             }
             if (pad) {
                 try self.writeU8(0);
             }
-            try self.writeBytes(v);
+            try self.writeBytes(value);
         }
     }
 
@@ -234,6 +238,18 @@ test "buffer wr overflow" {
     }
     // unable to write anymore
     try std.testing.expectError(BufferError.WriterOutOfDataErr, pkt.writeU8(0xBB));
+}
+
+test "buffer writer encodes canonical positive mpints" {
+    var backing: [16]u8 = undefined;
+    var writer = BufferWriter.init(&backing, 0);
+
+    try writer.writeMpint(&.{ 0, 0, 0x80 });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 2, 0, 0x80 }, writer.active());
+
+    writer = BufferWriter.init(&backing, 0);
+    try writer.writeMpint(&.{ 0, 0 });
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, writer.active());
 }
 
 test "buffer-skip" {

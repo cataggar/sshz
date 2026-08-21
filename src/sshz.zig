@@ -639,7 +639,6 @@ pub const ExtendedData = struct {
 pub const UserAuthAttempt = union(enum) {
     Password: []const u8,
     Pubkey: PublicKeyIdentity,
-    KeyboardInteractive: []const u8, // submethods
 };
 
 pub const UserCredentialsPasswordOrPubkey = UserAuthAttempt;
@@ -658,7 +657,6 @@ pub const UserCredentials = struct {
         return switch (attempt) {
             .Password => .Password,
             .Pubkey => .PublicKey,
-            .KeyboardInteractive => .KeyboardInteractive,
         };
     }
 };
@@ -681,11 +679,13 @@ pub const ChannelRequestType = union(enum) {
 };
 
 pub const ChannelRequestEvent = struct {
+    /// Server events are emitted only for an accepted `Session` channel.
     channel: u32,
     request: ChannelRequestType,
 };
 
 pub const WindowSize = struct {
+    /// Server events are emitted only for an accepted `Session` channel.
     channel: u32,
     cols: u32,
     rows: u32,
@@ -694,6 +694,7 @@ pub const WindowSize = struct {
 };
 
 pub const ChannelSignal = struct {
+    /// Server events are emitted only for an accepted `Session` channel.
     channel: u32,
     name: []const u8,
 };
@@ -1241,7 +1242,7 @@ pub fn SshzImpl(role: Role) type {
                                 }
                                 if (comptime role == .Server) {
                                     switch (eventCode) {
-                                        .TcpipForward, .CancelTcpipForward => return IoError.badClearEvent,
+                                        .TcpipForward, .CancelTcpipForward, .ChannelOpenRequest => return IoError.badClearEvent,
                                         .UserAuth => {
                                             if (self.session.sessionState == .CheckUserPasswordAuth) {
                                                 try self.session.decideAuthorization(.Deny);
@@ -2957,10 +2958,10 @@ test "KeyboardInteractivePrompt struct" {
     try std.testing.expect(!prompt.echo);
 }
 
-test "UserCredentialsPasswordOrPubkey KeyboardInteractive variant" {
-    const auth: UserCredentialsPasswordOrPubkey = .{ .KeyboardInteractive = "" };
+test "UserCredentialsPasswordOrPubkey password variant" {
+    const auth: UserCredentialsPasswordOrPubkey = .{ .Password = "secret" };
     switch (auth) {
-        .KeyboardInteractive => {},
+        .Password => |password| try std.testing.expectEqualStrings("secret", password),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -3094,6 +3095,9 @@ test "client-server full handshake round-trip" {
                         .UserAuth => {
                             server.grantAccess(true) catch {};
                             server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
+                        },
+                        .ChannelOpenRequest => |request| {
+                            server.acceptChannelOpen(request.channel) catch {};
                         },
                         .Connected => {
                             server.clearEvent(.{ .Connected = 0 }) catch {};
@@ -3744,6 +3748,9 @@ test "full handshake round-trip handles multiple large compressed channel packet
                             server.grantAccess(true) catch {};
                             server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
                         },
+                        .ChannelOpenRequest => |request| {
+                            server.acceptChannelOpen(request.channel) catch {};
+                        },
                         .Connected => {
                             connected_server = true;
                             server.clearEvent(.{ .Connected = 0 }) catch {};
@@ -3903,6 +3910,9 @@ test "client channelWriteComplete uses direct write when read is active" {
                             server.grantAccess(true) catch {};
                             server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
                         },
+                        .ChannelOpenRequest => |request| {
+                            server.acceptChannelOpen(request.channel) catch {};
+                        },
                         .Connected => server.clearEvent(.{ .Connected = 0 }) catch {},
                         .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }) catch {},
                         else => {
@@ -4034,6 +4044,9 @@ fn driveHandshakeForKeys(hostkey_ascii: []const u8, client_key_ascii: ?[]const u
                             }
                             server.grantAccess(true) catch {};
                             server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } }) catch {};
+                        },
+                        .ChannelOpenRequest => |request| {
+                            server.acceptChannelOpen(request.channel) catch {};
                         },
                         .Connected => server.clearEvent(.{ .Connected = 0 }) catch {},
                         .ChannelRequest => server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }) catch {},

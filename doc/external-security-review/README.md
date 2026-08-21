@@ -6,10 +6,13 @@ This package prepares an external review of a pinned sshz release candidate.
 It is a scope and evidence request, not evidence that a reviewer has been
 engaged, that a review has finished, or that any finding or approval exists.
 sshz remains experimental and is not suitable for production use.
-No independent external review has occurred. The work in
-[issue #70](https://github.com/cataggar/sshz/issues/70) remains blocked on
-engaging an external reviewer and creating the signed, pinned release candidate
-required by this package.
+No independent external review has occurred. Issue
+[#70](https://github.com/cataggar/sshz/issues/70) was rescoped to the completed
+2026-08-21 [maintainer-led review](../maintainer-security-review-2026-08-21.md)
+and closure as not planned; it no longer represents a blocked reviewer-hiring
+task. This package remains available for a future independent review, which is
+still a separate production-release requirement together with a signed,
+pinned release candidate.
 
 Reviewers and maintainers should use:
 
@@ -27,6 +30,13 @@ policy](../stress-and-soak.md), and [timing-sensitive operation
 inventory](../timing-sensitive-operations.md) are inputs, not conclusions.
 Where those documents identify gaps, this package does not treat the gaps as
 accepted risks.
+
+The current zlib input is the Zig source package
+`https://github.com/cataggar/zlib` at commit
+`b4e57365ac3c84121c99a51c54eb02a5e4b16c86`, package hash
+`zlib-1.3.2-Nw5YbZEKNwAuh6XJs-vzogSoSv5jdL3PBhOI98q_QUu0`. CI verifies pinned
+SHA-256 digests for downloaded Zig 0.16.0 archives before extracting or
+executing them; this does not pin runner images or installed system packages.
 
 ## Architecture and data flow
 
@@ -106,9 +116,9 @@ The review must preserve these boundaries:
   cleanup are application responsibilities. Events contain untrusted strings
   and may contain secrets or plaintext.
 - **Library to dependencies:** the compiler, Zig standard-library cryptography,
-  libc, and system zlib are trusted dependencies. Their internals are outside
-  this code review, but version selection, API use, error handling, and
-  cryptographic composition are in scope.
+  libc, and pinned Zig-source zlib package are trusted dependencies. Their
+  internals are outside this code review, but version selection, API use,
+  error handling, and cryptographic composition are in scope.
 - **Process to host:** key files, environment variables, SSH-agent sockets,
   allocator pages, logs, crash dumps, file descriptors, and OS permissions
   cross this boundary. The library cannot protect secrets after process, kernel,
@@ -127,7 +137,7 @@ the production library implementation and its tests:
 | `src/sshz.zig` | Public event/readiness API; identification and packet I/O; framing, encryption/MAC verification, host-key and application decision APIs; channel/forwarding entry points |
 | `src/client_session.zig` | Client KEX/rekey, host identity, authentication, global requests, channel/agent handling, and state transitions |
 | `src/server_session.zig` | Server KEX/rekey, host signing, authentication proof/application handoff, global requests, channel/agent handling, and state transitions |
-| `src/protocol.zig` | SSH constants and bounds, packet/key derivation, centralized algorithm offer validation and client-order selection, system-zlib streams, wrap/unwrap support |
+| `src/protocol.zig` | SSH constants and bounds, packet/key derivation, centralized algorithm offer validation and client-order selection, pinned-zlib streams, wrap/unwrap support |
 | `src/key.zig`, `src/privkey.zig` | Public/private key parsing, signature encoding/verification, RSA composition, OpenSSH private-key decoding and bcrypt/AES-CTR protection |
 | `src/aesctr.zig`, `src/hasher.zig` | AES-CTR state and exchange-hash/key-derivation support |
 | `src/channel.zig` | Four-slot channel table, windows, scheduling, buffering, EOF/close, channel types |
@@ -202,7 +212,7 @@ At package creation, the following are known and not approved exceptions:
   [threat-model blocker table](../threat-model.md#production-release-blockers);
 - the [algorithm policy](../algorithm-policy.md#production-release-criteria)
   records complete RSA validation, strict-KEX, delayed-compression,
-  independent-vector, and dependency-pinning gaps; centralized enforcement,
+  independent-vector, and remaining dependency/provenance gaps; centralized enforcement,
   client-order selection, guessed-packet handling, and automatic rekey are
   present and must be reviewed rather than listed as absent;
 - the [timing inventory](../timing-sensitive-operations.md) covers only the
@@ -241,7 +251,7 @@ added to a signed scope amendment:
   infrastructure and fixtures;
 - generated `.zig-cache/`, `zig-out/`, local evidence, and editor files;
 - internal correctness of Zig cryptographic primitives, the compiler, libc,
-  system zlib, OpenSSH, Dropbear, and libssh. sshz's selection, composition,
+  the pinned zlib source package, OpenSSH, Dropbear, and libssh. sshz's selection, composition,
   inputs, outputs, and failure handling remain in scope;
 - unimplemented SSH algorithms, extensions, services, and application
   protocols;

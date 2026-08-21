@@ -24,9 +24,16 @@ jobs:
 
           version="0.16.0"
           archive="zig-x86_64-linux-${version}.tar.xz"
+          archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+          archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
-          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
-          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
+          actual_sha256="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          if [ "${actual_sha256}" != "${archive_sha256}" ]; then
+            echo "SHA-256 mismatch for ${archive}" >&2
+            exit 1
+          fi
+          tar -xf "${archive_path}" -C "${RUNNER_TEMP}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           "${zig_dir}/zig" version
       - name: Install resource measurement tool
@@ -80,10 +87,22 @@ jobs:
 
           version="0.16.0"
           case "${{ runner.os }}-${{ runner.arch }}" in
-            Linux-X64) zig_target="x86_64-linux" ;;
-            macOS-ARM64) zig_target="aarch64-macos" ;;
-            macOS-X64) zig_target="x86_64-macos" ;;
-            Windows-X64) zig_target="x86_64-windows" ;;
+            Linux-X64)
+              zig_target="x86_64-linux"
+              archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+              ;;
+            macOS-ARM64)
+              zig_target="aarch64-macos"
+              archive_sha256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+              ;;
+            macOS-X64)
+              zig_target="x86_64-macos"
+              archive_sha256="0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
+              ;;
+            Windows-X64)
+              zig_target="x86_64-windows"
+              archive_sha256="68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"
+              ;;
             *)
               echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2
               exit 1
@@ -97,12 +116,18 @@ jobs:
           esac
 
           archive="zig-${zig_target}-${version}.${archive_ext}"
+          archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-${zig_target}-${version}"
-          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
+          actual_sha256="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          if [ "${actual_sha256}" != "${archive_sha256}" ]; then
+            echo "SHA-256 mismatch for ${archive}" >&2
+            exit 1
+          fi
           if [ "${archive_ext}" = "zip" ]; then
-            unzip -q "${RUNNER_TEMP}/${archive}" -d "${RUNNER_TEMP}"
+            unzip -q "${archive_path}" -d "${RUNNER_TEMP}"
           else
-            tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+            tar -xf "${archive_path}" -C "${RUNNER_TEMP}"
           fi
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           "${zig_dir}/zig" version

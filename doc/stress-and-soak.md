@@ -68,6 +68,18 @@ Scheduled and manual jobs have 35-minute timeouts and use ReleaseSafe. GNU
 `time` records elapsed time and maximum RSS for child runs. Linux `/proc`
 heartbeats record the orchestration shell's peak RSS and open FD count.
 
+## Current evidence gap
+
+[Run 32330117112, job
+96309001974](https://github.com/cataggar/sshz/actions/runs/32330117112/job/96309001974)
+failed with `InvalidSignature`. Maintainer triage found a product defect:
+leading zero bytes in the X25519 shared secret were not removed before SSH
+mpint encoding, producing a non-canonical exchange-hash/key-derivation input.
+The maintainer-review remediation canonicalizes positive mpints and adds
+regression tests. This failed run is useful defect evidence, not passing soak
+evidence; a successful replacement soak on a pinned resulting commit is still
+required.
+
 ## Resource baseline and budgets
 
 On 2026-07-24, a warm-cache Linux x86_64 ReleaseSafe run at seed `1751547392`

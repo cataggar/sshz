@@ -24,7 +24,7 @@ const ChannelState = @import("channel.zig").ChannelState;
 const ChannelType = @import("channel.zig").ChannelType;
 const TcpipOpen = @import("channel.zig").TcpipOpen;
 
-const supported_auth_methods = "password,publickey,keyboard-interactive";
+const supported_auth_methods = "password,publickey";
 
 const PendingAuthorizationKind = enum {
     Authentication,
@@ -654,6 +654,13 @@ pub const Session = struct {
                 chan.state = .Data;
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
             },
+            .RspFailureWrite => {
+                var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
+                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE));
+                try pkt.writeU32(chan.remote_id);
+                chan.state = .Data;
+                try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
+            },
             .Connected => {
                 sshz.requestEvent(.{ .Connected = chan.local_id }, .Idle);
                 chan.state = .Data;
@@ -1115,6 +1122,22 @@ pub const Session = struct {
         };
     }
 
+    fn isSessionChannelRequest(request_name: []const u8) bool {
+        return std.mem.eql(u8, request_name, "pty-req") or
+            std.mem.eql(u8, request_name, "x11-req") or
+            std.mem.eql(u8, request_name, "shell") or
+            std.mem.eql(u8, request_name, "exec") or
+            std.mem.eql(u8, request_name, "subsystem") or
+            std.mem.eql(u8, request_name, "env") or
+            std.mem.eql(u8, request_name, Protocol.channel_request_auth_agent) or
+            std.mem.eql(u8, request_name, "window-change") or
+            std.mem.eql(u8, request_name, "xon-xoff") or
+            std.mem.eql(u8, request_name, "signal") or
+            std.mem.eql(u8, request_name, "exit-status") or
+            std.mem.eql(u8, request_name, "exit-signal") or
+            std.mem.eql(u8, request_name, "break");
+    }
+
     fn requestChannelOpenEvent(self: *Self, sshz: *SshzServer, chan: *Channel) void {
         _ = self;
         const request: Sshz.ChannelOpenRequestType = switch (chan.channel_type) {
@@ -1169,17 +1192,10 @@ pub const Session = struct {
         chan.channel_type = channel_type;
         chan.tcpip_open = tcpip_open;
 
-        if (channel_type == .Session) {
-            chan.state = .ConfirmWrite;
-            self.active_channel_id = chan.local_id;
-            self.resumeChannelActive();
-            self.setIoSessionState(.Idle);
-        } else {
-            chan.state = .Open;
-            self.active_channel_id = null;
-            self.resumeChannelActive();
-            self.requestChannelOpenEvent(sshz, chan);
-        }
+        chan.state = .Open;
+        self.active_channel_id = null;
+        self.resumeChannelActive();
+        self.requestChannelOpenEvent(sshz, chan);
     }
 
     fn handleGlobalRequestPacket(self: *Self, rdr: *BufferReader, sshz: *SshzServer) SshzError!void {
@@ -1528,15 +1544,12 @@ pub const Session = struct {
                         self.setSessionState(.CheckUserPasswordAuth);
                         sshz.requestEvent(.{ .UserAuth = .{ .username = username, .auth = null } }, .Idle);
                     } else if (std.mem.eql(u8, authtyp, "keyboard-interactive")) {
-                        // RFC 4256 §3.1
+                        // RFC 4256 requires an information-request/response
+                        // exchange. Until that state machine exists, parse the
+                        // initial request completely and reject it.
                         _ = try rdr.readU32LenString(); // language tag
-                        const submethods = try rdr.readU32LenString();
-                        self.pending_authorization = .Authentication;
-                        self.setSessionState(.CheckUserPasswordAuth);
-                        sshz.requestEvent(.{ .UserAuth = .{
-                            .username = username,
-                            .auth = .{ .KeyboardInteractive = submethods },
-                        } }, .Idle);
+                        _ = try rdr.readU32LenString(); // submethods
+                        self.denyAuthentication();
                     } else {
                         self.denyAuthentication();
                     }
@@ -1565,6 +1578,13 @@ pub const Session = struct {
                 };
                 const typ = try rdr.readU32LenString();
                 const wantreply = try rdr.readBoolean();
+                if (chan.channel_type != .Session and isSessionChannelRequest(typ)) {
+                    self.active_channel_id = chan.local_id;
+                    chan.state = if (wantreply) .RspFailureWrite else .Data;
+                    self.resumeChannelActive();
+                    self.setIoSessionState(.Idle);
+                    return;
+                }
                 if (std.mem.eql(u8, typ, "pty-req")) {
                     const term = try rdr.readU32LenString();
                     const cols = try rdr.readU32();
@@ -2048,7 +2068,7 @@ test "server authentication denials have one packet and state shape" {
     }
 }
 
-test "server none and keyboard-interactive rejection cannot authenticate or open channels" {
+test "server none and unsupported keyboard-interactive cannot authenticate or open channels" {
     {
         var prng = std.Random.DefaultPrng.init(51);
         var m = try SshzServer.init(
@@ -2098,7 +2118,36 @@ test "server none and keyboard-interactive rejection cannot authenticate or open
         try payload.writeU32LenString("otp");
         try handleAuthPayloadForTest(&m, payload.active());
 
-        try rejectAuthEventForTest(&m, "keyboard-user", .KeyboardInteractive);
+        try std.testing.expectEqual(SessionState.UserAuthDenied, m.session.sessionState);
+        try std.testing.expectEqual(@as(?PendingAuthorizationKind, null), m.session.pending_authorization);
+        try m.advance();
+        try expectAuthFailurePayloadForTest(&m);
+        try expectUnauthenticatedChannelOpenRejectedForTest(&m);
+    }
+
+    {
+        var prng = std.Random.DefaultPrng.init(53);
+        var m = try SshzServer.init(
+            prng.random(),
+            @import("privkey.zig").testkey_valid,
+            std.testing.allocator,
+        );
+        defer m.deinit();
+
+        var payload_buffer: [192]u8 = undefined;
+        var payload = BufferWriter.init(&payload_buffer, 0);
+        try writeUserAuthPrefixForTest(&payload, "keyboard-user", "keyboard-interactive");
+        try payload.writeU32LenString("");
+
+        const packet_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
+        m.session.encrypted = false;
+        m.session.setSessionState(.AuthRead);
+        try std.testing.expectError(
+            BufferError.ReaderOutOfDataErr,
+            m.session.handlePacket(m.iobuf_rd[0..packet_len], &m),
+        );
+        try std.testing.expect(!m.session.user_authenticated);
+        try std.testing.expectEqual(@as(?PendingAuthorizationKind, null), m.session.pending_authorization);
     }
 }
 
@@ -2937,6 +2986,55 @@ test "handlePacket: direct-tcpip open emits request and accept confirms" {
     try std.testing.expectEqual(channel_id, try rdr.readU32());
 }
 
+test "handlePacket: session open requires an application decision" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer m.deinit();
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.Authenticated);
+
+    var payload_backing: [96]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU32LenString("session");
+    try pw.writeU32(78);
+    try pw.writeU32(32768);
+    try pw.writeU32(4096);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+
+    const evt = try m.getNextEvent();
+    const event_code = switch (evt) {
+        .Event => |code| code,
+        else => return error.TestUnexpectedResult,
+    };
+    const channel_id = switch (event_code) {
+        .ChannelOpenRequest => |request| blk: {
+            switch (request.request) {
+                .Session => {},
+                else => return error.TestUnexpectedResult,
+            }
+            break :blk request.channel;
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const chan = m.session.channel_table.findByLocalId(channel_id).?;
+    try std.testing.expectEqual(ChannelType.Session, chan.channel_type);
+    try std.testing.expectEqual(ChannelState.Open, chan.state);
+    try std.testing.expectError(IoError.badClearEvent, m.clearEvent(event_code));
+    try std.testing.expectEqual(ChannelState.Open, chan.state);
+
+    try m.acceptChannelOpen(channel_id);
+    const data = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(data));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 78), try rdr.readU32());
+    try std.testing.expectEqual(channel_id, try rdr.readU32());
+}
+
 test "rejectChannelOpen writes caller-provided failure" {
     const privkey = @import("privkey.zig");
     var prng = std.Random.DefaultPrng.init(42);
@@ -3275,6 +3373,75 @@ test "handlePacket: auth-agent request surfaces channel request event" {
             else => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handlePacket: session requests on non-session channels fail before events" {
+    const request_names = [_][]const u8{
+        "pty-req",
+        "x11-req",
+        "shell",
+        "exec",
+        "subsystem",
+        "env",
+        "window-change",
+        "xon-xoff",
+        "signal",
+        "exit-status",
+        "exit-signal",
+        "break",
+        Protocol.channel_request_auth_agent,
+    };
+
+    for (request_names, 0..) |request_name, index| {
+        const privkey = @import("privkey.zig");
+        var prng = std.Random.DefaultPrng.init(@intCast(100 + index));
+        var m = try SshzServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+        defer m.deinit();
+
+        const chan = m.session.channel_table.allocChannelKind(.Session, 100, 32768, 32768).?;
+        chan.channel_type = if (index % 2 == 0) .DirectTcpip else .ForwardedTcpip;
+        chan.state = .DataRx;
+
+        var payload_backing: [192]u8 = undefined;
+        var pw = BufferWriter.init(&payload_backing, 0);
+        try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+        try pw.writeU32(chan.local_id);
+        try pw.writeU32LenString(request_name);
+        try pw.writeBoolean(true);
+        if (std.mem.eql(u8, request_name, "pty-req")) {
+            try pw.writeU32LenString("xterm");
+            try pw.writeU32(80);
+            try pw.writeU32(24);
+            try pw.writeU32(0);
+            try pw.writeU32(0);
+        } else if (std.mem.eql(u8, request_name, "exec")) {
+            try pw.writeU32LenString("id");
+        } else if (std.mem.eql(u8, request_name, "subsystem")) {
+            try pw.writeU32LenString("sftp");
+        } else if (std.mem.eql(u8, request_name, "env")) {
+            try pw.writeU32LenString("LANG");
+            try pw.writeU32LenString("C");
+        } else if (std.mem.eql(u8, request_name, "window-change")) {
+            try pw.writeU32(100);
+            try pw.writeU32(40);
+            try pw.writeU32(0);
+            try pw.writeU32(0);
+        } else if (std.mem.eql(u8, request_name, "signal")) {
+            try pw.writeU32LenString("TERM");
+        }
+
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+        m.session.encrypted = false;
+        m.session.user_authenticated = true;
+        try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+        try m.advance();
+
+        const packet = try m.peek(Protocol.MaxSSHPacket);
+        var rdr = BufferReader.init(unencryptedPayload(packet));
+        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try rdr.readU8());
+        try std.testing.expectEqual(@as(u32, 100), try rdr.readU32());
+        try std.testing.expectEqual(rdr.payload.len, rdr.off);
     }
 }
 

@@ -7,7 +7,7 @@ ordered byte stream.
 ## Features
 
 - Client and server APIs with no internal transport I/O
-- Public-key, password, keyboard-interactive, and none authentication
+- Client keyboard-interactive plus client/server public-key, password, and none authentication
 - Multiple channels, sessions, port forwarding, and agent forwarding
 - Rekeying, delayed compression, resource limits, and deadline enforcement
 - Interoperability coverage with OpenSSH, Dropbear, and libssh
@@ -40,7 +40,14 @@ See [getting started](doc/getting-started.md) for library commands and the
 
 ## Project status
 
-sshz is pre-1.0, and its API may change between minor releases. The
+> **Security and support warning:** No independent external security review has
+> occurred. sshz is pre-1.0 and unsupported for production use while the
+> documented release blockers and evidence gaps remain.
+
+The 2026-08-21 [maintainer-led security review](doc/maintainer-security-review-2026-08-21.md)
+found and remediated security defects, but it is not an independent review or
+production approval. The
 [release checklist](doc/release-checklist.md) defines the evidence and review
 required for a supported release. `sshz` and `sshzd` are interoperability demos,
-not deployment templates.
+not deployment templates. See [SECURITY.md](SECURITY.md) for private
+vulnerability reporting.

@@ -51,6 +51,7 @@ pub const MsgId = enum(u8) {
     SSH_MSG_CHANNEL_CLOSE = 97,
     SSH_MSG_CHANNEL_REQUEST = 98,
     SSH_MSG_CHANNEL_SUCCESS = 99,
+    SSH_MSG_CHANNEL_FAILURE = 100,
 };
 
 // RFC 4250 §4.1.2 reserves message numbers 80-127 for the connection protocol,

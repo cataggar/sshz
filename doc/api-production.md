@@ -139,9 +139,10 @@ key, credential verifier, account state, source policy, and rate limits. Then
 call `decideUserAuth(.Allow|.Deny)` exactly once; it resolves and clears the
 event atomically. `grantAccess(bool)` followed by `clearEvent(event)` remains a
 compatibility path, and clearing an undecided `UserAuth` event denies by
-default. Deny `none`, password, keyboard-interactive, unknown users, backend
-failures, and unsupported key policies by default. Never use password
-equality, “any valid key,” or a missing policy as acceptance.
+default. Server keyboard-interactive is not advertised or accepted until its
+RFC 4256 challenge-response exchange is implemented. Deny `none`, password,
+unknown users, backend failures, and unsupported key policies by default.
+Never use password equality, “any valid key,” or a missing policy as acceptance.
 
 Authentication callbacks must be bounded and side-channel reviewed.
 Application-wide attempt/source limits complement the per-session
@@ -153,6 +154,7 @@ by connection cleanup, not acceptance or an indefinite pending event.
 1. A peer open produces `ChannelOpenRequest`. Authorize the channel type and
    every destination/origin field, then call `acceptChannelOpen(id)` or
    `rejectChannelOpen(id, reason, description)`. Never merely clear this event.
+   This includes `Session` opens; the server never confirms them implicitly.
 2. An outbound open is not usable until `ChannelOpened`; handle
    `ChannelOpenFailure` as final for that channel. `Connected` reports an
    accepted server channel or the client's automatic session channel.
@@ -161,6 +163,8 @@ by connection cleanup, not acceptance or an indefinite pending event.
    reply-requesting event sends success; there is no request-failure method.
    To deny, queue `sendChannelClose(channel)` before clearing. Treat this as a
    release blocker for applications needing request-level rejection.
+   Session-specific requests are rejected at the protocol boundary when their
+   recipient is not a `Session` channel and never reach application callbacks.
 4. Process `RxData`/`RxExtendedData` synchronously and clear the event to
    release the borrowed payload and permit window replenishment. Send with the
    borrowed channel-write buffer contract above; flow control may temporarily

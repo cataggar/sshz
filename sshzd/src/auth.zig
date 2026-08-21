@@ -147,7 +147,6 @@ pub const Attempt = union(enum) {
     none,
     password: []const u8,
     public_key: PublicKeyAttempt,
-    keyboard_interactive,
 };
 
 pub const Policy = union(enum) {
@@ -172,7 +171,7 @@ pub const Policy = union(enum) {
             .insecure_demo => switch (attempt) {
                 .password => |password| std.mem.eql(u8, username, password),
                 .public_key => true,
-                .none, .keyboard_interactive => false,
+                .none => false,
             },
         };
     }
@@ -507,7 +506,6 @@ test "authorized_keys policy rejects unsupported authentication methods" {
     defer policy.deinit();
 
     try std.testing.expect(!policy.allows("alice", .{ .password = "alice" }));
-    try std.testing.expect(!policy.allows("alice", .keyboard_interactive));
     try std.testing.expect(!policy.allows("alice", .none));
     try std.testing.expect(!policy.allows("alice", .{ .public_key = .{
         .algorithm = rsa_name,

@@ -202,24 +202,28 @@ clock, and close the transport after terminal errors.
 
 ## Dependencies and randomness
 
-sshz currently has no package dependency in `build.zig.zon`. It depends on:
+sshz depends on:
 
 - Zig standard-library implementations of SHA-2, HMAC, X25519, Ed25519,
   ECDSA P-256, AES, bcrypt, and finite-field operations used for RSA;
 - sshz's own AES-CTR state wrapper, SSH key derivation, RSA PKCS#1 v1.5
   encoding, parsing, and protocol composition;
-- system zlib for `zlib@openssh.com`; and
+- the Zig source package `https://github.com/cataggar/zlib` pinned at commit
+  `b4e57365ac3c84121c99a51c54eb02a5e4b16c86` with package hash
+  `zlib-1.3.2-Nw5YbZEKNwAuh6XJs-vzogSoSv5jdL3PBhOI98q_QUu0`, built and
+  statically linked by `build.zig` for `zlib@openssh.com`; and
 - a cryptographically secure `std.Random` supplied by the embedding
   application for KEX keys, cookies, and packet padding.
 
 These are trusted dependencies, not evidence of independent validation. The
-minimum build version is Zig 0.16.0, while newer compilers and system zlib
-versions are not locked by this repository. Before production, maintainers
-must pin and inventory the supported toolchain/dependency versions, monitor
-security advisories, review the custom composition code, and decide whether
-the Zig/system implementations are sufficiently reviewed or an external
-cryptographic backend is required. Predictable randomness is outside the
-production contract.
+minimum build version is Zig 0.16.0. CI pins and verifies the SHA-256 digest of
+each downloaded Zig 0.16.0 archive before extraction and execution. Runner
+images and installed system packages are not yet immutably pinned. Before
+production, maintainers must inventory and monitor all supported
+toolchain/dependency versions, review the custom composition code, and decide
+whether the Zig and pinned-zlib implementations are sufficiently reviewed or
+an external cryptographic backend is required. Predictable randomness is
+outside the production contract.
 
 ## Current test evidence and missing vectors
 
@@ -294,7 +298,7 @@ The algorithm-policy part of a production release is complete only when:
   family, packet cipher/MAC, and compression;
 - negative downgrade tests cover every negotiation category and both roles;
 - required OpenSSH, Dropbear, and libssh compatibility lanes pass;
-- the cryptographic backend/toolchain/system-zlib decision is documented with
+- the cryptographic backend/toolchain/pinned-zlib decision is documented with
   supported versions; and
 - the algorithm review finds no unresolved critical or high-severity issue.
 

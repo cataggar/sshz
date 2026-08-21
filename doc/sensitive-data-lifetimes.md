@@ -22,7 +22,7 @@ cleanup.
 | Client password and keyboard-interactive response | Allocator-owned session copies | After copying into the outbound packet, including construction errors; replacement and terminal cleanup are fallbacks |
 | Client automatic command and terminal option text | Allocator-owned session copies | After copying into their one outbound channel request, on replacement, or terminal cleanup |
 | Server host private key | Session-owned from successful initialization because rekey needs it | Fail-closed or deinit; partial initialization clears it with `errdefer` |
-| Server authentication packet | Input-packet storage owned by the session | After the application clears the `UserAuth` event. Password and keyboard-interactive fields are borrowed until then. Authentication signatures are scrubbed earlier after verification. |
+| Server authentication packet | Input-packet storage owned by the session | After the application clears the `UserAuth` event. Password fields are borrowed until then; unsupported keyboard-interactive requests are rejected without an event. Authentication signatures are scrubbed earlier after verification. |
 | Packet plaintext, decompression output, and channel write buffers | Packet buffers belong to the core session; channel buffers belong to their channel slot | Input/decompression storage on release of a borrowing event or before reuse; output storage only after the caller reports it fully consumed; terminal cleanup/deinit; channel consumption, discard, close, slot reuse, or terminal cleanup |
 | Random source | Borrowed from the caller; sshz does not own its PRNG state | Caller responsibility. sshz clears the exchange seeds it draws, but cannot clear the caller's generator state. |
 

@@ -65,6 +65,7 @@ pub const ChannelState = enum {
     OpenSent,
     ConfirmWrite,
     RspWrite,
+    RspFailureWrite,
     Connected,
     Data,
     DataRx,
@@ -315,7 +316,7 @@ pub const ChannelTable = struct {
 
     fn isRunnable(state: ChannelState) bool {
         return switch (state) {
-            .OpenWrite, .ConfirmWrite, .RspWrite, .CloseWrite, .OpenFailureWrite, .EofWrite => true,
+            .OpenWrite, .ConfirmWrite, .RspWrite, .RspFailureWrite, .CloseWrite, .OpenFailureWrite, .EofWrite => true,
             .Connected => true,
             .Data => true,
             .DataTx, .DataTxComplete => true,

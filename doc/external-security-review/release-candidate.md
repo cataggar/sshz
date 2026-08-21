@@ -1,8 +1,10 @@
 # Pinned security-review release candidate
 
 No such candidate has yet been pinned and no independent external review has
-occurred. [Issue #70](https://github.com/cataggar/sshz/issues/70) remains
-blocked on an external reviewer and completion of this signed-RC procedure.
+occurred. [Issue #70](https://github.com/cataggar/sshz/issues/70) was rescoped
+to a maintainer-led review and closure as not planned. A future independent
+review remains a separate production-release requirement and must complete this
+signed-RC procedure.
 
 ## Candidate record
 
@@ -32,12 +34,14 @@ annotated tag is a separate Git object.
 
 ## Toolchain and dependency record
 
-The repository currently declares no Zig package dependency in
-`build.zig.zon`. It requires Zig 0.16.0 or newer and links system zlib. The CI
-configuration currently downloads a Zig 0.16.0 archive by version but does not
-record an archive checksum; system packages and runner images are not pinned.
-These facts are incomplete release pinning, not permission to record
-`latest`.
+The repository requires Zig 0.16.0 or newer. `build.zig.zon` pins the Zig
+source package `https://github.com/cataggar/zlib` at commit
+`b4e57365ac3c84121c99a51c54eb02a5e4b16c86` with package hash
+`zlib-1.3.2-Nw5YbZEKNwAuh6XJs-vzogSoSv5jdL3PBhOI98q_QUu0`; `build.zig`
+builds and statically links its `z` artifact. CI pins and verifies SHA-256
+digests for each downloaded Zig 0.16.0 toolchain archive before extraction and
+execution. System packages and runner images are not immutably pinned. These
+facts remain incomplete release pinning, not permission to record `latest`.
 
 For each candidate, record:
 
@@ -50,7 +54,7 @@ target_triple: <EXACT>
 optimize_mode: <Debug|ReleaseSafe|...>
 os_image_and_kernel: <EXACT>
 libc_implementation_and_version: <EXACT>
-zlib_compile_and_runtime_version: <EXACT>
+zlib_source_repository_commit_and_package_hash: <EXACT>
 openssh_client_and_server_version: <EXACT-OR-NOT-INSTALLED>
 dropbear_version: <EXACT-OR-NOT-INSTALLED>
 libssh_version: <EXACT-OR-NOT-INSTALLED>
@@ -131,7 +135,7 @@ sha256sum "$EVIDENCE_DIR/source.tar.gz" \
   zig env
   sha256sum "$(command -v zig)"
   uname -a
-  pkg-config --modversion zlib
+  grep -A4 '\.zlib = ' build.zig.zon
   ssh -V
   sshd -V
   dropbear -V

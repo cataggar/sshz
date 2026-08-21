@@ -8,8 +8,8 @@ documentation, platform, and review requirement below must be satisfied.
 
 ### Scope and compatibility
 
-- [ ] Choose the exact commit, Zig version, system zlib versions, supported
-  targets, and artifact provenance; freeze the candidate.
+- [ ] Choose the exact commit, Zig version, pinned zlib source revision/package
+  hash, supported targets, and artifact provenance; freeze the candidate.
 - [ ] Review the candidate production surface in
   [the API contract](api-production.md); document every breaking/additive
   change and migration.
@@ -37,6 +37,9 @@ documentation, platform, and review requirement below must be satisfied.
 - [ ] Resolve every release blocker in the
   [threat model](threat-model.md) and [algorithm policy](algorithm-policy.md),
   or stop the release.
+- [x] Complete and record the 2026-08-21
+  [maintainer-led review](maintainer-security-review-2026-08-21.md), including
+  its findings and working-tree remediations. This is internal evidence only.
 - [ ] Complete an independent cryptographic/protocol and memory-safety review;
   triage all findings and publish a disclosure contact/advisory plan.
 - [ ] Run coverage-guided fuzzing with sanitizers where available over
@@ -49,6 +52,8 @@ documentation, platform, and review requirement below must be satisfied.
   timeout, resource-exhaustion, and cleanup paths in the production examples.
 - [ ] Generate and verify an SBOM/provenance record; pin dependencies and
   confirm release artifacts contain no fixtures, secrets, or unsafe tracing.
+  The zlib source dependency and CI Zig archive digests are pinned today, but
+  this does not complete release provenance.
 
 ### Documentation and operations
 

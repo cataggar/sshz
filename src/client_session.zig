@@ -1036,6 +1036,7 @@ pub const Session = struct {
 
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
             },
+            .RspFailureWrite => return IoError.UnexpectedResponse,
             .Connected => {
                 switch (chan.kind) {
                     .Session => sshz.requestEvent(.Connected, .Idle),

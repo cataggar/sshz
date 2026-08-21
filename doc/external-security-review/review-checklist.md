@@ -7,6 +7,11 @@ skipping an item. Record potential vulnerabilities through the
 [finding process](findings-and-disclosure.md), not in this checklist if doing
 so would disclose exploit details.
 
+The 2026-08-21 [maintainer-led review](../maintainer-security-review-2026-08-21.md)
+is completed internal evidence, but none of the independent-review boxes below
+are checked by that work. A future reviewer must evaluate a newly pinned,
+signed candidate and the maintainer remediations independently.
+
 ## Reviewer intake and scope
 
 - [ ] Record review ID, reviewer organization/name, review dates, candidate
@@ -14,8 +19,9 @@ so would disclose exploit details.
 - [ ] Confirm the candidate commit and tag resolve to the same object and the
       checkout is clean.
 - [ ] Confirm compiler, target, optimization mode, OS/architecture, libc,
-      system zlib, OpenSSH, Dropbear, and libssh versions are recorded, or mark
-      an unavailable dependency/lane as missing evidence.
+      pinned zlib source revision/package hash, OpenSSH, Dropbear, and libssh
+      versions are recorded, or mark an unavailable dependency/lane as missing
+      evidence.
 - [ ] Read the [package scope](README.md#exact-review-scope), [threat
       model](../threat-model.md), [algorithm
       policy](../algorithm-policy.md), and [timing
@@ -89,7 +95,7 @@ so would disclose exploit details.
 - [ ] Review OpenSSH private-key container bounds, metadata, one-key
       restriction, encrypted/unencrypted cases, bcrypt salt/rounds, passphrase
       failure, public/private consistency, trailing data, and scratch cleanup.
-- [ ] Identify where security depends on Zig or system-zlib internals and
+- [ ] Identify where security depends on Zig or pinned-zlib internals and
       compare candidate versions with advisories and upstream guarantees.
 
 ## Authentication and host identity
@@ -104,7 +110,9 @@ so would disclose exploit details.
       for names, ports, aliases, and trust stores.
 - [ ] Review client method discovery/order, per-method/total attempt limits,
       partial success, retry stages, banners, password, public-key,
-      keyboard-interactive, encrypted keys, and unsupported methods.
+      keyboard-interactive, encrypted keys, and unsupported methods. Verify the
+      server neither advertises nor accepts keyboard-interactive until a full
+      RFC 4256 challenge-response exchange is implemented.
 - [ ] Verify signed public-key proof precedes an authentication decision;
       unsigned probes require application authorization before `PK_OK` but
       cannot authenticate; malformed names/blobs/signatures cannot reach a
@@ -128,7 +136,9 @@ so would disclose exploit details.
       peer close during writes, error cleanup, and buffered-data zeroization.
 - [ ] Review parsing and application authorization for session,
       `direct-tcpip`, and `forwarded-tcpip` opens and shell, exec, subsystem,
-      environment, window-change, and signal requests.
+      environment, window-change, and signal requests. Verify session opens
+      require explicit application approval and session-only requests are
+      rejected on forwarding channels.
 - [ ] Review `tcpip-forward`/`cancel-tcpip-forward`, allocated ports,
       `want_reply`, outstanding-request correlation, address/port validation,
       and fail-closed application decisions.

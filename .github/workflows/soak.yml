@@ -54,9 +54,16 @@ jobs:
           set -euo pipefail
           version="0.16.0"
           archive="zig-x86_64-linux-${version}.tar.xz"
+          archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+          archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
-          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${RUNNER_TEMP}/${archive}"
-          tar -xf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}"
+          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
+          actual_sha256="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          if [ "${actual_sha256}" != "${archive_sha256}" ]; then
+            echo "SHA-256 mismatch for ${archive}" >&2
+            exit 1
+          fi
+          tar -xf "${archive_path}" -C "${RUNNER_TEMP}"
           echo "${zig_dir}" >> "${GITHUB_PATH}"
           "${zig_dir}/zig" version
       - &install-peers

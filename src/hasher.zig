@@ -104,16 +104,24 @@ pub fn Hasher(hash_algo: anytype) type {
         }
 
         pub fn writeMpint(self: *Self, v: []const u8) void {
+            var first_nonzero: usize = 0;
+            while (first_nonzero < v.len and v[first_nonzero] == 0) : (first_nonzero += 1) {}
+            const value = v[first_nonzero..];
+            if (value.len == 0) {
+                self.writeU32(0);
+                return;
+            }
+
             // if MSB of first byte is set, mpint must be padded
             // https://datatracker.ietf.org/doc/html/rfc4251#section-5
-            const pad = v[0] & 0x80 > 0;
+            const pad = value[0] & 0x80 > 0;
             if (pad) {
-                self.writeU32(@intCast(v.len + 1));
+                self.writeU32(@intCast(value.len + 1));
                 self.writeU8(0);
             } else {
-                self.writeU32(@intCast(v.len));
+                self.writeU32(@intCast(value.len));
             }
-            self.writeBytes(v);
+            self.writeBytes(value);
         }
 
         pub fn writeU32LenString(self: *Self, v: []const u8) void {
@@ -148,4 +156,18 @@ test "hasher" {
     try std.testing.expect(std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
     try std.testing.expect(!hasher.active);
     try std.testing.expectEqual(@as(usize, 0), hasher.msg_len);
+}
+
+test "hasher encodes canonical positive mpints" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const encoded = [_]u8{ 0, 0, 0, 2, 0, 0x80 };
+    var expected: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(&encoded, &expected, .{});
+
+    var hasher = Hasher(Sha256).init();
+    hasher.writeMpint(&.{ 0, 0, 0x80 });
+    var actual: [Sha256.digest_length]u8 = undefined;
+    hasher.final(&actual, null);
+
+    try std.testing.expectEqualSlices(u8, &expected, &actual);
 }

@@ -219,7 +219,6 @@ pub fn main(init: std.process.Init) !void {
                                     .algorithm = pubkey.algorithm,
                                     .blob = pubkey.blob,
                                 } },
-                                .KeyboardInteractive => .keyboard_interactive,
                             } else .none;
                             try sshz.decideUserAuth(
                                 if (policy.allows(credentials.username, attempt)) .Allow else .Deny,
@@ -241,11 +240,14 @@ pub fn main(init: std.process.Init) !void {
                             try sshz.clearEvent(eventCode);
                         },
                         .ChannelOpenRequest => |request| {
-                            try sshz.rejectChannelOpen(
-                                request.channel,
-                                SshOpenFailureReason.AdministrativelyProhibited,
-                                "unsupported channel open",
-                            );
+                            switch (request.request) {
+                                .Session => try sshz.acceptChannelOpen(request.channel),
+                                else => try sshz.rejectChannelOpen(
+                                    request.channel,
+                                    SshOpenFailureReason.AdministrativelyProhibited,
+                                    "unsupported channel open",
+                                ),
+                            }
                         },
                         .TcpipForward => {
                             try sshz.rejectTcpipForward();

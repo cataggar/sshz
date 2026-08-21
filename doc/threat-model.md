@@ -24,10 +24,14 @@ implementations:
 
 GitHub issue state is authoritative for tracked work. A link below means that
 the gap is tracked; it does not mean the issue is fixed or closed. In
-particular, no independent external security review has occurred. The review
-requested by [#70](https://github.com/cataggar/sshz/issues/70) remains
-blocked on engaging an external reviewer and pinning a signed release
-candidate.
+particular, no independent external security review has occurred. The
+2026-08-21 [maintainer-led review](maintainer-security-review-2026-08-21.md)
+records findings and working-tree remediations from an audit of base commit
+`9cfc88118a7872944ab3e841f31ad6e2e6cddade`; it is not independent-review or
+production-release evidence. Issue
+[#70](https://github.com/cataggar/sshz/issues/70) was rescoped to that
+maintainer review and closure as not planned rather than representing that an
+external reviewer was hired.
 
 ## Intended users and deployment modes
 
@@ -165,24 +169,26 @@ covered by [#66](https://github.com/cataggar/sshz/issues/66).
 
 ### Authentication, credential theft, and agent forwarding
 
-Password, keyboard-interactive, and public-key authentication are sent after
-new encryption keys are installed. Public-key authentication verifies proof of
-the presented private key before the server application makes its authorization
-decision. These protections still rely on correct host-key validation.
+Password and public-key authentication, plus client keyboard-interactive
+requests, are sent after new encryption keys are installed. Public-key
+authentication verifies proof of the presented private key before the server
+application makes its authorization decision. These protections still rely on
+correct host-key validation.
 
 The server library deliberately delegates account policy to its application.
 `sshzd` now fails closed by default and can authorize complete public-key blobs
 from a bounded `authorized_keys` file; its legacy unsafe behavior requires an
-explicit demo flag. Per-user policy integration, configurable method
-advertisement, and complete keyboard-interactive server behavior remain
-unfinished. Passwords and key passphrases are copied into session memory;
+explicit demo flag. Per-user policy integration and configurable method
+advertisement remain unfinished. The server does not advertise or accept
+keyboard-interactive until complete RFC 4256 challenge-response behavior is
+implemented. Passwords and key passphrases are copied into session memory;
 `sshz` optionally obtains them from environment variables. Agent forwarding is
 disabled by default in `sshz`, but enabling it gives the authenticated server
 access to the local agent for the session and must be limited to trusted
 servers.
 
-The server now emits typed authorization attempts for `none`, password,
-public-key, and keyboard-interactive requests. Applications resolve them with
+The server emits typed authorization attempts for `none`, password, and
+public-key requests. Applications resolve them with
 an atomic allow/deny decision; undecided clears deny, and public-key probes
 require policy approval without authenticating. The sample server defaults to
 deny-all and provides a bounded `authorized_keys` policy. Review and release
@@ -319,7 +325,11 @@ independent review. Commands, scenarios, and artifact rules are documented in
 [Stress and soak testing](stress-and-soak.md). Remaining interoperability and
 soak confidence is tracked by [#58](https://github.com/cataggar/sshz/issues/58),
 [#59](https://github.com/cataggar/sshz/issues/59), and
-[#68](https://github.com/cataggar/sshz/issues/68).
+[#68](https://github.com/cataggar/sshz/issues/68). The maintainer review also
+triaged an `InvalidSignature` soak failure to non-canonical shared-secret mpint
+encoding and added a fix and regression tests; [run 32330117112, job
+96309001974](https://github.com/cataggar/sshz/actions/runs/32330117112/job/96309001974)
+is failed evidence, and a successful replacement soak is still required.
 
 ## Accepted and out-of-scope risks
 
@@ -358,7 +368,7 @@ current state.
 | Resource and key-lifetime limits | Application-wide connection/FD/process admission limits and a driven production key-age policy; per-session limits, automatic local rekey, hard bounds, and key-lifetime tests are documented and enforced | [#67](https://github.com/cataggar/sshz/issues/67) |
 | Interoperability and stress confidence | Retain required OpenSSH/Dropbear/libssh Linux CI, deterministic ReleaseSafe stress, and scheduled peer soaks; accumulate and review long-run evidence | [#58](https://github.com/cataggar/sshz/issues/58), [#59](https://github.com/cataggar/sshz/issues/59), [#68](https://github.com/cataggar/sshz/issues/68) |
 | Safe, stable integration surface | Documented ownership/lifecycle/error semantics, compatibility policy, and separate production-oriented client/server examples | [#69](https://github.com/cataggar/sshz/issues/69) |
-| Independent review | Engage an external reviewer, pin a signed RC, review transport, crypto use, authentication, channels, memory hygiene, and side channels, and leave no unresolved critical/high finding | [#70](https://github.com/cataggar/sshz/issues/70) |
+| Independent review | Engage a reviewer independent of the maintainers and fix authors, pin a signed RC, review transport, crypto use, authentication, channels, memory hygiene, and side channels, and leave no unresolved critical/high finding. The 2026-08-21 maintainer review does not satisfy this row. | [Future independent-review package](external-security-review/README.md); [#70](https://github.com/cataggar/sshz/issues/70) records the rescoped maintainer work, not completed independent review |
 
 This checked-in model is the concrete mitigation requested by
 [#61](https://github.com/cataggar/sshz/issues/61). It must be updated when
