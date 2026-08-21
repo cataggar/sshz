@@ -590,6 +590,26 @@ pub const Session = struct {
         const chan = ch.?;
         self.active_channel_id = chan.local_id;
 
+        if (chan.remote_id_known and (chan.state == .Data or chan.state == .DataRx) and
+            !chan.eof_received and !chan.close_pending and !chan.close_sent and !chan.close_received and
+            chan.needsWindowAdjust())
+        {
+            var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
+            try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
+            try pkt.writeU32(chan.remote_id);
+            const adjust = chan.windowAdjustAmount();
+            try pkt.writeU32(adjust);
+            chan.local_window = chan.local_window_target;
+            try sshz.requestWrite(
+                try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr),
+                .WriteCompletePreserveState,
+            );
+            chan.state = .DataRx;
+            self.active_channel_id = null;
+            if (self.channel_table.findNextRunnable() == null) self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
+
         if ((chan.close_received or chan.close_pending) and chan.write_buf_nbytes > 0 and chan.tx_in_flight_len == 0) {
             chan.discardWriteBuffer();
             chan.eof_pending = false;
@@ -666,21 +686,8 @@ pub const Session = struct {
                 chan.state = .Data;
             },
             .Data => {
-                if (chan.needsWindowAdjust()) {
-                    // RFC 4254 §5.2 — replenish receive window
-                    var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                    try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
-                    try pkt.writeU32(chan.remote_id);
-                    const adjust = chan.windowAdjustAmount();
-                    try pkt.writeU32(adjust);
-                    chan.local_window = chan.local_window_target;
-                    try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
-                    chan.state = .DataRx;
-                    self.active_channel_id = null;
-                } else {
-                    chan.state = .DataRx;
-                    self.active_channel_id = null;
-                }
+                chan.state = .DataRx;
+                self.active_channel_id = null;
                 if (self.channel_table.findNextRunnable()) |_| {} else {
                     self.setIoSessionState(.ReadPktHdr);
                 }
@@ -1798,6 +1805,75 @@ pub const Session = struct {
         }
     }
 };
+
+fn writeServerChannelPacket(m: *SshzServer, channel: u32, data: []const u8) !void {
+    var payload_backing: [64]u8 = undefined;
+    var payload = BufferWriter.init(&payload_backing, 0);
+    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU32(channel);
+    try payload.writeU32LenString(data);
+
+    var packet: [96]u8 = undefined;
+    const packet_len = buildUnencryptedPacket(&packet, payload.active());
+    try m.write(packet[0..Protocol.sizeof_PktHdr]);
+    try m.write(packet[Protocol.sizeof_PktHdr..packet_len]);
+}
+
+fn expectAndClearServerData(m: *SshzServer, channel: u32, data: []const u8) !void {
+    switch (try m.getNextEvent()) {
+        .Event => |code| switch (code) {
+            .RxData => |received| {
+                try std.testing.expectEqual(channel, received.channel);
+                try std.testing.expectEqualSlices(u8, data, received.data);
+                try m.clearEvent(.{ .RxData = received });
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "server window adjustment completion preserves concurrently received packet" {
+    const limits = Sshz.ResourceLimits{
+        .initial_channel_window = 12,
+        .max_channel_window = 12,
+        .channel_packet_size = 4,
+        .max_peer_packet_size = 4,
+    };
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.initWithLimits(
+        prng.random(),
+        @import("privkey.zig").testkey_valid,
+        std.testing.allocator,
+        limits,
+    );
+    defer m.deinit();
+
+    const chan = m.session.channel_table.allocChannel(42, 12, 4).?;
+    chan.state = .DataRx;
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+    m.session.setIoSessionState(.ReadPktHdr);
+    m.requestRead(0, Protocol.sizeof_PktHdr, .{ .ReadPktBody = m.iobuf_rd[0..Protocol.sizeof_PktHdr] });
+
+    try writeServerChannelPacket(&m, chan.local_id, "aaaa");
+    try expectAndClearServerData(&m, chan.local_id, "aaaa");
+    try writeServerChannelPacket(&m, chan.local_id, "bbbb");
+    try expectAndClearServerData(&m, chan.local_id, "bbbb");
+
+    const adjust_len = m.wr_nbytes;
+    try std.testing.expect(adjust_len > 1);
+    var adjust = BufferReader.init(unencryptedPayload(try m.peek(adjust_len)));
+    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST), try adjust.readU8());
+    try std.testing.expectEqual(chan.remote_id, try adjust.readU32());
+    try std.testing.expectEqual(@as(u32, 8), try adjust.readU32());
+    try m.consumed(1);
+    try writeServerChannelPacket(&m, chan.local_id, "cccc");
+    try std.testing.expect(m.session.ioSessionState == .ReadPktCompletion);
+    try m.consumed(adjust_len - 1);
+    try expectAndClearServerData(&m, chan.local_id, "cccc");
+    try std.testing.expectEqual(@as(u32, 8), chan.local_window);
+}
 
 fn parsePublicKeyBlobExact(blob: []const u8) Key.KeyError!Key.PublicKey {
     const public_key = try Key.parsePublicKeyBlob(blob);
