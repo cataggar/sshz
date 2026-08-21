@@ -1436,6 +1436,7 @@ pub fn SshzImpl(role: Role) type {
                         self.wr_nbytes = 0;
                         self.wr_off = 0;
                         switch (iotype.next_state) {
+                            .WriteCompletePreserveState => {},
                             .ChannelWriteComplete => |channel_id| {
                                 self.session.completeChannelWrite(channel_id, self) catch |err| {
                                     self.failClosed();
@@ -1581,6 +1582,7 @@ pub fn SshzImpl(role: Role) type {
                         .Server => self.session.setIoSessionState(.VersionWrite),
                     }
                 },
+                .WriteCompletePreserveState => return IoError.UnexpectedResponse,
                 .ChannelWriteComplete => return IoError.UnexpectedResponse,
                 .ChannelControlComplete => return IoError.UnexpectedResponse,
                 .ReadPktHdr => {
@@ -1654,6 +1656,7 @@ pub fn SshzImpl(role: Role) type {
                 .ReadPktHdr, .ReadPktBody => self.iostate_rd == .Idle,
                 // Write-requiring states need write side idle
                 .VersionWrite => self.iostate_wr == .Idle,
+                .WriteCompletePreserveState => false,
                 .ChannelWriteComplete => false,
                 .ChannelControlComplete => false,
                 // Processing states

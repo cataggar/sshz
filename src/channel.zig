@@ -336,7 +336,10 @@ pub const ChannelTable = struct {
                     ch.control_in_flight == null and
                     ((ch.eof_pending and !ch.eof_sent) or (ch.close_pending and !ch.close_sent));
                 const terminal_close_ready = ch.remote_id_known and ch.tx_in_flight_len == 0 and ch.close_pending and !ch.close_sent;
-                if (tx_ready or control_ready or terminal_close_ready or isRunnable(ch.state)) {
+                const window_adjust_ready = ch.remote_id_known and ch.state == .DataRx and
+                    !ch.eof_received and !ch.close_pending and !ch.close_sent and !ch.close_received and
+                    ch.needsWindowAdjust();
+                if (tx_ready or control_ready or terminal_close_ready or window_adjust_ready or isRunnable(ch.state)) {
                     self.last_serviced_slot = slot_idx;
                     return ch;
                 }
@@ -574,6 +577,18 @@ test "findNextRunnable returns null when no channels runnable" {
     ch0.state = .DataRx;
     const ch1 = table.allocChannel(20, 32768, 32768).?;
     ch1.state = .DataRx;
+    try std.testing.expect(table.findNextRunnable() == null);
+}
+
+test "findNextRunnable wakes a receive-only channel needing window adjustment" {
+    var table = ChannelTable{ .limits = .{ .initial_window = 12, .packet_size = 4 } };
+    const ch = table.allocChannel(10, 12, 4).?;
+    ch.state = .DataRx;
+    ch.local_window = 4;
+
+    try std.testing.expectEqual(ch.local_id, table.findNextRunnable().?.local_id);
+
+    ch.close_received = true;
     try std.testing.expect(table.findNextRunnable() == null);
 }
 
