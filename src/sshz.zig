@@ -1737,6 +1737,18 @@ pub fn SshzImpl(role: Role) type {
             };
         }
 
+        /// Controls whether authentication automatically opens a session channel.
+        ///
+        /// Disable this before connecting when the client only needs channels
+        /// such as `direct-tcpip`. `.Connected` is then emitted immediately
+        /// after authentication, with every configured channel slot available.
+        pub fn setAutoSessionEnabled(self: *Self, enabled: bool) SshzError!void {
+            return switch (role) {
+                .Client => try self.session.setAutoSessionEnabled(enabled),
+                .Server => IoError.UnimplementedService,
+            };
+        }
+
         pub fn setAutoExecCommand(self: *Self, command: []const u8) SshzError!void {
             return switch (role) {
                 .Client => try self.session.setAutoExecCommand(command),

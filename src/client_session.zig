@@ -111,6 +111,7 @@ pub const Session = struct {
     auto_pty_width_px: u32,
     auto_pty_height_px: u32,
     auto_exec_command: ?[]u8,
+    auto_session_enabled: bool,
     kbd_interactive_response: ?[]u8, // allocated
     is_rekeying: bool,
     rekey_resume_state: ?SessionState,
@@ -175,6 +176,7 @@ pub const Session = struct {
             .auto_pty_width_px = 640,
             .auto_pty_height_px = 480,
             .auto_exec_command = null,
+            .auto_session_enabled = true,
             .kbd_interactive_response = null,
             .is_rekeying = false,
             .rekey_resume_state = null,
@@ -875,6 +877,11 @@ pub const Session = struct {
                 self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelOpenReq => {
+                if (!self.auto_session_enabled) {
+                    self.setSessionState(.ChannelActive);
+                    sshz.requestEvent(.Connected, .Idle);
+                    return;
+                }
                 const mode: ClientChannelOpenMode = if (self.auto_exec_command != null) .AutoExec else .AutoShell;
                 const chan = try self.allocateClientSessionChannel(mode);
                 self.active_channel_id = chan.local_id;
@@ -1548,6 +1555,7 @@ pub const Session = struct {
     }
 
     pub fn enableAgentForwarding(self: *Self) SshzError!void {
+        if (!self.auto_session_enabled) return IoError.UnexpectedResponse;
         switch (self.sessionState) {
             .ChannelActive => return IoError.UnexpectedResponse,
             else => {
@@ -1556,14 +1564,30 @@ pub const Session = struct {
         }
     }
 
+    pub fn setAutoSessionEnabled(self: *Self, enabled: bool) SshzError!void {
+        if (self.channel_table.activeCount() != 0 or self.user_authenticated) {
+            return IoError.UnexpectedResponse;
+        }
+        if (!enabled and
+            (self.agent_forwarding_enabled or self.auto_exec_command != null or self.auto_pty_term != null))
+        {
+            return IoError.UnexpectedResponse;
+        }
+        self.auto_session_enabled = enabled;
+    }
+
     pub fn setAutoExecCommand(self: *Self, command: []const u8) SshzError!void {
-        if (self.channel_table.activeCount() != 0) return IoError.UnexpectedResponse;
+        if (!self.auto_session_enabled or self.channel_table.activeCount() != 0) {
+            return IoError.UnexpectedResponse;
+        }
         self.clearAndFreeOptional(&self.auto_exec_command);
         self.auto_exec_command = try self.allocator.dupe(u8, command);
     }
 
     pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
-        if (self.channel_table.activeCount() != 0) return IoError.UnexpectedResponse;
+        if (!self.auto_session_enabled or self.channel_table.activeCount() != 0) {
+            return IoError.UnexpectedResponse;
+        }
         self.clearAndFreeOptional(&self.auto_pty_term);
         self.auto_pty_term = try self.allocator.dupe(u8, term);
         self.auto_pty_cols = cols;
@@ -2515,6 +2539,61 @@ test "none auth success advances without requesting credentials" {
     try std.testing.expectEqual(SessionState.ChannelOpenReq, m.session.sessionState);
     try std.testing.expect(m.session.privkey_ascii == null);
     try std.testing.expect(m.session.auth_passphrase == null);
+}
+
+test "disabled auto session emits Connected without consuming a channel slot" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var limits: Sshz.ResourceLimits = .{};
+    limits.max_channels = 1;
+    var m = try SshzClient.initWithLimits(
+        prng.random(),
+        "testuser",
+        std.testing.allocator,
+        limits,
+    );
+    defer m.deinit();
+
+    try m.setAutoSessionEnabled(false);
+    m.session.encrypted = false;
+    m.session.current_auth_method = .None;
+    m.session.setSessionState(.AuthRsp);
+    m.iostate_rd = .Idle;
+    m.iostate_wr = .Idle;
+
+    var payload = [_]u8{@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS)};
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, &payload);
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+    try m.advance();
+
+    try std.testing.expectEqual(SessionState.ChannelActive, m.session.sessionState);
+    try std.testing.expectEqual(@as(u32, 0), m.session.channel_table.activeCount());
+    const event = try m.getNextEvent();
+    switch (event) {
+        .Event => |code| switch (code) {
+            .Connected => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try m.clearEvent(.Connected);
+    const channel_id = try m.openDirectTcpipChannel("example.com", 443, "127.0.0.1", 55555);
+    try std.testing.expectEqual(@as(u32, 0), channel_id);
+    try std.testing.expectEqual(@as(u32, 1), m.session.channel_table.activeCount());
+}
+
+test "disabled auto session rejects session-dependent configuration" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.setAutoSessionEnabled(false);
+    try std.testing.expectError(error.UnexpectedResponse, m.enableAgentForwarding());
+    try std.testing.expectError(error.UnexpectedResponse, m.setAutoExecCommand("true"));
+    try std.testing.expectError(
+        error.UnexpectedResponse,
+        m.setAutoPty("xterm-color", 80, 24, 640, 480),
+    );
 }
 
 test "none rejection falls back through missing key to password" {
