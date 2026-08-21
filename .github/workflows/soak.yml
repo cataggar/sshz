@@ -58,7 +58,14 @@ jobs:
           archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
           curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
-          actual_sha256="$(shasum -a 256 "${archive_path}" | awk '{print $1}')"
+          actual_sha256="$(python - "${archive_path}" <<'PY'
+          import hashlib
+          import sys
+
+          with open(sys.argv[1], "rb") as archive_file:
+              print(hashlib.file_digest(archive_file, "sha256").hexdigest())
+          PY
+          )"
           if [ "${actual_sha256}" != "${archive_sha256}" ]; then
             echo "SHA-256 mismatch for ${archive}" >&2
             exit 1
