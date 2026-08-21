@@ -105,6 +105,7 @@ pub const Session = struct {
     pending_global_request_bind_address: [Protocol.MaxSSHPacket]u8 = undefined,
     agent_forwarding_enabled: bool,
     agent_forwarding_requested: bool,
+    auto_pty_requested: bool,
     auto_pty_term: ?[]u8,
     auto_pty_cols: u32,
     auto_pty_rows: u32,
@@ -170,6 +171,7 @@ pub const Session = struct {
             .pending_global_request = null,
             .agent_forwarding_enabled = false,
             .agent_forwarding_requested = false,
+            .auto_pty_requested = false,
             .auto_pty_term = null,
             .auto_pty_cols = 80,
             .auto_pty_rows = 24,
@@ -205,6 +207,7 @@ pub const Session = struct {
         self.clearAndFreeOptional(&self.kbd_interactive_response);
         self.clearAndFreeOptional(&self.auto_exec_command);
         self.clearAndFreeOptional(&self.auto_pty_term);
+        self.auto_pty_requested = false;
         self.clearPendingKeys();
         self.clearAndFreeOptional(&self.pending_server_kexinit);
         self.rekey_resume_state = null;
@@ -971,7 +974,17 @@ pub const Session = struct {
                     chan.state = .Data;
                     return;
                 }
-                defer self.clearAndFreeOptional(&self.auto_pty_term);
+                const request_pty = chan.client_open_mode == .AutoShell or
+                    (chan.client_open_mode == .AutoExec and self.auto_pty_requested);
+                if (!request_pty) {
+                    chan.state = .RspWrite;
+                    try self.advanceChannel(sshz, outkeys);
+                    return;
+                }
+                defer {
+                    self.clearAndFreeOptional(&self.auto_pty_term);
+                    self.auto_pty_requested = false;
+                }
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
                 try pkt.writeU32(chan.remote_id);
@@ -1577,7 +1590,7 @@ pub const Session = struct {
             return IoError.UnexpectedResponse;
         }
         if (!enabled and
-            (self.agent_forwarding_enabled or self.auto_exec_command != null or self.auto_pty_term != null))
+            (self.agent_forwarding_enabled or self.auto_exec_command != null or self.auto_pty_requested))
         {
             return IoError.UnexpectedResponse;
         }
@@ -1588,20 +1601,23 @@ pub const Session = struct {
         if (!self.auto_session_enabled or self.channel_table.activeCount() != 0) {
             return IoError.UnexpectedResponse;
         }
+        const replacement = try self.allocator.dupe(u8, command);
         self.clearAndFreeOptional(&self.auto_exec_command);
-        self.auto_exec_command = try self.allocator.dupe(u8, command);
+        self.auto_exec_command = replacement;
     }
 
     pub fn setAutoPty(self: *Self, term: []const u8, cols: u32, rows: u32, width_px: u32, height_px: u32) SshzError!void {
         if (!self.auto_session_enabled or self.channel_table.activeCount() != 0) {
             return IoError.UnexpectedResponse;
         }
+        const replacement = try self.allocator.dupe(u8, term);
         self.clearAndFreeOptional(&self.auto_pty_term);
-        self.auto_pty_term = try self.allocator.dupe(u8, term);
+        self.auto_pty_term = replacement;
         self.auto_pty_cols = cols;
         self.auto_pty_rows = rows;
         self.auto_pty_width_px = width_px;
         self.auto_pty_height_px = height_px;
+        self.auto_pty_requested = true;
     }
 
     pub fn setKeyboardInteractiveResponse(self: *Self, response: []const u8) SshzError!void {
@@ -2507,6 +2523,28 @@ fn expectProducedExecRequest(m: *SshzClient, expected_command: []const u8) !void
     try std.testing.expectEqualStrings(expected_command, try rdr.readU32LenString());
 }
 
+fn confirmAutoSessionChannel(m: *SshzClient, mode: ClientChannelOpenMode) !*Channel {
+    const chan = m.session.channel_table.allocChannel(0, 0, 0).?;
+    chan.client_open_mode = mode;
+    chan.state = .OpenWrite;
+
+    var payload_backing: [32]u8 = undefined;
+    var pw = BufferWriter.init(&payload_backing, 0);
+    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try pw.writeU32(chan.local_id);
+    try pw.writeU32(42);
+    try pw.writeU32(32768);
+    try pw.writeU32(4096);
+
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.payload);
+    m.session.encrypted = false;
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelOpenRsp);
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], m);
+    try std.testing.expectEqual(ChannelState.Open, chan.state);
+    return chan;
+}
+
 test "none auth queues request before method-started event" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
@@ -2602,6 +2640,20 @@ test "disabled auto session rejects session-dependent configuration" {
         error.UnexpectedResponse,
         m.setAutoPty("xterm-color", 80, 24, 640, 480),
     );
+}
+
+test "configured pty guards auto session and failClosed clears ownership" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var session = try Session.init(prng.random(), "testuser", std.testing.allocator);
+    defer session.deinit();
+
+    try session.setAutoPty("xterm-color", 80, 24, 640, 480);
+    try std.testing.expect(session.auto_pty_requested);
+    try std.testing.expectError(error.UnexpectedResponse, session.setAutoSessionEnabled(false));
+
+    session.failClosed();
+    try std.testing.expect(!session.auto_pty_requested);
+    try std.testing.expectEqual(@as(?[]u8, null), session.auto_pty_term);
 }
 
 test "none rejection falls back through missing key to password" {
@@ -4646,7 +4698,29 @@ test "handlePacket: auto-shell confirmation still emits Connected" {
     }
 }
 
-test "handlePacket: auto-exec confirmation sends pty then exec" {
+test "handlePacket: auto-exec confirmation sends exec without pty by default" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.setAutoExecCommand("printf machine-output");
+    _ = try confirmAutoSessionChannel(&m, .AutoExec);
+
+    try m.advance();
+    try expectProducedExecRequest(&m, "printf machine-output");
+    try m.consumed(m.wr_nbytes);
+
+    const evt = try m.getNextEvent();
+    switch (evt) {
+        .Event => |code| switch (code) {
+            .Connected => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "handlePacket: auto-exec sends pty then exec when pty setter follows exec" {
     var prng = std.Random.DefaultPrng.init(42);
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
@@ -4688,6 +4762,38 @@ test "handlePacket: auto-exec confirmation sends pty then exec" {
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "handlePacket: auto-exec sends latest pty and exec when pty setter comes first" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.setAutoPty("old-term", 80, 24, 640, 480);
+    try m.setAutoPty("xterm-new", 132, 50, 1056, 800);
+    try m.setAutoExecCommand("false");
+    try m.setAutoExecCommand("run-current");
+    _ = try confirmAutoSessionChannel(&m, .AutoExec);
+
+    try m.advance();
+    try expectProducedPtyRequest(&m, "xterm-new", 132, 50, 1056, 800);
+    try m.consumed(m.wr_nbytes);
+    try expectProducedExecRequest(&m, "run-current");
+}
+
+test "handlePacket: agent forwarding precedes non-pty exec" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    try m.enableAgentForwarding();
+    try m.setAutoExecCommand("agent-command");
+    _ = try confirmAutoSessionChannel(&m, .AutoExec);
+
+    try m.advance();
+    try expectProducedChannelRequest(&m, Protocol.channel_request_auth_agent);
+    try m.consumed(m.wr_nbytes);
+    try expectProducedExecRequest(&m, "agent-command");
 }
 
 test "handlePacket: channel open failure frees channel and emits event" {

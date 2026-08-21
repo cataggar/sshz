@@ -47,6 +47,8 @@ pub fn init(
         config.limits,
     );
     errdefer client.deinit();
+    // Exec is non-PTY by default, so stdout and extended-data stderr remain
+    // distinct. Call setAutoPty as well only when terminal semantics are wanted.
     try client.setAutoExecCommand(config.command);
     try client.initializeDeadlines(now);
     return client;

@@ -121,9 +121,14 @@ Credential request events borrow or copy credentials only for the required
 setter call. Do not log them. Clear ordinary informational/request events only
 after setting the requested value. `EndSession` is terminal. The current
 client automatically opens a session channel after authentication (shell by
-default, or `setAutoExecCommand`); this behavior is pre-1.0 and unsuitable as
-an implicit production policy. Configure the intended operation before
-driving the handshake.
+default, or `setAutoExecCommand`). The automatic shell requests a PTY with
+default terminal settings unless `setAutoPty` supplies them. Automatic exec is
+non-PTY by default, preserving separate `RxData` and `RxExtendedData` streams;
+call `setAutoPty` before or after `setAutoExecCommand` to explicitly request
+PTY+exec. A PTY may merge stderr into terminal output and apply terminal output
+processing. This automatic-session behavior is pre-1.0 and unsuitable as an
+implicit production policy. Configure the intended operation before driving
+the handshake.
 
 ## Server authentication and authorization
 
