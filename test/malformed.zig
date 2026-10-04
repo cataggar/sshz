@@ -89,19 +89,19 @@ const CorpusCase = struct {
     expected: ExpectedError,
 };
 
-const oversized_identification = [_]u8{'A'} ** 256;
+const oversized_identification: [256]u8 = @splat('A');
 const valid_packet = [_]u8{
     0, 0, 0, 12, 10,
     2,
-} ++ ([_]u8{0} ** 10);
+} ++ @as([10]u8, @splat(0));
 const overlong_packet = valid_packet ++ [_]u8{0};
-const truncated_mac_packet = valid_packet ++ ([_]u8{0} ** (sshz.TransportLimits.mac_len - 1));
+const truncated_mac_packet = valid_packet ++ @as([sshz.TransportLimits.mac_len - 1]u8, @splat(0));
 const bad_block_packet = [_]u8{
     0, 0, 0, 8, 6,
     2,
-} ++ ([_]u8{0} ** 6) ++ ([_]u8{0} ** sshz.TransportLimits.mac_len);
-const corrupt_mac = ([_]u8{0} ** (sshz.TransportLimits.mac_len - 1)) ++ [_]u8{1};
-const truncated_ecdh_key = [_]u8{0x42} ** (sshz.TransportLimits.ecdh_public_key_len - 1);
+} ++ @as([6]u8, @splat(0)) ++ @as([sshz.TransportLimits.mac_len]u8, @splat(0));
+const corrupt_mac = @as([sshz.TransportLimits.mac_len - 1]u8, @splat(0)) ++ [_]u8{1};
+const truncated_ecdh_key: [sshz.TransportLimits.ecdh_public_key_len - 1]u8 = @splat(0x42);
 const ecdh_reply_trailing = [_]u8{
     31,
     0,
@@ -112,7 +112,7 @@ const ecdh_reply_trailing = [_]u8{
     0,
     0,
     sshz.TransportLimits.ecdh_public_key_len,
-} ++ ([_]u8{0x42} ** sshz.TransportLimits.ecdh_public_key_len) ++ [_]u8{
+} ++ @as([sshz.TransportLimits.ecdh_public_key_len]u8, @splat(0x42)) ++ [_]u8{
     0,    0, 0, 0,
     0xff,
 };
@@ -379,7 +379,7 @@ fn runClientCase(case: CorpusCase, case_index: usize) !void {
         .client_kexinit => {
             var writer = sshz.BufferWriter.init(&generated_payload, 0);
             try writer.writeU8(20);
-            try writer.writeBytes(&([_]u8{0} ** 16));
+            try writer.writeBytes(&@as([16]u8, @splat(0)));
             try writer.writeU32LenString(case.input);
             try writer.writeU32LenString("ssh-ed25519");
             inline for (0..2) |_| try writer.writeU32LenString("aes256-ctr");
@@ -467,7 +467,7 @@ fn runCase(case: CorpusCase, case_index: usize) !void {
         .packet => try std.testing.expectError(case.expected.value(), sshz.inspectPacket(case.input, false)),
         .encrypted_packet => try std.testing.expectError(case.expected.value(), sshz.inspectPacket(case.input, true)),
         .mac => {
-            const calculated = [_]u8{0} ** sshz.TransportLimits.mac_len;
+            const calculated: [sshz.TransportLimits.mac_len]u8 = @splat(0);
             try std.testing.expectError(case.expected.value(), sshz.verifyPacketMac(calculated, case.input));
         },
         .compression => {

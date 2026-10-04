@@ -22,12 +22,12 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="0.16.0"
+          version="0.17.0"
           archive="zig-x86_64-linux-${version}.tar.xz"
-          archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+          archive_sha256="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
           archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
-          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
+          curl -fsSL "https://github.com/cataggar/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
           actual_sha256="$(python - "${archive_path}" <<'PY'
           import hashlib
           import sys
@@ -55,7 +55,7 @@ jobs:
           /usr/bin/time \
             -f "resource elapsed_seconds=%e max_rss_kib=%M exit=%x" \
             -o "${RUNNER_TEMP}/sshz-stress-safe/resource.txt" \
-            zig build stress -Doptimize=ReleaseSafe -- --seed 1751547392 \
+            zig build stress -Doptimize=safe -- --seed 1751547392 \
             2>&1 | tee "${RUNNER_TEMP}/sshz-stress-safe/stress.log"
           cat "${RUNNER_TEMP}/sshz-stress-safe/resource.txt"
           elapsed="$(sed -n 's/.*elapsed_seconds=\([^ ]*\).*/\1/p' "${RUNNER_TEMP}/sshz-stress-safe/resource.txt")"
@@ -92,23 +92,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          version="0.16.0"
+          version="0.17.0"
           case "${{ runner.os }}-${{ runner.arch }}" in
             Linux-X64)
               zig_target="x86_64-linux"
-              archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+              archive_sha256="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
               ;;
             macOS-ARM64)
               zig_target="aarch64-macos"
-              archive_sha256="b23d70deaa879b5c2d486ed3316f7eaa53e84acf6fc9cc747de152450d401489"
+              archive_sha256="b607e9b9234790a008116ae5bdb71c6243b84b9fb42a53a9e70fde41c06c536a"
               ;;
             macOS-X64)
               zig_target="x86_64-macos"
-              archive_sha256="0387557ed1877bc6a2e1802c8391953baddba76081876301c522f52977b52ba7"
+              archive_sha256="4f9a1c5269aa17ebda5e6d3c2b89d6cbf36f7d2b22a0306e9ab98f25f95529c6"
               ;;
             Windows-X64)
               zig_target="x86_64-windows"
-              archive_sha256="68659eb5f1e4eb1437a722f1dd889c5a322c9954607f5edcf337bc3684a75a7e"
+              archive_sha256="b5663f69581dcf391293fbf16c06cb80d81d806545ce618b4d0bab7f0eb8c428"
               ;;
             *)
               echo "Unsupported runner: ${{ runner.os }}-${{ runner.arch }}" >&2
@@ -125,7 +125,7 @@ jobs:
           archive="zig-${zig_target}-${version}.${archive_ext}"
           archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-${zig_target}-${version}"
-          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
+          curl -fsSL "https://github.com/cataggar/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
           actual_sha256="$(python - "${archive_path}" <<'PY'
           import hashlib
           import sys
@@ -152,8 +152,8 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 3
         run: |
-          zig build malformed -Doptimize=Debug --test-timeout 30s --seed 0
-          zig build malformed -Doptimize=ReleaseSafe --test-timeout 30s --seed 0
+          zig build malformed -Doptimize=debug --test-timeout 30s
+          zig build malformed -Doptimize=safe --test-timeout 30s
         working-directory: sshz
       - name: Build lib
         run: zig build

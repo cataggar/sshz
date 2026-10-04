@@ -3,13 +3,11 @@ const Sshz = @import("sshz.zig");
 const Protocol = @import("protocol.zig");
 const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferReader = @import("buffer.zig").BufferReader;
-const zlib = @cImport({
-    @cInclude("zlib.h");
-});
+const zlib = @import("zlib-c");
 
 const Open = enum { session, direct, forwarded, agent };
 const Ordering = enum { receive_first, transmit_first, partial_header, partial_body, header_before_open, body_before_open };
-const repeated_data = "A" ** 56;
+const repeated_data = &@as([56]u8, @splat('A'));
 
 fn Fixture(comptime opening: Open) type {
     const client = opening == .session or opening == .direct;
@@ -41,9 +39,9 @@ fn Fixture(comptime opening: Open) type {
             errdefer self.endpoint.deinit();
             if (!client) try self.endpoint.setServerChannelEventsEnabled(true);
             const session = &self.endpoint.session;
-            const hash = [_]u8{0x31} ** Protocol.hash_algo.digest_length;
-            const secret = [_]u8{0x42} ** Protocol.kex_algo.shared_length;
-            const session_id = [_]u8{0x53} ** Protocol.hash_algo.digest_length;
+            const hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x31);
+            const secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x42);
+            const session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0x53);
             try session.keydata.genKeys(hash, secret, session_id);
             try self.peer_keys.genKeys(hash, secret, session_id);
             try session.keydata.c2s.activateEpoch(0, null);
@@ -104,7 +102,7 @@ fn Fixture(comptime opening: Open) type {
         fn dataPacket(self: *Self, data: []const u8) ![]const u8 {
             var payload: [256]u8 = undefined;
             var writer = BufferWriter.init(&payload, 0);
-            try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+            try writer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
             try writer.writeU32(self.channel);
             try writer.writeU32LenString(data);
             return self.packet(writer.active());
@@ -197,7 +195,7 @@ fn Fixture(comptime opening: Open) type {
 
         fn checkOpen(self: *Self, channel_id: u32) !void {
             var reader = try self.readOutput();
-            try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try reader.readU8());
+            try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try reader.readU8());
             try std.testing.expectEqualStrings(switch (opening) {
                 .session => "session",
                 .direct => "direct-tcpip",
@@ -210,7 +208,7 @@ fn Fixture(comptime opening: Open) type {
         fn reply(self: *Self, channel_id: u32, accepted: bool) !void {
             var payload: [128]u8 = undefined;
             var writer = BufferWriter.init(&payload, 0);
-            try writer.writeU8(@intFromEnum(if (accepted)
+            try writer.writeU8(@backingInt(if (accepted)
                 Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION
             else
                 Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
@@ -398,7 +396,7 @@ test "channel OPEN completion processes received EOF and CLOSE before queued con
                 try fixture.endpoint.sendChannelEof(fixture.channel);
             var payload: [5]u8 = undefined;
             var writer = BufferWriter.init(&payload, 0);
-            try writer.writeU8(@intFromEnum(control));
+            try writer.writeU8(@backingInt(control));
             try writer.writeU32(fixture.channel);
             try fixture.feed(try fixture.packet(writer.active()));
             _ = try fixture.drain(Protocol.MaxSSHPacket);
@@ -420,7 +418,7 @@ test "channel OPEN completion processes received EOF and CLOSE before queued con
                 try std.testing.expectEqual(.Close, chan.control_in_flight.?);
                 _ = try fixture.drain(Protocol.MaxSSHPacket);
                 var reply = try fixture.readOutput();
-                try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try reply.readU8());
+                try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try reply.readU8());
                 try std.testing.expectEqual(@as(u32, 42), try reply.readU32());
                 if (opening == .session or opening == .direct) {
                     const ready = try fixture.endpoint.getNextEvent();
@@ -462,7 +460,7 @@ test "local rekey waits for OPEN-overlapped packet authentication and delivery" 
         try std.testing.expectEqual(.OpenSent, fixture.endpoint.session.channel_table.findByLocalId(opened).?.state);
         _ = try fixture.drain(Protocol.MaxSSHPacket);
         var kex = try fixture.readOutput();
-        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT), try kex.readU8());
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT), try kex.readU8());
         try std.testing.expectEqual(@as(u64, 5), fixture.inKeys().encrypted_packets);
     }
 }
@@ -501,11 +499,11 @@ test "peer rekey received during OPEN retains serialized KEX write continuations
 
         var payload: [2048]u8 = undefined;
         var writer = BufferWriter.init(&payload, 0);
-        try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
-        try writer.writeBytes(&(.{0} ** 16));
+        try writer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
+        try writer.writeBytes(&@as([16]u8, @splat(0)));
         const offers = Protocol.localAlgorithmOffers(@import("key.zig").client_hostkey_algorithms);
-        inline for (std.meta.fields(Protocol.AlgorithmOffers)) |field| {
-            try writer.writeU32LenString(@field(offers, field.name));
+        inline for (@typeInfo(Protocol.AlgorithmOffers).@"struct".field_names) |name| {
+            try writer.writeU32LenString(@field(offers, name));
         }
         try writer.writeU32LenString("");
         try writer.writeU32LenString("");
@@ -519,11 +517,11 @@ test "peer rekey received during OPEN retains serialized KEX write continuations
         try std.testing.expectEqual(@as(u64, 5), fixture.inKeys().encrypted_packets);
         _ = try fixture.drain(Protocol.MaxSSHPacket);
         var response = try fixture.readOutput();
-        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT), try response.readU8());
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT), try response.readU8());
         if (opening == .session or opening == .direct) {
             _ = try fixture.drain(Protocol.MaxSSHPacket);
             response = try fixture.readOutput();
-            try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT), try response.readU8());
+            try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT), try response.readU8());
         }
         try std.testing.expect(!try fixture.takeData(""));
         try std.testing.expectEqual(@as(u64, 5), fixture.inKeys().encrypted_packets);

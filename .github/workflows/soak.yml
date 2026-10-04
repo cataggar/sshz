@@ -52,12 +52,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="0.16.0"
+          version="0.17.0"
           archive="zig-x86_64-linux-${version}.tar.xz"
-          archive_sha256="70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00"
+          archive_sha256="1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026"
           archive_path="${RUNNER_TEMP}/${archive}"
           zig_dir="${RUNNER_TEMP}/zig-x86_64-linux-${version}"
-          curl -fsSL "https://github.com/ctaggart/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
+          curl -fsSL "https://github.com/cataggar/zig/releases/download/v${version}/${archive}" -o "${archive_path}"
           actual_sha256="$(python - "${archive_path}" <<'PY'
           import hashlib
           import sys
@@ -86,7 +86,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/sshz-soak-safe"
-          zig build soak -Doptimize=ReleaseSafe -- \
+          zig build soak -Doptimize=safe -- \
             --duration-seconds 1200 --seed 1751547392 --peer "${{ matrix.peer }}" \
             2>&1 | tee "${RUNNER_TEMP}/sshz-soak-safe/soak.log"
       - &upload-safe
@@ -123,7 +123,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/sshz-soak-safe"
-          zig build soak -Doptimize=ReleaseSafe -- \
+          zig build soak -Doptimize=safe -- \
             --duration-seconds 1200 --seed 1751547392 --peer "${{ matrix.peer }}" \
             2>&1 | tee "${RUNNER_TEMP}/sshz-soak-safe/soak.log"
       - *upload-safe
@@ -150,7 +150,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "${RUNNER_TEMP}/sshz-soak-safe"
-          zig build soak -Doptimize=ReleaseSafe -- \
+          zig build soak -Doptimize=safe -- \
             --duration-seconds "${{ inputs.duration_seconds }}" \
             --seed "${{ inputs.seed }}" \
             --peer "${{ matrix.peer }}" \

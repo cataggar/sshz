@@ -88,11 +88,11 @@ pub const Session = struct {
     // Owned only while an ECDH exchange is in progress.
     ecdh_ephem_keypair: Protocol.kex_algo.KeyPair = std.mem.zeroes(Protocol.kex_algo.KeyPair),
     ecdh_ephem_keypair_active: bool,
-    shared_secret_k: [Protocol.kex_algo.shared_length]u8 = .{0} ** Protocol.kex_algo.shared_length, // K
+    shared_secret_k: [Protocol.kex_algo.shared_length]u8 = @splat(0), // K
     kex_hasher: Hasher(Protocol.hash_algo) = undefined, // for building H
     kex_hash_order: Protocol.KexHashOrder = .Init,
     selected_hostkey_algorithm: ?Key.SignatureAlgorithm,
-    session_id: [Protocol.hash_algo.digest_length]u8 = .{0} ** Protocol.hash_algo.digest_length,
+    session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0),
     session_id_established: bool = false,
     user_authenticated: bool = false,
     keydata: Protocol.KeyDataBi,
@@ -103,7 +103,7 @@ pub const Session = struct {
     active_channel_id: ?u32,
     channel_events_enabled: bool = false,
     auto_channel_read_credit_enabled: bool = true,
-    exit_submissions: [MaxChannels]?ExitSubmission = .{null} ** MaxChannels,
+    exit_submissions: [MaxChannels]?ExitSubmission = @splat(null),
     exit_write_in_flight: ?u32 = null,
     exit_observation_ended: bool = false,
     pending_global_request: ?PendingGlobalRequest,
@@ -123,7 +123,7 @@ pub const Session = struct {
     auth_pubkey_attempted: Key.Blob,
     auth_pubkey_algorithm: ?Key.SignatureAlgorithm,
     pending_authorization: ?PendingAuthorizationKind,
-    q_c: [Protocol.kex_algo.public_length]u8 = .{0} ** Protocol.kex_algo.public_length,
+    q_c: [Protocol.kex_algo.public_length]u8 = @splat(0),
 
     host_private_key: Key.PrivateKey,
     host_private_key_active: bool,
@@ -453,7 +453,7 @@ pub const Session = struct {
             },
             .KexInitWrite => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
                 var cookie: [16]u8 = undefined;
                 self.rand.bytes(&cookie);
                 try pkt.writeBytes(&cookie);
@@ -494,7 +494,7 @@ pub const Session = struct {
                 errdefer self.clearKexState();
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
 
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
 
                 var hostkey_blob_buf: Key.Blob = .{};
                 const hostkey_blob = try self.host_private_key.publicBlob(&hostkey_blob_buf);
@@ -511,7 +511,7 @@ pub const Session = struct {
                 defer std.crypto.secureZero(u8, &seed);
                 self.rand.bytes(&seed);
                 self.clearEphemeralKeyPair();
-                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generateDeterministic(seed) catch unreachable;
+                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generateDeterministic(seed);
                 self.ecdh_ephem_keypair_active = true;
                 try pkt.writeU32LenString(&self.ecdh_ephem_keypair.public_key);
                 UNSAFE_TRACEDUMP(.Debug, "qs", .{}, &self.ecdh_ephem_keypair.public_key);
@@ -556,7 +556,7 @@ pub const Session = struct {
             .NewKeysWrite => {
                 // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_NEWKEYS));
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr);
                 try sshz.requestWrite(wrapped, .Idle);
                 try self.activatePendingS2cKeys(sshz);
@@ -570,7 +570,7 @@ pub const Session = struct {
             },
             .AuthRspServReqSuccess => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_SERVICE_ACCEPT));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_SERVICE_ACCEPT));
                 try pkt.writeU32LenString("ssh-userauth");
                 self.setSessionState(.AuthRead);
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
@@ -580,7 +580,7 @@ pub const Session = struct {
             },
             .UserAuthDenied => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE));
                 try pkt.writeU32LenString(supported_auth_methods);
                 try pkt.writeBoolean(false); // partial success
                 self.setSessionState(.AuthRead);
@@ -588,7 +588,7 @@ pub const Session = struct {
             },
             .UserAuthAccepted => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS));
                 const wrapped = try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr);
                 try self.activateDelayedCompression();
                 self.user_authenticated = true;
@@ -597,7 +597,7 @@ pub const Session = struct {
             },
             .AuthPkAllowed => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK));
                 const auth_alg = self.auth_pubkey_algorithm orelse return IoError.UnexpectedResponse;
                 try pkt.writeU32LenString(auth_alg.name());
                 try pkt.writeU32LenString(self.auth_pubkey_attempted.slice());
@@ -656,7 +656,7 @@ pub const Session = struct {
         switch (chan.state) {
             .OpenWrite => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
                 try pkt.writeU32LenString(chan.channel_type.name());
                 try pkt.writeU32(chan.local_id);
                 try pkt.writeU32(self.limits.initial_channel_window);
@@ -673,7 +673,7 @@ pub const Session = struct {
             },
             .ConfirmWrite => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
                 try pkt.writeU32(chan.remote_id);
                 try pkt.writeU32(chan.local_id);
                 try pkt.writeU32(self.limits.initial_channel_window);
@@ -683,7 +683,7 @@ pub const Session = struct {
             },
             .OpenFailureWrite => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
                 try pkt.writeU32(chan.remote_id);
                 try pkt.writeU32(chan.open_failure_reason_code);
                 try pkt.writeU32LenString(chan.open_failure_description);
@@ -694,14 +694,14 @@ pub const Session = struct {
             },
             .RspWrite => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS));
                 try pkt.writeU32(chan.remote_id);
                 chan.state = .Data;
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
             },
             .RspFailureWrite => {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE));
                 try pkt.writeU32(chan.remote_id);
                 chan.state = .Data;
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
@@ -758,7 +758,7 @@ pub const Session = struct {
             .Open => {
                 if (chan.kind == .AgentForward) {
                     var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-                    try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+                    try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
                     try pkt.writeU32LenString(Protocol.channel_type_auth_agent_openssh);
                     try pkt.writeU32(chan.local_id);
                     try pkt.writeU32(self.limits.initial_channel_window);
@@ -899,7 +899,7 @@ pub const Session = struct {
         const send_len = @min(max_send, chan.peer_window);
         if (send_len == 0) return false;
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@intFromEnum(if (chan.write_data_type != null)
+        try pkt.writeU8(@backingInt(if (chan.write_data_type != null)
             Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA
         else
             Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
@@ -988,7 +988,7 @@ pub const Session = struct {
             return false;
 
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@intFromEnum(switch (control) {
+        try pkt.writeU8(@backingInt(switch (control) {
             .Eof => Protocol.MsgId.SSH_MSG_CHANNEL_EOF,
             .Close => Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE,
         }));
@@ -1042,7 +1042,7 @@ pub const Session = struct {
             !chan.needsWindowAdjust()) return false;
         const adjust = chan.windowAdjustAmount();
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
+        try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
         try pkt.writeU32(chan.remote_id);
         try pkt.writeU32(adjust);
         try sshz.requestWrite(
@@ -1159,7 +1159,7 @@ pub const Session = struct {
         } else return IoError.ResourceLimitExceeded;
         var submission: ExitSubmission = .{ .status = .{ .channel = channel_id, .transmission = .Queued } };
         var pkt = BufferWriter.init(&submission.payload, 0);
-        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+        try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
         try pkt.writeU32(chan.remote_id);
         switch (result) {
             .Status => |status| {
@@ -1282,7 +1282,7 @@ pub const Session = struct {
         description: []const u8,
     ) SshzError!void {
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+        try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
         try pkt.writeU32(recipient);
         try pkt.writeU32(reason_code);
         try pkt.writeU32LenString(description);
@@ -1299,7 +1299,7 @@ pub const Session = struct {
         if (sshz.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
 
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS));
+        try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS));
         if (include_bound_port) {
             try pkt.writeU32(bound_port);
         }
@@ -1310,7 +1310,7 @@ pub const Session = struct {
         if (sshz.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
 
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE));
+        try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE));
         try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.s2c, &pkt, &sshz.iobuf_wr), .ReadPktHdr);
     }
 
@@ -1593,9 +1593,9 @@ pub const Session = struct {
         }
 
         switch (msgid) {
-            @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_KEXINIT) => {
                 errdefer self.clearKexState();
-                TRACE(.Debug, "{any}", .{@as(Protocol.MsgId, @enumFromInt(msgid))});
+                TRACE(.Debug, "{any}", .{@as(Protocol.MsgId, @fromBackingInt(@intCast(msgid)))});
 
                 // A peer-initiated re-key is only meaningful once the first key
                 // exchange has completed. Without this, a KEXINIT arriving
@@ -1643,7 +1643,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT) => {
                 if (self.sessionState == .EcdhInitRead) {
                     errdefer self.clearKexState();
                     const q_c = try rdr.readU32LenString();
@@ -1660,7 +1660,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_NEWKEYS) => {
                 if (self.sessionState == .NewKeysRead) {
                     try self.activatePendingC2sKeys(sshz);
                     if (self.is_rekeying) {
@@ -1677,7 +1677,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse;
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_SERVICE_REQUEST) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_SERVICE_REQUEST) => {
                 if (self.sessionState == .AuthRead) {
                     const svcname = try rdr.readU32LenString();
                     if (std.mem.eql(u8, svcname, "ssh-userauth")) {
@@ -1690,7 +1690,7 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => {
                 if (self.sessionState == .AuthRead) {
                     self.clearAuthAttempt();
                     self.pending_authorization = null;
@@ -1765,7 +1765,7 @@ pub const Session = struct {
                             defer std.crypto.secureZero(u8, &backing_sigbuffer_buf);
                             var sigbuffer = BufferWriter.init(&backing_sigbuffer_buf, 0);
                             try sigbuffer.writeU32LenString(&self.session_id);
-                            try sigbuffer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+                            try sigbuffer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
                             try sigbuffer.writeU32LenString(username);
                             try sigbuffer.writeU32LenString("ssh-connection");
                             try sigbuffer.writeU32LenString("publickey");
@@ -1808,19 +1808,19 @@ pub const Session = struct {
                     return IoError.UnexpectedResponse; // why is client asking now?
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST) => {
                 try self.handleGlobalRequestPacket(&rdr, sshz);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN) => {
                 try self.handleChannelOpenPacket(&rdr, sshz);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION) => {
                 try self.handleChannelOpenConfirmationPacket(&rdr, sshz);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE) => {
                 try self.handleChannelOpenFailurePacket(&rdr, sshz);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST) => {
                 // https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
                 const recipient = try rdr.readU32();
                 const chan = self.channel_table.findByLocalId(recipient) orelse {
@@ -1923,7 +1923,7 @@ pub const Session = struct {
                     self.setIoSessionState(.Idle);
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA) => {
                 const channelnum = try rdr.readU32();
                 const chan = self.channel_table.findByLocalId(channelnum) orelse {
                     self.setIoSessionState(.ReadPktHdr);
@@ -1946,7 +1946,7 @@ pub const Session = struct {
                 self.active_channel_id = chan.local_id;
                 self.resumeChannelActive();
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
                 const channelnum = try rdr.readU32();
                 const chan = self.channel_table.findByLocalId(channelnum) orelse {
                     self.setIoSessionState(.ReadPktHdr);
@@ -1969,7 +1969,7 @@ pub const Session = struct {
                 self.active_channel_id = chan.local_id;
                 self.resumeChannelActive();
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_DISCONNECT) => {
                 // RFC 4253 §11.1
                 const reason_code = try rdr.readU32();
                 const description = try rdr.readU32LenString();
@@ -1980,7 +1980,7 @@ pub const Session = struct {
                     .description = description,
                 } } }, .Idle);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EOF) => {
                 const channelnum = try rdr.readU32();
                 if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 if (self.channel_table.findByLocalId(channelnum)) |chan| {
@@ -2004,7 +2004,7 @@ pub const Session = struct {
                 }
                 self.setIoSessionState(.ReadPktHdr);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE) => {
                 const channelnum = try rdr.readU32();
                 const chan = self.channel_table.findByLocalId(channelnum) orelse {
                     self.setIoSessionState(.ReadPktHdr);
@@ -2038,11 +2038,11 @@ pub const Session = struct {
                     self.setIoSessionState(.Idle);
                 }
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_IGNORE) => {
                 // RFC 4253 §11.2 - must be silently ignored
                 self.setIoSessionState(.ReadPktHdr);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_DEBUG) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_DEBUG) => {
                 // RFC 4253 §11.3 - may be logged, must not cause protocol failure
                 const always_display = try rdr.readBoolean();
                 const message = try rdr.readU32LenString();
@@ -2054,7 +2054,7 @@ pub const Session = struct {
                 }
                 self.setIoSessionState(.ReadPktHdr);
             },
-            @intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
                 // RFC 4254 §5.2 - peer is granting more window
                 const channelnum = try rdr.readU32();
                 if (self.channel_table.findByLocalId(channelnum)) |chan| {
@@ -2084,7 +2084,7 @@ pub const Session = struct {
 fn writeServerChannelPacket(m: *SshzServer, channel: u32, data: []const u8) !void {
     var payload_backing: [64]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
     try payload.writeU32(channel);
     try payload.writeU32LenString(data);
 
@@ -2139,7 +2139,7 @@ test "server window adjustment completion preserves concurrently received packet
     const adjust_len = m.wr_nbytes;
     try std.testing.expect(adjust_len > 1);
     var adjust = BufferReader.init(unencryptedPayload(try m.peek(adjust_len)));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST), try adjust.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST), try adjust.readU8());
     try std.testing.expectEqual(chan.remote_id, try adjust.readU32());
     try std.testing.expectEqual(@as(u32, 8), try adjust.readU32());
     try m.consumed(1);
@@ -2196,7 +2196,7 @@ fn decryptFirstBlockForTest(packet: []u8, keys: *Protocol.KeyDataUni) !void {
 fn consumeProducedChannelDataForTest(m: *SshzServer, destination: []u8, offset: usize) !usize {
     const packet = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(packet));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA), try rdr.readU8());
     _ = try rdr.readU32();
     const data = try rdr.readU32LenString();
     @memcpy(destination[offset .. offset + data.len], data);
@@ -2219,8 +2219,8 @@ fn writeKexInitPayloadWithGuessForTest(
     host_key_algorithms: []const u8,
     first_kex_packet_follows: bool,
 ) !void {
-    try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
-    const cookie: [16]u8 = .{0x5a} ** 16;
+    try writer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
+    const cookie: [16]u8 = @splat(0x5a);
     try writer.writeBytes(&cookie);
     try writer.writeU32LenString(kex_algorithms);
     try writer.writeU32LenString(host_key_algorithms);
@@ -2257,7 +2257,7 @@ test "server ignores exactly one packet after an incorrect KEX guess" {
 
     const guessed_packet_len = buildUnencryptedPacket(
         &m.iobuf_rd,
-        &.{@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT)},
+        &.{@backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT)},
     );
     m.session.setSessionState(.EcdhInitRead);
     try m.session.handlePacket(m.iobuf_rd[0..guessed_packet_len], &m);
@@ -2281,7 +2281,7 @@ fn writeUserAuthPrefixForTest(
     username: []const u8,
     method: []const u8,
 ) !void {
-    try writer.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try writer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
     try writer.writeU32LenString(username);
     try writer.writeU32LenString("ssh-connection");
     try writer.writeU32LenString(method);
@@ -2291,7 +2291,7 @@ fn expectAuthFailurePayloadForTest(m: *SshzServer) !void {
     const packet = try m.peek(Protocol.MaxSSHPacket);
     var reader = BufferReader.init(unencryptedPayload(packet));
     try std.testing.expectEqual(
-        @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE),
+        @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE),
         try reader.readU8(),
     );
     try std.testing.expectEqualStrings(supported_auth_methods, try reader.readU32LenString());
@@ -2303,7 +2303,7 @@ fn expectAuthFailurePayloadForTest(m: *SshzServer) !void {
 fn expectUnauthenticatedChannelOpenRejectedForTest(m: *SshzServer) !void {
     var payload_buffer: [128]u8 = undefined;
     var payload = BufferWriter.init(&payload_buffer, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
     try payload.writeU32LenString("session");
     try payload.writeU32(7);
     try payload.writeU32(1024);
@@ -2566,7 +2566,7 @@ test "server public-key probe and denial state machine preserves RFC shapes" {
     const probe_packet = try probe.peek(Protocol.MaxSSHPacket);
     var probe_reader = BufferReader.init(unencryptedPayload(probe_packet));
     try std.testing.expectEqual(
-        @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK),
+        @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK),
         try probe_reader.readU8(),
     );
     try std.testing.expectEqualStrings("ssh-ed25519", try probe_reader.readU32LenString());
@@ -2632,7 +2632,7 @@ test "server public-key probe and denial state machine preserves RFC shapes" {
         var typed_signature_buffer: [128]u8 = undefined;
         var typed_signature = BufferWriter.init(&typed_signature_buffer, 0);
         try typed_signature.writeU32LenString("ssh-ed25519");
-        try typed_signature.writeU32LenString(&(.{0} ** 64));
+        try typed_signature.writeU32LenString(&@as([64]u8, @splat(0)));
 
         var payload_buffer: [512]u8 = undefined;
         var payload = BufferWriter.init(&payload_buffer, 0);
@@ -2682,7 +2682,7 @@ test "server public-key probe and denial state machine preserves RFC shapes" {
         );
         defer m.deinit();
 
-        m.session.session_id = .{0x5a} ** Protocol.hash_algo.digest_length;
+        m.session.session_id = @splat(0x5a);
         var key_storage: Key.Blob = .{};
         const key = try m.session.host_private_key.publicBlob(&key_storage);
 
@@ -2762,9 +2762,9 @@ test "server rekey preserves initial session id for key derivation" {
     var session = try Session.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
     defer session.deinit();
 
-    const original_session_id: [Protocol.hash_algo.digest_length]u8 = .{0x11} ** Protocol.hash_algo.digest_length;
-    const rekey_hash: [Protocol.hash_algo.digest_length]u8 = .{0x33} ** Protocol.hash_algo.digest_length;
-    const rekey_secret: [Protocol.kex_algo.shared_length]u8 = .{0x22} ** Protocol.kex_algo.shared_length;
+    const original_session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0x11);
+    const rekey_hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x33);
+    const rekey_secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x22);
     session.session_id = original_session_id;
     session.shared_secret_k = rekey_secret;
     session.is_rekeying = true;
@@ -2816,7 +2816,7 @@ test "simultaneous server local and client rekey preserves exact local KEXINIT" 
     var local_payload_copy: [512]u8 = undefined;
     @memcpy(local_payload_copy[0..local_payload.len], local_payload);
     const local_payload_len = local_payload.len;
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT), local_payload[0]);
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT), local_payload[0]);
     try std.testing.expectEqualStrings(local_payload, m.session.pending_server_kexinit.?);
     try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
     try m.consumed(local_packet.len);
@@ -2849,11 +2849,11 @@ test "server rekey activates outbound and inbound keys at NEWKEYS boundaries" {
     var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
     defer m.deinit();
 
-    const session_id: [Protocol.hash_algo.digest_length]u8 = .{0x10} ** Protocol.hash_algo.digest_length;
-    const old_hash: [Protocol.hash_algo.digest_length]u8 = .{0x20} ** Protocol.hash_algo.digest_length;
-    const old_secret: [Protocol.kex_algo.shared_length]u8 = .{0x30} ** Protocol.kex_algo.shared_length;
-    const new_hash: [Protocol.hash_algo.digest_length]u8 = .{0x40} ** Protocol.hash_algo.digest_length;
-    const new_secret: [Protocol.kex_algo.shared_length]u8 = .{0x50} ** Protocol.kex_algo.shared_length;
+    const session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0x10);
+    const old_hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x20);
+    const old_secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x30);
+    const new_hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x40);
+    const new_secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x50);
     m.session.session_id = session_id;
     try m.session.keydata.genKeys(old_hash, old_secret, session_id);
     m.session.keydata.c2s.epoch = 3;
@@ -2904,11 +2904,11 @@ test "server rekey activates outbound and inbound keys at NEWKEYS boundaries" {
         verifier.iobuf_rd[0..server_newkeys.len],
         &verifier.session.keydata.s2c,
     );
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS), try server_rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_NEWKEYS), try server_rdr.readU8());
 
     var client_packet_buf: [Protocol.MaxSSHPacket]u8 = undefined;
     var client_packet = BufferWriter.init(&client_packet_buf, Protocol.sizeof_PktHdr);
-    try client_packet.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS));
+    try client_packet.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_NEWKEYS));
     var client_prng = std.Random.DefaultPrng.init(99);
     var client_rand = client_prng.random();
     const wrapped_client_newkeys = try Protocol.wrapPkt(
@@ -2966,17 +2966,17 @@ test "server rekey gates deferred channel traffic until NEWKEYS completes" {
 
     const server_kexinit = try m.peek(Protocol.MaxSSHPacket);
     try std.testing.expectEqual(
-        @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT),
+        @backingInt(Protocol.MsgId.SSH_MSG_KEXINIT),
         unencryptedPayload(server_kexinit)[0],
     );
     try m.consumed(server_kexinit.len);
 
     m.iostate_rd = .Idle;
-    m.session.session_id = .{0x11} ** Protocol.hash_algo.digest_length;
-    m.session.shared_secret_k = .{0x22} ** Protocol.kex_algo.shared_length;
+    m.session.session_id = @splat(0x11);
+    m.session.shared_secret_k = @splat(0x22);
     m.session.negotiated_compression_c2s = .None;
     m.session.negotiated_compression_s2c = .None;
-    try m.session.installExchangeKeys(.{0x33} ** Protocol.hash_algo.digest_length);
+    try m.session.installExchangeKeys(@splat(0x33));
     const new_s2c_key = m.session.pending_s2c_keys.?.key;
     m.session.setSessionState(.NewKeysWrite);
     m.session.setIoSessionState(.Idle);
@@ -2984,7 +2984,7 @@ test "server rekey gates deferred channel traffic until NEWKEYS completes" {
 
     const newkeys = try m.peek(Protocol.MaxSSHPacket);
     try std.testing.expectEqual(
-        @intFromEnum(Protocol.MsgId.SSH_MSG_NEWKEYS),
+        @backingInt(Protocol.MsgId.SSH_MSG_NEWKEYS),
         unencryptedPayload(newkeys)[0],
     );
     try std.testing.expectEqual(@as(usize, 1000), channel_a.write_buf_nbytes);
@@ -3052,7 +3052,7 @@ test "server channel write retains suffix across peer packet limit" {
 
     const eof_packet = try m.peek(Protocol.MaxSSHPacket);
     var eof_reader = BufferReader.init(unencryptedPayload(eof_packet));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
     try std.testing.expect(!(try m.channelEofFlushed(chan.local_id)));
     try m.consumed(eof_packet.len);
     try std.testing.expect(try m.channelEofFlushed(chan.local_id));
@@ -3083,7 +3083,7 @@ test "server local close discards window-blocked suffix after in-flight fragment
 
     const close_packet = try m.peek(Protocol.MaxSSHPacket);
     var close_reader = BufferReader.init(unencryptedPayload(close_packet));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
     try std.testing.expectEqual(chan.remote_id, try close_reader.readU32());
     try std.testing.expectEqual(@as(usize, 0), chan.write_buf_nbytes);
     try std.testing.expectEqual(@as(usize, 0), chan.tx_in_flight_len);
@@ -3117,7 +3117,7 @@ test "server completion schedules pending control on another channel" {
 
     const close_packet = try m.peek(Protocol.MaxSSHPacket);
     var close_reader = BufferReader.init(unencryptedPayload(close_packet));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
     try std.testing.expectEqual(channel_b.remote_id, try close_reader.readU32());
 }
 
@@ -3143,14 +3143,14 @@ test "server close completion dispatches next channel control during active read
 
     const first_close = try m.peek(Protocol.MaxSSHPacket);
     var close_reader = BufferReader.init(unencryptedPayload(first_close));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
     try m.consumed(first_close.len);
 
     try std.testing.expectEqual(Protocol.IoSessionState.ReadPktHdr, m.session.ioSessionState);
     try std.testing.expect(m.iostate_rd != .Idle);
     const second_eof = try m.peek(Protocol.MaxSSHPacket);
     var eof_reader = BufferReader.init(unencryptedPayload(second_eof));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
     try std.testing.expectEqual(second.remote_id, try eof_reader.readU32());
 }
 
@@ -3210,7 +3210,7 @@ test "server rejects channel data above packet and receive window limits" {
     packet_server.session.user_authenticated = true;
     var payload_backing: [64]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
     try payload.writeU32(packet_chan.local_id);
     try payload.writeU32LenString("12345");
     const packet_len = buildUnencryptedPacket(&packet_server.iobuf_rd, payload.active());
@@ -3232,7 +3232,7 @@ test "server rejects channel data above packet and receive window limits" {
     window_server.session.user_authenticated = true;
     window_chan.local_window = 3;
     payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
     try payload.writeU32(window_chan.local_id);
     try payload.writeU32LenString("1234");
     const window_len = buildUnencryptedPacket(&window_server.iobuf_rd, payload.active());
@@ -3264,7 +3264,7 @@ test "handlePacket: channel data is accepted while a rekey is in flight" {
 
     var payload_backing: [64]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
     try payload.writeU32(chan.local_id);
     try payload.writeU32LenString("hello");
 
@@ -3296,7 +3296,7 @@ fn deliverServerChannelControlForTest(
     channel_id: u32,
 ) !void {
     var payload: [5]u8 = undefined;
-    payload[0] = @intFromEnum(message);
+    payload[0] = @backingInt(message);
     std.mem.writeInt(u32, payload[1..5], channel_id, .big);
     const packet_len = buildUnencryptedPacket(&m.iobuf_rd, &payload);
     m.iostate_rd = .Idle;
@@ -3310,7 +3310,7 @@ fn deliverServerChannelOpenConfirmationForTest(
 ) !void {
     var payload_backing: [32]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
     try payload.writeU32(recipient);
     try payload.writeU32(sender);
     try payload.writeU32(32768);
@@ -3327,7 +3327,7 @@ fn deliverServerChannelDataForTest(
 ) !void {
     var payload_backing: [128]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
     try payload.writeU32(channel_id);
     try payload.writeU32LenString(data);
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
@@ -3342,7 +3342,7 @@ fn deliverServerChannelExtendedDataForTest(
 ) !void {
     var payload_backing: [128]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA));
     try payload.writeU32(channel_id);
     try payload.writeU32(1);
     try payload.writeU32LenString(data);
@@ -3358,7 +3358,7 @@ fn deliverServerWindowAdjustForTest(
 ) !void {
     var payload_backing: [16]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST));
     try payload.writeU32(channel_id);
     try payload.writeU32(bytes_to_add);
     const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, payload.active());
@@ -3375,7 +3375,7 @@ fn deliverServerChannelRequestForTest(
 ) !void {
     var payload_backing: [512]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
     try payload.writeU32(channel_id);
     try payload.writeU32LenString(request_name);
     try payload.writeBoolean(want_reply);
@@ -3391,7 +3391,7 @@ fn requestServerDirectTcpipOpenForTest(
 ) !u32 {
     var payload_backing: [160]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
     try payload.writeU32LenString("direct-tcpip");
     try payload.writeU32(remote_id);
     try payload.writeU32(32768);
@@ -3441,7 +3441,7 @@ test "handlePacket: direct-tcpip open emits request and accept confirms" {
 
     var payload_backing: [160]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
     try pw.writeU32LenString("direct-tcpip");
     try pw.writeU32(77); // sender channel
     try pw.writeU32(32768); // initial window size
@@ -3482,7 +3482,7 @@ test "handlePacket: direct-tcpip open emits request and accept confirms" {
     try m.acceptChannelOpen(channel_id);
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), try rdr.readU8());
     try std.testing.expectEqual(@as(u32, 77), try rdr.readU32());
     try std.testing.expectEqual(channel_id, try rdr.readU32());
 }
@@ -3497,7 +3497,7 @@ test "handlePacket: session open requires an application decision" {
 
     var payload_backing: [96]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
     try pw.writeU32LenString("session");
     try pw.writeU32(78);
     try pw.writeU32(32768);
@@ -3531,7 +3531,7 @@ test "handlePacket: session open requires an application decision" {
     try m.acceptChannelOpen(channel_id);
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION), try rdr.readU8());
     try std.testing.expectEqual(@as(u32, 78), try rdr.readU32());
     try std.testing.expectEqual(channel_id, try rdr.readU32());
 }
@@ -3546,7 +3546,7 @@ test "rejectChannelOpen writes caller-provided failure" {
 
     var payload_backing: [160]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
     try pw.writeU32LenString("direct-tcpip");
     try pw.writeU32(88); // sender channel
     try pw.writeU32(32768);
@@ -3575,7 +3575,7 @@ test "rejectChannelOpen writes caller-provided failure" {
 
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
     try std.testing.expectEqual(@as(u32, 88), try rdr.readU32());
     try std.testing.expectEqual(SshOpenFailureReason.ConnectFailed, try rdr.readU32());
     try std.testing.expectEqualStrings("connect failed", try rdr.readU32LenString());
@@ -3679,7 +3679,7 @@ test "server pending inbound decision idles and defers acceptance or rejection d
             const packet = try m.peek(Protocol.MaxSSHPacket);
             var reader = BufferReader.init(unencryptedPayload(packet));
             const expected: Protocol.MsgId = if (accept) .SSH_MSG_CHANNEL_OPEN_CONFIRMATION else .SSH_MSG_CHANNEL_OPEN_FAILURE;
-            try std.testing.expectEqual(@intFromEnum(expected), try reader.readU8());
+            try std.testing.expectEqual(@backingInt(expected), try reader.readU8());
             try std.testing.expectEqual(@as(u32, 88), try reader.readU32());
             if (accept) {
                 try std.testing.expectEqual(channel_id, try reader.readU32());
@@ -3730,7 +3730,7 @@ test "server accept and reject cannot decide an outbound agent Open channel" {
         try std.testing.expect(!chan.remote_id_known);
         const packet = try m.peek(Protocol.MaxSSHPacket);
         var reader = BufferReader.init(unencryptedPayload(packet));
-        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try reader.readU8());
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try reader.readU8());
         try std.testing.expectEqualStrings(Protocol.channel_type_auth_agent_openssh, try reader.readU32LenString());
         try std.testing.expectEqual(channel_id, try reader.readU32());
     }
@@ -3759,7 +3759,7 @@ test "server rejected inbound open during rekey rejects confirmation" {
     try m.advance();
     const failure = try m.peek(Protocol.MaxSSHPacket);
     var reader = BufferReader.init(unencryptedPayload(failure));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try reader.readU8());
     try std.testing.expectEqual(remote_id, try reader.readU32());
     try std.testing.expectEqual(SshOpenFailureReason.AdministrativelyProhibited, try reader.readU32());
     try std.testing.expect(m.session.channel_table.findByLocalId(channel_id) == null);
@@ -3928,7 +3928,7 @@ test "handlePacket: unknown channel type writes open failure" {
 
     var payload_backing: [64]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
     try pw.writeU32LenString("x11");
     try pw.writeU32(99); // sender channel
     try pw.writeU32(32768);
@@ -3940,7 +3940,7 @@ test "handlePacket: unknown channel type writes open failure" {
 
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
     try std.testing.expectEqual(@as(u32, 99), try rdr.readU32());
     try std.testing.expectEqual(SshOpenFailureReason.UnknownChannelType, try rdr.readU32());
     try std.testing.expectEqualStrings("unknown channel type", try rdr.readU32LenString());
@@ -3957,7 +3957,7 @@ test "handlePacket: global requests are rejected before authentication" {
 
     var payload_backing: [96]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
     try pw.writeU32LenString("tcpip-forward");
     try pw.writeBoolean(true);
     try pw.writeU32LenString("127.0.0.1");
@@ -4009,7 +4009,7 @@ test "handlePacket: tcpip-forward emits event and accept writes allocated port" 
 
     var payload_backing: [96]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
     try pw.writeU32LenString("tcpip-forward");
     try pw.writeBoolean(true);
     try pw.writeU32LenString("127.0.0.1");
@@ -4036,7 +4036,7 @@ test "handlePacket: tcpip-forward emits event and accept writes allocated port" 
     try m.acceptTcpipForward(2222);
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS), try rdr.readU8());
     try std.testing.expectEqual(@as(u32, 2222), try rdr.readU32());
 }
 
@@ -4048,7 +4048,7 @@ test "handlePacket: cancel-tcpip-forward emits event and reject writes failure" 
 
     var payload_backing: [96]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
     try pw.writeU32LenString("cancel-tcpip-forward");
     try pw.writeBoolean(true);
     try pw.writeU32LenString("127.0.0.1");
@@ -4074,7 +4074,7 @@ test "handlePacket: cancel-tcpip-forward emits event and reject writes failure" 
     try m.rejectCancelTcpipForward();
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
 }
 
 test "handlePacket: unknown global request with reply writes failure" {
@@ -4085,7 +4085,7 @@ test "handlePacket: unknown global request with reply writes failure" {
 
     var payload_backing: [64]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
     try pw.writeU32LenString("unknown-request");
     try pw.writeBoolean(true);
 
@@ -4096,7 +4096,7 @@ test "handlePacket: unknown global request with reply writes failure" {
 
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
 }
 
 test "openForwardedTcpipChannel writes forwarded-tcpip open payload" {
@@ -4115,7 +4115,7 @@ test "openForwardedTcpipChannel writes forwarded-tcpip open payload" {
 
     const data = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(data));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try rdr.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try rdr.readU8());
     try std.testing.expectEqualStrings("forwarded-tcpip", try rdr.readU32LenString());
     try std.testing.expectEqual(channel_id, try rdr.readU32());
     try std.testing.expectEqual(Sshz.default_channel_window, try rdr.readU32());
@@ -4145,14 +4145,14 @@ test "unconfirmed server channel defers close until remote id is known" {
 
     const open_packet = try m.peek(Protocol.MaxSSHPacket);
     var open_reader = BufferReader.init(unencryptedPayload(open_packet));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try open_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN), try open_reader.readU8());
     try m.consumed(open_packet.len);
     try std.testing.expect(!pending.remote_id_known);
     try std.testing.expect(pending.control_in_flight == null);
 
     var confirmation_payload_buf: [32]u8 = undefined;
     var confirmation = BufferWriter.init(&confirmation_payload_buf, 0);
-    try confirmation.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try confirmation.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
     try confirmation.writeU32(channel_id);
     try confirmation.writeU32(88);
     try confirmation.writeU32(1000);
@@ -4172,7 +4172,7 @@ test "unconfirmed server channel defers close until remote id is known" {
 
     const close_packet = try m.peek(Protocol.MaxSSHPacket);
     var close_reader = BufferReader.init(unencryptedPayload(close_packet));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try close_reader.readU8());
     try std.testing.expectEqual(@as(u32, 88), try close_reader.readU32());
     try std.testing.expect(pending.remote_id_known);
 }
@@ -4188,7 +4188,7 @@ test "handlePacket: auth-agent request surfaces channel request event" {
 
     var payload_backing: [128]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
     try pw.writeU32(chan.local_id);
     try pw.writeU32LenString(Protocol.channel_request_auth_agent);
     try pw.writeBoolean(false);
@@ -4244,7 +4244,7 @@ test "handlePacket: session requests on non-session channels fail before events"
 
         var payload_backing: [192]u8 = undefined;
         var pw = BufferWriter.init(&payload_backing, 0);
-        try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+        try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
         try pw.writeU32(chan.local_id);
         try pw.writeU32LenString(request_name);
         try pw.writeBoolean(true);
@@ -4278,7 +4278,7 @@ test "handlePacket: session requests on non-session channels fail before events"
 
         const packet = try m.peek(Protocol.MaxSSHPacket);
         var rdr = BufferReader.init(unencryptedPayload(packet));
-        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try rdr.readU8());
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try rdr.readU8());
         try std.testing.expectEqual(@as(u32, 100), try rdr.readU32());
         try std.testing.expectEqual(rdr.payload.len, rdr.off);
     }
@@ -4310,7 +4310,7 @@ test "handlePacket: agent channel open confirmation activates server channel" {
 
     var payload_backing: [64]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_CONFIRMATION));
     try pw.writeU32(channel_id);
     try pw.writeU32(77);
     try pw.writeU32(32768);
@@ -4347,7 +4347,7 @@ test "handlePacket: agent channel open failure emits close event" {
 
     var payload_backing: [128]u8 = undefined;
     var pw = BufferWriter.init(&payload_backing, 0);
-    try pw.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
     try pw.writeU32(channel_id);
     try pw.writeU32(1);
     try pw.writeU32LenString("rejected");
@@ -4401,7 +4401,7 @@ fn feedServerPayloadForTest(m: *SshzServer, payload: []const u8) !void {
 fn serverControlPayloadForTest(m: *SshzServer, id: Protocol.MsgId, channel: u32, amount: ?u32) !void {
     var bytes: [16]u8 = undefined;
     var pkt = BufferWriter.init(&bytes, 0);
-    try pkt.writeU8(@intFromEnum(id));
+    try pkt.writeU8(@backingInt(id));
     try pkt.writeU32(channel);
     if (amount) |n| try pkt.writeU32(n);
     try feedServerPayloadForTest(m, pkt.active());
@@ -4418,7 +4418,7 @@ test "server PTY admission is opt in bounded borrowed and explicitly decided" {
                 const channel = try activeServerForTest(&m, 64, 32);
                 var bytes: [256]u8 = undefined;
                 var pkt = BufferWriter.init(&bytes, 0);
-                try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
                 try pkt.writeU32(channel);
                 try pkt.writeU32LenString("pty-req");
                 try pkt.writeBoolean(want_reply);
@@ -4448,7 +4448,7 @@ test "server PTY admission is opt in bounded borrowed and explicitly decided" {
                 if (want_reply) {
                     const output = try m.peek(Protocol.MaxSSHPacket);
                     var reply = BufferReader.init(unencryptedPayload(output));
-                    try std.testing.expectEqual(@intFromEnum(if (!observe or allow)
+                    try std.testing.expectEqual(@backingInt(if (!observe or allow)
                         Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS
                     else
                         Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try reply.readU8());
@@ -4472,7 +4472,7 @@ test "server PTY rejects incomplete modes and trailing packet bytes before event
         const channel = try activeServerForTest(&m, 64, 32);
         var bytes: [128]u8 = undefined;
         var pkt = BufferWriter.init(&bytes, 0);
-        try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+        try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
         try pkt.writeU32(channel);
         try pkt.writeU32LenString("pty-req");
         try pkt.writeBoolean(true);
@@ -4520,7 +4520,7 @@ test "server extended data suffix precedes owned signal and EOF across partial w
         const output = try m.peek(Protocol.MaxSSHPacket);
         const len = output.len;
         var packet = BufferReader.init(unencryptedPayload(output));
-        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA), try packet.readU8());
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA), try packet.readU8());
         try std.testing.expectEqual(@as(u32, 42), try packet.readU32());
         try std.testing.expectEqual(@as(u32, 1), try packet.readU32());
         try std.testing.expectEqualSlices(u8, "abcdef"[part * 2 ..][0..2], try packet.readU32LenString());
@@ -4532,7 +4532,7 @@ test "server extended data suffix precedes owned signal and EOF across partial w
     const result = try m.peek(Protocol.MaxSSHPacket);
     const result_len = result.len;
     var packet = BufferReader.init(unencryptedPayload(result));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try packet.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST), try packet.readU8());
     try std.testing.expectEqual(@as(u32, 42), try packet.readU32());
     try std.testing.expectEqualStrings("exit-signal", try packet.readU32LenString());
     try std.testing.expect(!try packet.readBoolean());
@@ -4551,7 +4551,7 @@ test "server extended data suffix precedes owned signal and EOF across partial w
     try m.clearEvent(event);
     const eof = try m.peek(Protocol.MaxSSHPacket);
     var eof_reader = BufferReader.init(unencryptedPayload(eof));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EOF), try eof_reader.readU8());
     try std.testing.expect(!try m.channelEofFlushed(channel));
     try m.consumed(eof.len);
     try std.testing.expect(try m.channelEofFlushed(channel));
@@ -4585,7 +4585,7 @@ test "server manual credit is exact and does not freeze control or other channel
     other.automatic_read_credit = false;
     var input_bytes: [32]u8 = undefined;
     var input = BufferWriter.init(&input_bytes, 0);
-    try input.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA));
+    try input.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA));
     try input.writeU32(other.local_id);
     try input.writeU32(1);
     try input.writeU32LenString("ijkl");
@@ -4604,7 +4604,7 @@ test "server manual credit is exact and does not freeze control or other channel
     _ = try consumeProducedChannelDataForTest(&m, &discarded, 0);
     const adjust = try m.peek(Protocol.MaxSSHPacket);
     var packet = BufferReader.init(unencryptedPayload(adjust));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST), try packet.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST), try packet.readU8());
     try std.testing.expectEqual(chan.remote_id, try packet.readU32());
     try std.testing.expectEqual(@as(u32, 3), try packet.readU32());
     try m.consumed(adjust.len);
@@ -4657,7 +4657,7 @@ test "server exit submission bounds abandonment and retained lifetime" {
         }
         const close = try m.peek(Protocol.MaxSSHPacket);
         var packet = BufferReader.init(unencryptedPayload(close));
-        try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try packet.readU8());
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE), try packet.readU8());
         try m.consumed(close.len);
         try serverControlPayloadForTest(&m, .SSH_MSG_CHANNEL_CLOSE, channel, null);
         try std.testing.expect((try m.getNextEvent()).Event == .EndSession);
@@ -4737,7 +4737,7 @@ test "server pending exit becomes abandoned on disconnect or deadline" {
         } else {
             var bytes: [64]u8 = undefined;
             var pkt = BufferWriter.init(&bytes, 0);
-            try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_DISCONNECT));
+            try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_DISCONNECT));
             try pkt.writeU32(11);
             try pkt.writeU32LenString("done");
             try pkt.writeU32LenString("");
@@ -4814,7 +4814,7 @@ test "server PTY observation never admits an agent channel as a session" {
     m.session.channel_table.findByLocalId(channel).?.kind = .AgentForward;
     var bytes: [64]u8 = undefined;
     var pkt = BufferWriter.init(&bytes, 0);
-    try pkt.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+    try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
     try pkt.writeU32(channel);
     try pkt.writeU32LenString("pty-req");
     try pkt.writeBoolean(true);
@@ -4824,7 +4824,7 @@ test "server PTY observation never admits an agent channel as a session" {
     try feedServerPayloadForTest(&m, pkt.active());
     const output = try m.peek(Protocol.MaxSSHPacket);
     var response = BufferReader.init(unencryptedPayload(output));
-    try std.testing.expectEqual(@intFromEnum(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try response.readU8());
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try response.readU8());
     try std.testing.expectEqual(@as(u32, 42), try response.readU32());
     try std.testing.expectEqual(response.payload.len, response.off);
 }

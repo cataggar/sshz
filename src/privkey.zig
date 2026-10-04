@@ -28,8 +28,8 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
     const post_banner = "-----END OPENSSH PRIVATE KEY-----";
 
     var b64_slice_opt: ?[]const u8 = null;
-    if (std.ascii.indexOfIgnoreCase(keydata_ascii, pre_banner)) |pre_banner_start| {
-        if (std.ascii.indexOfIgnoreCase(keydata_ascii, post_banner)) |post_banner_start| {
+    if (std.ascii.findIgnoreCase(keydata_ascii, pre_banner)) |pre_banner_start| {
+        if (std.ascii.findIgnoreCase(keydata_ascii, post_banner)) |post_banner_start| {
             b64_slice_opt = keydata_ascii[pre_banner_start + pre_banner.len .. post_banner_start];
         }
     }
@@ -236,7 +236,7 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
 fn mpintToFixed(comptime len: usize, mpint: []const u8) PrivKeyError![len]u8 {
     const trimmed = Key.trimMpint(mpint);
     if (trimmed.len > len) return PrivKeyError.BadPrivKey;
-    var out: [len]u8 = .{0} ** len;
+    var out: [len]u8 = @splat(0);
     @memcpy(out[len - trimmed.len ..], trimmed);
     return out;
 }
@@ -333,8 +333,8 @@ test "decodepriv" {
     try decodePrivKey(testkey_encrypted_valid_passworded, testkey_encrypted_valid_password, &blob, &pubblob);
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 168, 158, 23, 77, 212, 94, 57, 255, 157, 6, 173, 128, 17, 109, 67, 232, 3, 126, 106, 1, 93, 9, 70, 135, 50, 35, 207, 108, 76, 128, 251, 24, 189, 27, 142, 8, 84, 46, 86, 64, 66, 99, 249, 172, 207, 208, 211, 134, 21, 193, 250, 85, 48, 57, 251, 81, 133, 110, 66, 16, 244, 86, 130, 249 }));
     try std.testing.expectError(PrivKeyError.InvalidKeyDecrypt, decodePrivKey(testkey_encrypted_valid_passworded, "notpassword", &blob, &pubblob));
-    try std.testing.expectEqualSlices(u8, &(.{0} ** blob.len), &blob);
-    try std.testing.expectEqualSlices(u8, &(.{0} ** pubblob.len), &pubblob);
+    try std.testing.expectEqualSlices(u8, &@as([blob.len]u8, @splat(0)), &blob);
+    try std.testing.expectEqualSlices(u8, &@as([pubblob.len]u8, @splat(0)), &pubblob);
     try decodePrivKey(testkey_valid, null, &blob, &pubblob);
     try std.testing.expect(std.mem.eql(u8, &blob, &[_]u8{ 166, 119, 186, 89, 114, 101, 152, 133, 196, 14, 211, 238, 206, 143, 73, 223, 41, 101, 45, 196, 132, 150, 240, 240, 41, 82, 229, 54, 152, 193, 40, 220, 232, 131, 168, 235, 233, 3, 218, 50, 159, 159, 165, 94, 166, 155, 49, 203, 223, 47, 9, 101, 69, 137, 215, 186, 3, 175, 96, 21, 112, 247, 116, 245 }));
 }

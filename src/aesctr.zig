@@ -55,8 +55,8 @@ const testalgos = .{ aes.Aes128, aes.Aes256 };
 test "aesctr clear wipes the expanded key and counter state" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
-        const iv: [AesCtrT.iv_size]u8 = .{0xA5} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{0x5A} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat(0xA5);
+        const key: [AesCtrT.key_size]u8 = @splat(0x5A);
         var ctx = AesCtrT.init(iv, key);
 
         ctx.clear();
@@ -69,11 +69,11 @@ test "aesctr clear wipes the expanded key and counter state" {
 
 test "aesctr fails before its historical u32 byte counter would wrap" {
     const AesCtrT = AesCtr(aes.Aes256);
-    const iv: [AesCtrT.iv_size]u8 = .{0x11} ** AesCtrT.iv_size;
-    const key: [AesCtrT.key_size]u8 = .{0x22} ** AesCtrT.key_size;
+    const iv: [AesCtrT.iv_size]u8 = @splat(0x11);
+    const key: [AesCtrT.key_size]u8 = @splat(0x22);
     var ctx = AesCtrT.init(iv, key);
     defer ctx.clear();
-    var input: [AesCtrT.block_size]u8 = .{0} ** AesCtrT.block_size;
+    var input: [AesCtrT.block_size]u8 = @splat(0);
     var output: [AesCtrT.block_size]u8 = undefined;
 
     ctx.bytecount = AesCtrT.max_bytes_per_key - (2 * AesCtrT.block_size - 1);
@@ -93,18 +93,18 @@ test "aesctr-bigblock-twostage" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
 
-        const iv: [AesCtrT.iv_size]u8 = .{'I'} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{'K'} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat('I');
+        const key: [AesCtrT.key_size]u8 = @splat('K');
         var aesctx_enc = AesCtrT.init(iv, key);
         defer aesctx_enc.clear();
-        const block0_plaintext: [AesCtrT.block_size * 10]u8 = .{'0'} ** (AesCtrT.block_size * 10);
+        const block0_plaintext: [AesCtrT.block_size * 10]u8 = @splat('0');
         var block0_ciphertext: [AesCtrT.block_size * 10]u8 = undefined;
         try aesctx_enc.encrypt(&block0_plaintext, &block0_ciphertext);
 
         //        UNSAFE_TRACEDUMP(.Debug, "plaintext0", .{}, &block0_plaintext);
         //        UNSAFE_TRACEDUMP(.Debug, "ciphertext0", .{}, &block0_ciphertext);
 
-        const block1_plaintext: [AesCtrT.block_size * 10]u8 = .{'1'} ** (AesCtrT.block_size * 10);
+        const block1_plaintext: [AesCtrT.block_size * 10]u8 = @splat('1');
         var block1_ciphertext: [AesCtrT.block_size * 10]u8 = undefined;
         try aesctx_enc.encrypt(&block1_plaintext, &block1_ciphertext);
 
@@ -135,18 +135,18 @@ test "aesctr-doubleblock-twostage" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
 
-        const iv: [AesCtrT.iv_size]u8 = .{'I'} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{'K'} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat('I');
+        const key: [AesCtrT.key_size]u8 = @splat('K');
         var aesctx_enc = AesCtrT.init(iv, key);
         defer aesctx_enc.clear();
-        const block0_plaintext: [AesCtrT.block_size]u8 = .{'0'} ** AesCtrT.block_size;
+        const block0_plaintext: [AesCtrT.block_size]u8 = @splat('0');
         var block0_ciphertext: [AesCtrT.block_size]u8 = undefined;
         try aesctx_enc.encrypt(&block0_plaintext, &block0_ciphertext);
 
         //        UNSAFE_TRACEDUMP(.Debug, "plaintext0", .{}, &block0_plaintext);
         //        UNSAFE_TRACEDUMP(.Debug, "ciphertext0", .{}, &block0_ciphertext);
 
-        const block1_plaintext: [AesCtrT.block_size]u8 = .{'1'} ** AesCtrT.block_size;
+        const block1_plaintext: [AesCtrT.block_size]u8 = @splat('1');
         var block1_ciphertext: [AesCtrT.block_size]u8 = undefined;
         try aesctx_enc.encrypt(&block1_plaintext, &block1_ciphertext);
 
@@ -177,11 +177,11 @@ test "aesctr-singleblock-normal" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
 
-        const iv: [AesCtrT.iv_size]u8 = .{'I'} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{'K'} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat('I');
+        const key: [AesCtrT.key_size]u8 = @splat('K');
         var aesctx_enc = AesCtrT.init(iv, key);
         defer aesctx_enc.clear();
-        const block_plaintext: [AesCtrT.block_size]u8 = .{'D'} ** AesCtrT.block_size;
+        const block_plaintext: [AesCtrT.block_size]u8 = @splat('D');
         var block_ciphertext: [AesCtrT.block_size]u8 = undefined;
         try aesctx_enc.encrypt(&block_plaintext, &block_ciphertext);
 
@@ -204,11 +204,11 @@ test "aesctr-doubleblock-normal" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
 
-        const iv: [AesCtrT.iv_size]u8 = .{'I'} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{'K'} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat('I');
+        const key: [AesCtrT.key_size]u8 = @splat('K');
         var aesctx_enc = AesCtrT.init(iv, key);
         defer aesctx_enc.clear();
-        const plaintext: [AesCtrT.block_size * 2]u8 = .{'D'} ** (AesCtrT.block_size * 2);
+        const plaintext: [AesCtrT.block_size * 2]u8 = @splat('D');
         var ciphertext: [AesCtrT.block_size * 2]u8 = undefined;
         try aesctx_enc.encrypt(&plaintext, &ciphertext);
 
@@ -231,16 +231,16 @@ test "aesctr-singleblock-wrongkey" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
 
-        const iv: [AesCtrT.iv_size]u8 = .{'I'} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{'K'} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat('I');
+        const key: [AesCtrT.key_size]u8 = @splat('K');
         var aesctx_enc = AesCtrT.init(iv, key);
         defer aesctx_enc.clear();
-        const block_plaintext: [AesCtrT.block_size]u8 = .{'D'} ** AesCtrT.block_size;
+        const block_plaintext: [AesCtrT.block_size]u8 = @splat('D');
         var block_ciphertext: [AesCtrT.block_size]u8 = undefined;
 
         try aesctx_enc.encrypt(&block_plaintext, &block_ciphertext);
 
-        const keywrong: [AesCtrT.key_size]u8 = .{'L'} ** AesCtrT.key_size;
+        const keywrong: [AesCtrT.key_size]u8 = @splat('L');
         var aesctx_dec = AesCtrT.init(iv, keywrong);
         defer aesctx_dec.clear();
         var block_recovered_plaintext: [AesCtrT.block_size]u8 = undefined;
@@ -254,16 +254,16 @@ test "aesctr-singleblock-wrongiv" {
     inline for (testalgos) |algo| {
         const AesCtrT = AesCtr(algo);
 
-        const iv: [AesCtrT.iv_size]u8 = .{'I'} ** AesCtrT.iv_size;
-        const key: [AesCtrT.key_size]u8 = .{'K'} ** AesCtrT.key_size;
+        const iv: [AesCtrT.iv_size]u8 = @splat('I');
+        const key: [AesCtrT.key_size]u8 = @splat('K');
         var aesctx_enc = AesCtrT.init(iv, key);
         defer aesctx_enc.clear();
-        const block_plaintext: [AesCtrT.block_size]u8 = .{'D'} ** AesCtrT.block_size;
+        const block_plaintext: [AesCtrT.block_size]u8 = @splat('D');
         var block_ciphertext: [AesCtrT.block_size]u8 = undefined;
 
         try aesctx_enc.encrypt(&block_plaintext, &block_ciphertext);
 
-        const ivwrong: [AesCtrT.iv_size]u8 = .{'J'} ** AesCtrT.iv_size;
+        const ivwrong: [AesCtrT.iv_size]u8 = @splat('J');
         var aesctx_dec = AesCtrT.init(ivwrong, key);
         defer aesctx_dec.clear();
         var block_recovered_plaintext: [AesCtrT.block_size]u8 = undefined;

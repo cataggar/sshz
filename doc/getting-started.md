@@ -1,6 +1,6 @@
 # Getting started
 
-sshz requires [Zig 0.16.0](https://ziglang.org/download/). zlib is built from
+sshz requires [Zig 0.17.0](https://ziglang.org/download/). zlib is built from
 source as a package dependency, so no system zlib installation is required.
 
 ## Library

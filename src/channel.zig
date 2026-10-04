@@ -353,7 +353,7 @@ pub const Channel = struct {
 pub const ChannelTable = struct {
     const Self = @This();
 
-    channels: [MaxChannels]?Channel = .{null} ** MaxChannels,
+    channels: [MaxChannels]?Channel = @splat(null),
     next_local_id: u32 = 0,
     last_serviced_slot: usize = 0,
     last_window_change_slot: usize = 0,
