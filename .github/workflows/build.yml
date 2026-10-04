@@ -152,8 +152,8 @@ jobs:
         if: runner.os == 'Linux'
         timeout-minutes: 3
         run: |
-          zig build malformed -Doptimize=debug --test-timeout 30s --seed 0
-          zig build malformed -Doptimize=safe --test-timeout 30s --seed 0
+          zig build malformed -Doptimize=debug --test-timeout 30s
+          zig build malformed -Doptimize=safe --test-timeout 30s
         working-directory: sshz
       - name: Build lib
         run: zig build
