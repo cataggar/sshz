@@ -176,7 +176,6 @@ fn openLockedForUpdate(io: std.Io, dir: std.Io.Dir, path: []const u8) !std.Io.Fi
     return error.KnownHostsChangedDuringOpen;
 }
 
-
 fn acceptNewAt(
     io: std.Io,
     allocator: std.mem.Allocator,

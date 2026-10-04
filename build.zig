@@ -2,7 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    const required_zig = "0.16.0";
+    const required_zig = "0.17.0";
     const current_zig = builtin.zig_version;
     const min_zig = std.SemanticVersion.parse(required_zig) catch unreachable;
     if (current_zig.order(min_zig) == .lt) {
@@ -25,6 +25,22 @@ fn linkZlib(b: *std.Build, mod: *std.Build.Module) void {
         .optimize = mod.optimize.?,
     });
     mod.linkLibrary(dep.artifact("z"));
+    const translate_dep = b.dependency("translate_c", .{});
+    const bindings: @import("translate_c").Translator = .init(translate_dep, .{
+        .name = "sshz-zlib",
+        .c_source_file = b.addWriteFiles().add("sshz-zlib.h",
+            \\#define Z_SOLO 1
+            \\#include <zlib.h>
+            \\
+        ),
+        .target = mod.resolved_target.?,
+        .optimize = mod.optimize.?,
+        .link_libc = false,
+    });
+    // Only stream APIs are needed. Z_SOLO excludes file-I/O headers, so the
+    // bindings also translate for Android before the consumer supplies an NDK.
+    bindings.addIncludePath(dep.path(""));
+    mod.addImport("zlib-c", bindings.mod);
 }
 
 /// How much the library is allowed to print.
@@ -254,13 +270,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const run_stress = b.addRunArtifact(stress_exe);
-    if (b.args) |args| run_stress.addArgs(args);
+    run_stress.addPassthruArgs();
     const stress_step = b.step("stress", "Run deterministic in-process stress acceptance");
     stress_step.dependOn(&run_stress.step);
 
     const soak_cmd = b.addSystemCommand(&.{ "bash", "test/stress/soak.sh" });
     soak_cmd.addArtifactArg(stress_exe);
-    if (b.args) |args| soak_cmd.addArgs(args);
+    soak_cmd.addPassthruArgs();
     const soak_step = b.step("soak", "Run duration/seed/peer-selected soak coverage");
     soak_step.dependOn(&soak_cmd.step);
 

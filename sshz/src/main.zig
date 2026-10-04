@@ -130,8 +130,8 @@ pub fn raw_mode_start() !void {
         termios.lflag.IEXTEN = false;
         termios.lflag.ISIG = false;
         termios.cflag.CSIZE = .CS8;
-        termios.cc[@intFromEnum(std.posix.V.TIME)] = 0;
-        termios.cc[@intFromEnum(std.posix.V.MIN)] = 1;
+        termios.cc[@backingInt(std.posix.V.TIME)] = 0;
+        termios.cc[@backingInt(std.posix.V.MIN)] = 1;
 
         try std.posix.tcsetattr(handle, .FLUSH, termios);
     }
@@ -465,7 +465,7 @@ pub fn main(init: std.process.Init) !void {
             defer raw_mode_stop();
 
             var iobuf: [8]u8 = undefined; // could be any size
-            var agent_sockets: [MaxAgentSockets]?AgentSocket = .{null} ** MaxAgentSockets;
+            var agent_sockets: [MaxAgentSockets]?AgentSocket = @splat(null);
             defer closeAllAgentSockets(&agent_sockets);
             var quit = false;
             var connected = false;

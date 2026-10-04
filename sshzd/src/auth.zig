@@ -127,8 +127,8 @@ fn timingSafeAuthorizedValueEql(expected: []const u8, supplied: []const u8) bool
     // agree, compare the authorization-sensitive value without an early exit.
     if (expected.len != supplied.len or expected.len > MaxKeyBlobBytes) return false;
 
-    var expected_padded: [MaxKeyBlobBytes]u8 = .{0} ** MaxKeyBlobBytes;
-    var supplied_padded: [MaxKeyBlobBytes]u8 = .{0} ** MaxKeyBlobBytes;
+    var expected_padded: [MaxKeyBlobBytes]u8 = @splat(0);
+    var supplied_padded: [MaxKeyBlobBytes]u8 = @splat(0);
     @memcpy(expected_padded[0..expected.len], expected);
     @memcpy(supplied_padded[0..supplied.len], supplied);
     return std.crypto.timing_safe.eql(
@@ -346,9 +346,9 @@ fn requestAlgorithmMatches(algorithm: []const u8, kind: KeyKind) bool {
 const allowed_ed25519_line =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER test key\n";
 const allowed_ed25519_blob =
-    "\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" ++ ("\x11" ** 32);
+    "\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" ++ @as([32]u8, @splat(0x11));
 const wrong_ed25519_blob =
-    "\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" ++ ("\x22" ** 32);
+    "\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20" ++ @as([32]u8, @splat(0x22));
 
 fn parseTestPolicy(contents: []const u8) !Policy {
     const result = try AuthorizedKeys.parse(std.testing.allocator, contents);

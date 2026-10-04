@@ -113,7 +113,7 @@ pub const SignatureBlob = struct {
 };
 
 pub const RsaComponent = struct {
-    bytes: [MaxRsaBytes]u8 = .{0} ** MaxRsaBytes,
+    bytes: [MaxRsaBytes]u8 = @splat(0),
     len: usize = 0,
 
     pub fn set(self: *RsaComponent, bytes: []const u8) KeyError!void {
@@ -327,12 +327,12 @@ pub const PrivateKey = union(KeyAlgorithm) {
         std.crypto.secureZero(u8, std.mem.asBytes(self));
         self.* = switch (alg) {
             .Ed25519 => .{ .Ed25519 = .{
-                .public = .{0} ** Ed25519.PublicKey.encoded_length,
-                .secret = .{0} ** Ed25519.SecretKey.encoded_length,
+                .public = @splat(0),
+                .secret = @splat(0),
             } },
             .EcdsaP256 => .{ .EcdsaP256 = .{
-                .public_sec1 = .{0} ** EcdsaP256.PublicKey.uncompressed_sec1_encoded_length,
-                .secret_scalar = .{0} ** EcdsaP256.SecretKey.encoded_length,
+                .public_sec1 = @splat(0),
+                .secret_scalar = @splat(0),
             } },
             .Rsa => .{ .Rsa = .{} },
         };
@@ -347,32 +347,32 @@ fn expectZeroed(bytes: []const u8) !void {
 
 test "private key clear wipes every algorithm payload" {
     var ed25519: PrivateKey = .{ .Ed25519 = .{
-        .public = .{0xA5} ** Ed25519.PublicKey.encoded_length,
-        .secret = .{0x5A} ** Ed25519.SecretKey.encoded_length,
+        .public = @splat(0xA5),
+        .secret = @splat(0x5A),
     } };
     ed25519.clear();
     try expectZeroed(&ed25519.Ed25519.public);
     try expectZeroed(&ed25519.Ed25519.secret);
 
     var ecdsa: PrivateKey = .{ .EcdsaP256 = .{
-        .public_sec1 = .{0xA5} ** EcdsaP256.PublicKey.uncompressed_sec1_encoded_length,
-        .secret_scalar = .{0x5A} ** EcdsaP256.SecretKey.encoded_length,
+        .public_sec1 = @splat(0xA5),
+        .secret_scalar = @splat(0x5A),
     } };
     ecdsa.clear();
     try expectZeroed(&ecdsa.EcdsaP256.public_sec1);
     try expectZeroed(&ecdsa.EcdsaP256.secret_scalar);
 
     var rsa: PrivateKey = .{ .Rsa = .{} };
-    try rsa.Rsa.d.set(&(.{0xA5} ** MaxRsaBytes));
-    try rsa.Rsa.p.set(&(.{0x5A} ** MaxRsaBytes));
+    try rsa.Rsa.d.set(&@as([MaxRsaBytes]u8, @splat(0xA5)));
+    try rsa.Rsa.p.set(&@as([MaxRsaBytes]u8, @splat(0x5A)));
     rsa.clear();
     try expectZeroed(std.mem.asBytes(&rsa.Rsa));
 }
 
 test "private key signing errors clear caller output" {
     var key: PrivateKey = .{ .Ed25519 = .{
-        .public = .{0} ** Ed25519.PublicKey.encoded_length,
-        .secret = .{0} ** Ed25519.SecretKey.encoded_length,
+        .public = @splat(0),
+        .secret = @splat(0),
     } };
     defer key.clear();
     var signature: SignatureBlob = undefined;
@@ -385,7 +385,7 @@ test "private key signing errors clear caller output" {
 test "failed RSA component replacement clears the previous value" {
     var component: RsaComponent = .{};
     try component.set("private");
-    var oversized: [MaxRsaBytes + 1]u8 = .{0xA5} ** (MaxRsaBytes + 1);
+    var oversized: [MaxRsaBytes + 1]u8 = @splat(0xA5);
     defer std.crypto.secureZero(u8, &oversized);
 
     try std.testing.expectError(error.RsaComponentTooLarge, component.set(&oversized));
@@ -538,7 +538,7 @@ fn parseEcdsaSignature(sig_payload: []const u8) KeyError!EcdsaP256.Signature {
         return error.InvalidSignature;
     }
 
-    var raw: [EcdsaP256.Signature.encoded_length]u8 = .{0} ** EcdsaP256.Signature.encoded_length;
+    var raw: [EcdsaP256.Signature.encoded_length]u8 = @splat(0);
     defer std.crypto.secureZero(u8, &raw);
     @memcpy(raw[EcdsaP256.SecretKey.encoded_length - r_mpint.len .. EcdsaP256.SecretKey.encoded_length], r_mpint);
     @memcpy(raw[EcdsaP256.Signature.encoded_length - s_mpint.len ..], s_mpint);
@@ -679,7 +679,7 @@ test "server host key selection follows peer client order and loaded key" {
 }
 
 test "RSA modulus policy enforces 2048 through 4096 bits and exponent at least three" {
-    var modulus_2047: [MinRsaBytes]u8 = .{0xff} ** MinRsaBytes;
+    var modulus_2047: [MinRsaBytes]u8 = @splat(0xff);
     modulus_2047[0] = 0x7f;
     try std.testing.expectError(
         error.RsaKeyTooSmall,
@@ -714,7 +714,7 @@ test "RSA modulus policy enforces 2048 through 4096 bits and exponent at least t
         weak_private.sign(.RsaSha256, "message", &generated_signature),
     );
 
-    var modulus_2048: [MinRsaBytes]u8 = .{0xff} ** MinRsaBytes;
+    var modulus_2048: [MinRsaBytes]u8 = @splat(0xff);
     modulus_2048[0] = 0x80;
     try validateRsaPublicComponents(&modulus_2048, &.{3});
     try std.testing.expectError(
@@ -722,7 +722,7 @@ test "RSA modulus policy enforces 2048 through 4096 bits and exponent at least t
         validateRsaPublicComponents(&modulus_2048, &.{1}),
     );
 
-    const oversized: [MaxRsaBytes + 1]u8 = .{0xff} ** (MaxRsaBytes + 1);
+    const oversized: [MaxRsaBytes + 1]u8 = @splat(0xff);
     try std.testing.expectError(
         error.RsaComponentTooLarge,
         validateRsaPublicComponents(&oversized, &.{3}),

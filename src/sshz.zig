@@ -235,8 +235,8 @@ pub const ResourceLimits = struct {
         if (Protocol.zlibSyncFlushBound(self.channel_packet_size + Protocol.ChannelExtendedDataFramingLen) >
             self.max_payload_size)
             return error.InvalidPeerPacketLimit;
-        inline for (std.meta.fields(DeadlineLimits)) |field| {
-            if (@field(self.deadlines, field.name)) |duration| {
+        inline for (@typeInfo(DeadlineLimits).@"struct".field_names) |name| {
+            if (@field(self.deadlines, name)) |duration| {
                 if (duration == 0) return error.InvalidDeadlineLimit;
             }
         }
@@ -390,7 +390,7 @@ pub fn inspectMessageFraming(payload: []const u8) MessageInputError!void {
     var reader = BufferReader.init(payload);
     const message_id = try reader.readU8();
     inline for (std.meta.tags(Protocol.MsgId)) |known| {
-        if (message_id == @intFromEnum(known)) return;
+        if (message_id == @backingInt(known)) return;
     }
     return error.UnsupportedMessage;
 }
@@ -410,7 +410,7 @@ pub fn exerciseEcdhReplyPublicKey(public_key: []const u8, allocator: std.mem.All
 
     var payload_backing: [128]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
+    try payload.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
     try payload.writeU32LenString("");
     try payload.writeU32LenString(public_key);
     try payload.writeU32LenString("");
@@ -468,9 +468,9 @@ pub const AuthFailureInfo = struct {
     pub const MaxUnsupportedMethodsLen = 128;
 
     attempted_method: AuthMethod,
-    supported_methods: [MaxSupportedMethods]AuthMethod = .{.None} ** MaxSupportedMethods,
+    supported_methods: [MaxSupportedMethods]AuthMethod = @splat(.None),
     supported_methods_len: u8 = 0,
-    unsupported_methods: [MaxUnsupportedMethodsLen]u8 = .{0} ** MaxUnsupportedMethodsLen,
+    unsupported_methods: [MaxUnsupportedMethodsLen]u8 = @splat(0),
     unsupported_methods_len: u8 = 0,
     partial_success: bool,
     auth_stage: u8,
@@ -921,9 +921,9 @@ pub fn SshzImpl(role: Role) type {
         // Session-owned packet storage. Event slices borrow these buffers and
         // remain valid only until the event is cleared or another API call
         // documented to release the event is made.
-        iobuf_rd: [Protocol.MaxSSHPacket]u8 = .{0} ** Protocol.MaxSSHPacket,
-        iobuf_wr: [Protocol.MaxSSHPacket]u8 = .{0} ** Protocol.MaxSSHPacket,
-        iobuf_decompressed: [Protocol.MaxPayload]u8 = .{0} ** Protocol.MaxPayload,
+        iobuf_rd: [Protocol.MaxSSHPacket]u8 = @splat(0),
+        iobuf_wr: [Protocol.MaxSSHPacket]u8 = @splat(0),
+        iobuf_decompressed: [Protocol.MaxPayload]u8 = @splat(0),
         rd_nbytes: usize,
         rd_off: usize,
         wr_nbytes: usize,
@@ -1245,11 +1245,11 @@ pub fn SshzImpl(role: Role) type {
                 }
                 self.pre_auth_packets += 1;
                 const work: u32 = switch (msgid) {
-                    @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT),
-                    @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT),
-                    @intFromEnum(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY),
+                    @backingInt(Protocol.MsgId.SSH_MSG_KEXINIT),
+                    @backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT),
+                    @backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY),
                     => 8,
-                    @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => 4,
+                    @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST) => 4,
                     else => 1,
                 };
                 if (work > self.limits.max_pre_auth_work -| self.pre_auth_work) {
@@ -1259,7 +1259,7 @@ pub fn SshzImpl(role: Role) type {
                 self.pre_auth_work += work;
             }
 
-            if (msgid == @intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT)) {
+            if (msgid == @backingInt(Protocol.MsgId.SSH_MSG_KEXINIT)) {
                 if (self.key_exchanges >= self.limits.max_key_exchanges) {
                     self.failClosed();
                     return IoError.TooManyKeyExchanges;
@@ -1275,7 +1275,7 @@ pub fn SshzImpl(role: Role) type {
             }
 
             if (comptime role == .Server) {
-                if (msgid == @intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)) {
+                if (msgid == @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)) {
                     if (self.server_auth_attempts >= self.limits.max_server_auth_attempts) {
                         self.failClosed();
                         return IoError.TooManyAuthAttempts;
@@ -1362,7 +1362,7 @@ pub fn SshzImpl(role: Role) type {
                 .Active => |iotype| {
                     switch (iotype.action) {
                         .Eventing => |eventCode| {
-                            if (@intFromEnum(eventCode) == @intFromEnum(clearEventCode)) {
+                            if (@backingInt(eventCode) == @backingInt(clearEventCode)) {
                                 if (comptime role == .Client) {
                                     switch (eventCode) {
                                         .CheckHostKey => return IoError.badClearEvent,
@@ -2541,12 +2541,12 @@ fn startClientIdentificationRead(client: *SshzClient) !void {
 }
 
 test "packet MAC verification accepts a matching MAC" {
-    const mac = [1]u8{0xa5} ** Protocol.mac_algo.key_length;
+    const mac: [Protocol.mac_algo.key_length]u8 = @splat(0xa5);
     try verifyPacketMac(mac, &mac);
 }
 
 test "packet MAC verification rejects a different or incorrectly sized MAC" {
-    const mac = [1]u8{0xa5} ** Protocol.mac_algo.key_length;
+    const mac: [Protocol.mac_algo.key_length]u8 = @splat(0xa5);
     var different = mac;
     different[different.len - 1] ^= 1;
 
@@ -2943,11 +2943,11 @@ test "pre-auth packet work and rekey limits fail closed at boundaries" {
     var client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer client.deinit();
 
-    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
-    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
+    try client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE));
+    try client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE));
     try std.testing.expectError(
         IoError.TooManyPreAuthPackets,
-        client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE)),
+        client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE)),
     );
     try std.testing.expectError(IoError.SessionTerminated, client.getNextEvent());
 
@@ -2955,31 +2955,31 @@ test "pre-auth packet work and rekey limits fail closed at boundaries" {
     limits.max_pre_auth_work = 9;
     var work_client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer work_client.deinit();
-    try work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
-    try work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE));
+    try work_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try work_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE));
     try std.testing.expectError(
         IoError.TooMuchPreAuthWork,
-        work_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_IGNORE)),
+        work_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE)),
     );
 
     limits.max_pre_auth_work = 100;
     limits.min_packets_between_rekeys = 1;
     var frequency_client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer frequency_client.deinit();
-    try frequency_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try frequency_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
     try std.testing.expectError(
         IoError.RekeyTooFrequent,
-        frequency_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT)),
+        frequency_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT)),
     );
 
     limits.min_packets_between_rekeys = 0;
     var count_client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer count_client.deinit();
-    try count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
-    try count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try count_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try count_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
     try std.testing.expectError(
         IoError.TooManyKeyExchanges,
-        count_client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_KEXINIT)),
+        count_client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT)),
     );
 }
 
@@ -2995,24 +2995,24 @@ test "server authentication attempt limit is independent of client attempts" {
     );
     defer server.deinit();
 
-    try server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
-    try server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try server.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try server.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
     try std.testing.expectError(
         IoError.TooManyAuthAttempts,
-        server.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)),
+        server.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST)),
     );
 
     var client = try SshzClient.initWithLimits(prng.random(), "test", std.testing.allocator, limits);
     defer client.deinit();
-    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
-    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
-    try client.accountInboundMessage(@intFromEnum(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
+    try client.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
 }
 
 fn installAutomaticRekeyTestKeys(keydata: *Protocol.KeyDataBi) !void {
-    const hash: [Protocol.hash_algo.digest_length]u8 = .{0x31} ** Protocol.hash_algo.digest_length;
-    const secret: [Protocol.kex_algo.shared_length]u8 = .{0x42} ** Protocol.kex_algo.shared_length;
-    const session_id: [Protocol.hash_algo.digest_length]u8 = .{0x53} ** Protocol.hash_algo.digest_length;
+    const hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x31);
+    const secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x42);
+    const session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0x53);
     try keydata.genKeys(hash, secret, session_id);
     try keydata.c2s.activateEpoch(0, null);
     try keydata.s2c.activateEpoch(0, null);
@@ -3795,12 +3795,12 @@ test "client and server pending reads respect offsets through the final buffer b
         @memset(m.iobuf_rd[0..17], 0x55);
         m.requestRead(17, Protocol.MaxSSHPacket - 17, .ReadPktHdr);
         try std.testing.expectEqual(Protocol.MaxSSHPacket - 17, (try m.getNextEvent()).ReadyToConsume);
-        const data = [_]u8{0x77} ** (Protocol.MaxSSHPacket - 18);
+        const data: [Protocol.MaxSSHPacket - 18]u8 = @splat(0x77);
         try m.write(&data);
         try std.testing.expectEqual(@as(usize, 1), (try m.getNextEvent()).ReadyToConsume);
         try std.testing.expectError(IoError.cannotAcceptWrite, m.write("xx"));
         try std.testing.expectEqual(@as(usize, 1), (try m.getNextEvent()).ReadyToConsume);
-        try std.testing.expectEqualSlices(u8, &([_]u8{0x55} ** 17), m.iobuf_rd[0..17]);
+        try std.testing.expectEqualSlices(u8, &@as([17]u8, @splat(0x55)), m.iobuf_rd[0..17]);
         try std.testing.expectEqualSlices(u8, &data, m.iobuf_rd[17 .. m.iobuf_rd.len - 1]);
         try m.write("x");
         // Completion must advance directly to a positive header read, never
@@ -4207,7 +4207,7 @@ test "full handshake handles large compressed channel packets and keepalive queu
     var connected_server = false;
     var server_packets_sent: u8 = 0;
     var client_packets_received: u8 = 0;
-    var receive_epochs: [12]u64 = .{0} ** 12;
+    var receive_epochs: [12]u64 = @splat(0);
     var initial_session_id: ?[Protocol.hash_algo.digest_length]u8 = null;
     var accepted_host_fingerprint: ?[Protocol.hash_algo.digest_length]u8 = null;
     var keepalive_token: ?KeepaliveToken = null;

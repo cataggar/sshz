@@ -46,7 +46,7 @@ pub const traces_are_printed = trace_level != .Off;
 
 pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
     if (builtin.os.tag != .freestanding) {
-        if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
+        if (@backingInt(trace_level) >= @backingInt(level)) {
             std.debug.print(fmt ++ "\n", args);
         }
     }
@@ -55,7 +55,7 @@ pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
 pub inline fn unsafeTracedump(level: TraceLevel, comptime fmt: []const u8, args: anytype, data: []const u8) void {
     if (comptime unsafe_secret_tracing) {
         if (builtin.os.tag != .freestanding) {
-            if (@intFromEnum(trace_level) >= @intFromEnum(level)) {
+            if (@backingInt(trace_level) >= @backingInt(level)) {
                 std.debug.print(fmt ++ "\n", args);
                 dumpStderr(data);
             }

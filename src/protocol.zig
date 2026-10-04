@@ -11,9 +11,7 @@ const BufferReader = @import("buffer.zig").BufferReader;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const decodePrivKey = @import("privkey.zig").decodePrivKey;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
-const zlib = @cImport({
-    @cInclude("zlib.h");
-});
+const zlib = @import("zlib-c");
 
 pub const CommDir = enum {
     ClientToServer,
@@ -101,7 +99,7 @@ pub const KexHashOrder = enum { // https://datatracker.ietf.org/doc/html/rfc5656
     // calling myorder = myorder.check(next) will assert if done in the wrong order
     pub fn check(self: *const KexHashOrder, next: KexHashOrder) KexHashOrder {
         TRACE(.Debug, "KexHashOrder {any} -> {any}", .{ self, next });
-        std.debug.assert(@intFromEnum(self.*) + 1 == @intFromEnum(next));
+        std.debug.assert(@backingInt(self.*) + 1 == @backingInt(next));
         return next;
     }
 };
@@ -298,8 +296,8 @@ pub fn readKexInit(rdr: *BufferReader) SshzError!KexInit {
     _ = try rdr.readU32();
     if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
 
-    inline for (std.meta.fields(AlgorithmOffers)) |field| {
-        if (!isValidNameList(@field(result.offers, field.name), true)) {
+    inline for (@typeInfo(AlgorithmOffers).@"struct".field_names) |name| {
+        if (!isValidNameList(@field(result.offers, name), true)) {
             return IoError.AlgorithmNegotiationFailed;
         }
     }
@@ -316,8 +314,8 @@ pub fn negotiateAlgorithms(
     role: AlgorithmRole,
     local_host_key_algorithms: []const u8,
 ) SshzError!NegotiatedAlgorithms {
-    inline for (std.meta.fields(AlgorithmOffers)) |field| {
-        if (!isValidNameList(@field(peer.offers, field.name), true)) {
+    inline for (@typeInfo(AlgorithmOffers).@"struct".field_names) |name| {
+        if (!isValidNameList(@field(peer.offers, name), true)) {
             return IoError.AlgorithmNegotiationFailed;
         }
     }
@@ -771,7 +769,7 @@ test "packet sequence hard bound fails before wrapping" {
     var output: [MaxSSHPacket]u8 = undefined;
     try std.testing.expectError(
         IoError.KeyLifetimeExceeded,
-        wrapPayload(&rand, false, &keys, &.{@intFromEnum(MsgId.SSH_MSG_IGNORE)}, &output),
+        wrapPayload(&rand, false, &keys, &.{@backingInt(MsgId.SSH_MSG_IGNORE)}, &output),
     );
     try std.testing.expectEqual(std.math.maxInt(u32), keys.seq);
 }
@@ -797,19 +795,19 @@ test "identification rejects invalid UTF-8 and forbidden comment bytes" {
 
 test "MsgId enum values match SSH RFC" {
     // RFC 4253 transport layer messages
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(MsgId.SSH_MSG_DISCONNECT));
-    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(MsgId.SSH_MSG_IGNORE));
-    try std.testing.expectEqual(@as(u8, 3), @intFromEnum(MsgId.SSH_MSG_UNIMPLEMENTED));
-    try std.testing.expectEqual(@as(u8, 4), @intFromEnum(MsgId.SSH_MSG_DEBUG));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(MsgId.SSH_MSG_DISCONNECT));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(MsgId.SSH_MSG_IGNORE));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(MsgId.SSH_MSG_UNIMPLEMENTED));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(MsgId.SSH_MSG_DEBUG));
 
     // RFC 4254 channel messages
-    try std.testing.expectEqual(@as(u8, 80), @intFromEnum(MsgId.SSH_MSG_GLOBAL_REQUEST));
-    try std.testing.expectEqual(@as(u8, 81), @intFromEnum(MsgId.SSH_MSG_REQUEST_SUCCESS));
-    try std.testing.expectEqual(@as(u8, 82), @intFromEnum(MsgId.SSH_MSG_REQUEST_FAILURE));
-    try std.testing.expectEqual(@as(u8, 90), @intFromEnum(MsgId.SSH_MSG_CHANNEL_OPEN));
-    try std.testing.expectEqual(@as(u8, 94), @intFromEnum(MsgId.SSH_MSG_CHANNEL_DATA));
-    try std.testing.expectEqual(@as(u8, 96), @intFromEnum(MsgId.SSH_MSG_CHANNEL_EOF));
-    try std.testing.expectEqual(@as(u8, 97), @intFromEnum(MsgId.SSH_MSG_CHANNEL_CLOSE));
+    try std.testing.expectEqual(@as(u8, 80), @backingInt(MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try std.testing.expectEqual(@as(u8, 81), @backingInt(MsgId.SSH_MSG_REQUEST_SUCCESS));
+    try std.testing.expectEqual(@as(u8, 82), @backingInt(MsgId.SSH_MSG_REQUEST_FAILURE));
+    try std.testing.expectEqual(@as(u8, 90), @backingInt(MsgId.SSH_MSG_CHANNEL_OPEN));
+    try std.testing.expectEqual(@as(u8, 94), @backingInt(MsgId.SSH_MSG_CHANNEL_DATA));
+    try std.testing.expectEqual(@as(u8, 96), @backingInt(MsgId.SSH_MSG_CHANNEL_EOF));
+    try std.testing.expectEqual(@as(u8, 97), @backingInt(MsgId.SSH_MSG_CHANNEL_CLOSE));
 }
 
 test "MaxPayload is reasonable" {
@@ -914,9 +912,9 @@ test "algorithm negotiation always follows client preference for both roles" {
 }
 
 test "algorithm negotiation fails closed for every required category" {
-    inline for (std.meta.fields(AlgorithmOffers)) |field| {
+    inline for (@typeInfo(AlgorithmOffers).@"struct".field_names) |name| {
         var peer = testKexInit();
-        @field(peer.offers, field.name) = "unsupported-only";
+        @field(peer.offers, name) = "unsupported-only";
         try std.testing.expectError(
             IoError.AlgorithmNegotiationFailed,
             negotiateAlgorithms(peer, .Server, srv_hostkey_algo_name),
@@ -940,9 +938,9 @@ test "algorithm negotiation fails closed for every required category" {
 }
 
 fn writeTestKexInitBody(writer: *BufferWriter, kexinit: KexInit) !void {
-    try writer.writeBytes(&(.{0x5a} ** 16));
-    inline for (std.meta.fields(AlgorithmOffers)) |field| {
-        try writer.writeU32LenString(@field(kexinit.offers, field.name));
+    try writer.writeBytes(&@as([16]u8, @splat(0x5a)));
+    inline for (@typeInfo(AlgorithmOffers).@"struct".field_names) |name| {
+        try writer.writeU32LenString(@field(kexinit.offers, name));
     }
     try writer.writeU32LenString(kexinit.language_c2s);
     try writer.writeU32LenString(kexinit.language_s2c);
@@ -1006,7 +1004,7 @@ fn expectExactBoundCompressedChannelPayload(extended: bool) !void {
 
     var payload_backing: [MaxPayload]u8 = undefined;
     var payload = BufferWriter.init(&payload_backing, 0);
-    try payload.writeU8(@intFromEnum(if (extended) MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA else MsgId.SSH_MSG_CHANNEL_DATA));
+    try payload.writeU8(@backingInt(if (extended) MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA else MsgId.SSH_MSG_CHANNEL_DATA));
     try payload.writeU32(7);
     if (extended) try payload.writeU32(1);
     try payload.writeU32LenString(&logical_data);
@@ -1050,7 +1048,7 @@ test "zlib openssh decompression rejects invalid data" {
 }
 
 fn expectDecompressionBoundary(input_len: usize, output_len: usize, expect_overflow: bool) !void {
-    var input: [65]u8 = .{'A'} ** 65;
+    var input: [65]u8 = @splat('A');
     var compressed: [MaxPayload]u8 = undefined;
     var output: [64]u8 = undefined;
     var compressor = CompressionState{ .algorithm = .ZlibOpenSsh };
@@ -1116,7 +1114,7 @@ test "wrapPayload compresses active zlib openssh payloads" {
 
 test "KeyDataBi.clear zeros all key material" {
     var kd = KeyDataBi.init();
-    try kd.genKeys(.{0x11} ** hash_algo.digest_length, .{0x22} ** kex_algo.shared_length, .{0x33} ** hash_algo.digest_length);
+    try kd.genKeys(@splat(0x11), @splat(0x22), @splat(0x33));
     // fill with non-zero data
     @memset(&kd.c2s.iv, 0xAA);
     @memset(&kd.c2s.key, 0xBB);
@@ -1127,8 +1125,8 @@ test "KeyDataBi.clear zeros all key material" {
 
     kd.clear();
 
-    const zero_iv: [MaxIVLen]u8 = .{0} ** MaxIVLen;
-    const zero_key: [MaxKeyLen]u8 = .{0} ** MaxKeyLen;
+    const zero_iv: [MaxIVLen]u8 = @splat(0);
+    const zero_key: [MaxKeyLen]u8 = @splat(0);
     try std.testing.expectEqualSlices(u8, &zero_iv, &kd.c2s.iv);
     try std.testing.expectEqualSlices(u8, &zero_key, &kd.c2s.key);
     try std.testing.expectEqualSlices(u8, &zero_key, &kd.c2s.mackey);
@@ -1143,9 +1141,9 @@ test "RFC 4253 key derivation known-answer values" {
     var kd = KeyDataBi.init();
     defer kd.clear();
     try kd.genKeys(
-        .{0x11} ** hash_algo.digest_length,
-        .{0x22} ** kex_algo.shared_length,
-        .{0x33} ** hash_algo.digest_length,
+        @splat(0x11),
+        @splat(0x22),
+        @splat(0x33),
     );
 
     try std.testing.expectEqualStrings(
@@ -1176,7 +1174,7 @@ test "RFC 4253 key derivation known-answer values" {
 
 test "RFC 4231 HMAC-SHA-256 known-answer vector" {
     var actual: [mac_algo.mac_length]u8 = undefined;
-    var hmac = mac_algo.init(&(.{0x0b} ** 20));
+    var hmac = mac_algo.init(&@as([20]u8, @splat(0x0b)));
     hmac.update("Hi There");
     hmac.final(&actual);
     try std.testing.expectEqualStrings(
@@ -1229,8 +1227,8 @@ test "encrypted wrap capacity error does not expose plaintext" {
     var rand = prng.random();
     var keys = KeyDataUni{ .seq = 0 };
     defer keys.clear();
-    var iobuf: [AesCtrT.block_size * 2]u8 = .{0xA5} ** (AesCtrT.block_size * 2);
+    var iobuf: [AesCtrT.block_size * 2]u8 = @splat(0xA5);
 
     try std.testing.expectError(IoError.tooBig, wrapPayload(&rand, true, &keys, "secret payload", &iobuf));
-    try std.testing.expectEqualSlices(u8, &(.{0xA5} ** iobuf.len), &iobuf);
+    try std.testing.expectEqualSlices(u8, &@as([iobuf.len]u8, @splat(0xA5)), &iobuf);
 }

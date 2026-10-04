@@ -22,7 +22,13 @@ The authoritative algorithm list and negotiation rules are in the
 
 ## Quick start
 
-sshz requires [Zig 0.16.0](https://ziglang.org/download/).
+sshz requires [Zig 0.17.0](https://ziglang.org/download/).
+
+Zlib remains the same pinned, bundled static library. Its stream bindings are
+generated with the pinned `cataggar/translate-c` 2.0.0 and GitHub Aro mirror.
+Android consumers may still replace the module's single bundled-library link
+and include edge with the NDK/system `z` library; header translation itself
+does not require the NDK. The 0.2.1 channel/authentication contracts are unchanged.
 
 ```sh
 zig build test

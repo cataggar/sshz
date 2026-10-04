@@ -38,8 +38,8 @@ const DirectionDigests = struct {
 const DirectionState = struct {
     direction: Direction,
     seed: u64,
-    sent: [channel_count]u64 = .{0} ** channel_count,
-    received: [channel_count]u64 = .{0} ** channel_count,
+    sent: [channel_count]u64 = @splat(0),
+    received: [channel_count]u64 = @splat(0),
     sent_hashers: [channel_count]std.crypto.hash.sha2.Sha256,
     received_hashers: [channel_count]std.crypto.hash.sha2.Sha256,
     next_channel: usize = 0,
@@ -99,7 +99,7 @@ const DirectionState = struct {
     fn receive(self: *DirectionState, data: []const u8) !void {
         if (data.len < 16 or !std.mem.eql(u8, data[0..4], "MSH1"))
             return error.InvalidStressFrame;
-        if (data[4] != @intFromEnum(self.direction)) return error.WrongDirection;
+        if (data[4] != @backingInt(self.direction)) return error.WrongDirection;
         const channel: usize = data[5];
         if (channel >= channel_count) return error.InvalidStressChannel;
         const offset = readU64(data[8..16]);
@@ -157,7 +157,7 @@ fn mix64(input: u64) u64 {
 }
 
 fn patternByte(seed: u64, direction: Direction, channel: usize, position: u64) u8 {
-    const mixed = mix64(seed ^ (@as(u64, @intFromEnum(direction)) << 56) ^
+    const mixed = mix64(seed ^ (@as(u64, @backingInt(direction)) << 56) ^
         (@as(u64, channel) << 48) ^ position);
     return @truncate(mixed >> 24);
 }
@@ -165,7 +165,7 @@ fn patternByte(seed: u64, direction: Direction, channel: usize, position: u64) u
 fn fillPayload(buf: []u8, seed: u64, direction: Direction, channel: usize, offset: u64) void {
     std.debug.assert(buf.len >= 16);
     @memcpy(buf[0..4], "MSH1");
-    buf[4] = @intFromEnum(direction);
+    buf[4] = @backingInt(direction);
     buf[5] = @intCast(channel);
     buf[6] = 0;
     buf[7] = 0;
@@ -185,15 +185,15 @@ const Pair = struct {
     client_ended: bool = false,
     server_ended: bool = false,
     auth_events: u32 = 0,
-    client_channels: [channel_count]u32 = .{0} ** channel_count,
-    server_channels: [channel_count]u32 = .{0} ** channel_count,
+    client_channels: [channel_count]u32 = @splat(0),
+    server_channels: [channel_count]u32 = @splat(0),
     client_channel_count: usize = 0,
     server_channel_count: usize = 0,
     open_pending: bool = false,
     c2s_transfer: ?*DirectionState = null,
     s2c_transfer: ?*DirectionState = null,
-    client_window_exhausted: [channel_count]bool = .{false} ** channel_count,
-    server_window_exhausted: [channel_count]bool = .{false} ** channel_count,
+    client_window_exhausted: [channel_count]bool = @splat(false),
+    server_window_exhausted: [channel_count]bool = @splat(false),
     window_exhaustions: u64 = 0,
     window_replenishments: u64 = 0,
 
@@ -818,7 +818,7 @@ fn parseSeed(args: []const []const u8) !u64 {
             if (index == args.len) return error.MissingSeed;
             seed = try std.fmt.parseInt(u64, args[index], 0);
         } else if (std.mem.eql(u8, args[index], "--help")) {
-            std.debug.print("usage: zig build stress -Doptimize=ReleaseSafe -- --seed <u64>\n", .{});
+            std.debug.print("usage: zig build stress -Doptimize=safe -- --seed <u64>\n", .{});
             std.process.exit(0);
         } else {
             return error.UnknownArgument;
@@ -831,7 +831,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const seed = parseSeed(args) catch |err| {
         std.debug.print("stress argument error: {s}\n", .{@errorName(err)});
-        std.debug.print("usage: zig build stress -Doptimize=ReleaseSafe -- --seed <u64>\n", .{});
+        std.debug.print("usage: zig build stress -Doptimize=safe -- --seed <u64>\n", .{});
         return err;
     };
     const started = std.Io.Clock.Timestamp.now(init.io, .awake);
@@ -842,7 +842,7 @@ pub fn main(init: std.process.Init) !void {
         .{ transfer_bytes_per_direction, 2 * MiB },
     );
     std.debug.print(
-        "rerun: zig build stress -Doptimize=ReleaseSafe -- --seed {d}\n",
+        "rerun: zig build stress -Doptimize=safe -- --seed {d}\n",
         .{seed},
     );
 
