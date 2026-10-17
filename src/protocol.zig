@@ -1044,9 +1044,12 @@ pub fn negotiateAlgorithmsWithLocalOffers(
     const selected_compression_s2c = selectClientPreferred(client.compression_s2c, server.compression_s2c) orelse
         return IoError.AlgorithmNegotiationFailed;
 
+    // RFC 4253 §7.1: a peer's optimistic first_kex_packet_follows guess is
+    // only valid when server and client share the same preferred (first) KEX
+    // algorithm and the same preferred (first) host key algorithm.
     const peer_guessed_correctly =
-        std.mem.eql(u8, firstName(peer.offers.kex), selected_kex_name) and
-        std.mem.eql(u8, firstName(peer.offers.host_key), selected_host_key);
+        std.mem.eql(u8, firstName(peer.offers.kex), firstName(local.kex)) and
+        std.mem.eql(u8, firstName(peer.offers.host_key), firstName(local.host_key));
 
     return .{
         .kex = selected_kex,
@@ -1762,7 +1765,27 @@ test "algorithm negotiation always follows client preference for both roles" {
     );
     try std.testing.expectEqualStrings("rsa-sha2-256", as_server.host_key);
     try std.testing.expectEqual(CompressionAlgorithm.None, as_server.compression_c2s);
-    try std.testing.expect(!as_server.ignore_next_peer_packet);
+    try std.testing.expect(as_server.ignore_next_peer_packet);
+
+    const as_server_matching_first = try negotiateAlgorithms(
+        client_kexinit,
+        .Server,
+        "rsa-sha2-256,rsa-sha2-512",
+    );
+    try std.testing.expectEqualStrings("rsa-sha2-256", as_server_matching_first.host_key);
+    try std.testing.expect(!as_server_matching_first.ignore_next_peer_packet);
+
+    var dropbear_style_client = testKexInit();
+    dropbear_style_client.offers.kex = "curve25519-sha256,ecdh-sha2-nistp256";
+    dropbear_style_client.offers.host_key = "ssh-ed25519";
+    dropbear_style_client.first_kex_packet_follows = true;
+    const as_server_dropbear_guess = try negotiateAlgorithms(
+        dropbear_style_client,
+        .Server,
+        "ssh-ed25519",
+    );
+    try std.testing.expectEqual(KexAlgorithm.curve25519_sha256, as_server_dropbear_guess.kex);
+    try std.testing.expect(as_server_dropbear_guess.ignore_next_peer_packet);
 }
 
 test "algorithm negotiation fails closed for every required category" {
