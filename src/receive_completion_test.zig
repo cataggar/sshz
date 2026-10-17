@@ -50,7 +50,8 @@ fn Fixture(comptime opening: Open) type {
             session.encrypted = true;
             session.inbound_encrypted = true;
             session.user_authenticated = true;
-            session.session_id = session_id;
+            @memcpy(session.session_id[0..session_id.len], &session_id);
+            session.session_id_len = session_id.len;
             session.session_id_established = true;
             session.setSessionState(.ChannelActive);
             session.setIoSessionState(.ReadPktHdr);

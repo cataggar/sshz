@@ -23,12 +23,23 @@ sshz has no API for broadening these lists at runtime.
 
 | Purpose | SSH name and construction | Role and direction | Current rationale and status |
 | --- | --- | --- | --- |
-| Key exchange | `curve25519-sha256` (X25519 with SHA-256) | Client and server | The only advertised KEX. It provides ephemeral key agreement and a SHA-256 exchange hash. Enforced now. |
+| Key exchange | `mlkem1024nistp384-sha384`, `mlkem768nistp256-sha256`, `mlkem768x25519-sha256` (RFC 10042 post-quantum ML-KEM hybrids), `curve25519-sha256`, `curve25519-sha256@libssh.org` (RFC 8731 X25519), `ecdh-sha2-nistp384`, `ecdh-sha2-nistp256` (RFC 5656 NIST ECDH) | Client and server | Advertised in default preference order. Hybrid ML-KEM methods combine ML-KEM-1024/768 with P-384, P-256, or X25519 and encode `K = HASH(K_PQ \|\| K_CL)` as an SSH `string` per RFC 10042; classical ECDH methods encode `K` as an SSH `mpint`. Each family can be individually enabled or disabled at compile time. Enforced now. |
 | Server host-key signature | `ssh-mldsa87-p384`, `ssh-mldsa44-ed25519`, `ssh-ed25519`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp256`, `rsa-sha2-512`, `rsa-sha2-256` | The client advertises this order (filtered by compile-time enabled signature algorithms). The server advertises only enabled algorithms usable with its single loaded host key. | Post-quantum composite ML-DSA signatures (`draft-ietf-sshm-composite-sigs-00`), Ed25519, and ECDSA P-384/P-256 provide modern signatures. RSA is retained for compatibility, but only with SHA-2. Signature verification, key-family matching, client-ordered selection, and RSA size bounds are enforced now. |
-| Encryption | `aes256-ctr` | Independently named for client-to-server (c2s) and server-to-client (s2c), but it is the only choice in both directions | A widely interoperable 256-bit cipher. Enforced now. The current construction is the original SSH encrypt-and-MAC construction, not AEAD or encrypt-then-MAC; its production suitability still requires review. |
-| MAC | `hmac-sha2-256` | Independently negotiated c2s and s2c; the full 32-byte MAC is used | SHA-256 HMAC over the packet sequence number and plaintext packet. Enforced now, including timing-safe comparison of equal-sized MACs. |
+| Encryption | `aes256-gcm@openssh.com`, `chacha20-poly1305@openssh.com`, `aes128-gcm@openssh.com` (AEAD), `aes256-ctr`, `aes192-ctr`, `aes128-ctr` (AES-CTR) | Independently negotiated for client-to-server (c2s) and server-to-client (s2c) | AEAD ciphers (`aes256-gcm@openssh.com`, `chacha20-poly1305@openssh.com`, `aes128-gcm@openssh.com`) are preferred ahead of AES-CTR (`aes256-ctr`, `aes192-ctr`, `aes128-ctr`). When an AEAD cipher is selected for a direction, the MAC name-list for that direction is ignored. Enforced now. |
+| MAC | `hmac-sha2-512-etm@openssh.com`, `hmac-sha2-256-etm@openssh.com` (Encrypt-then-MAC), `hmac-sha2-512`, `hmac-sha2-256` (Encrypt-and-MAC) | Independently negotiated c2s and s2c when the direction's cipher is non-AEAD | Encrypt-then-MAC (`-etm@openssh.com`) is preferred ahead of Encrypt-and-MAC, leaves the 4-byte packet length unencrypted, and verifies the full-length HMAC over `seq \|\| packet_length \|\| ciphertext` before decrypting. Enforced now, including timing-safe comparison. |
 | Compression | `zlib@openssh.com`, then `none` | Independently negotiated c2s and s2c using client preference | Only delayed zlib and no compression are allowed. Delayed zlib is activated after `SSH_MSG_USERAUTH_SUCCESS`; authentication traffic is not compressed. Enforced now, subject to the compression policy below. |
-| Key derivation | RFC 4253 SHA-256 derivation | Separate IV, encryption key, and MAC key for c2s and s2c | Uses the exchange hash, shared secret, the letters A through F, and the initial session identifier. Enforced now. |
+| Key derivation | RFC 4253 §7.2 SHA-256 or SHA-384 derivation (matching negotiated KEX hash) with multi-block expansion | Separate IV, encryption key, and MAC key for c2s and s2c | Uses the exchange hash `H`, shared secret `K` (`string` for RFC 10042 ML-KEM hybrids, `mpint` for classical ECDH), letters A through F, the initial session identifier, and `K_1 \|\| K_2 ...` multi-block expansion for 64-byte keys. Enforced now. |
+
+### Compile-time algorithm build options
+
+All 23 transport and signature algorithm families are enabled by default under `-Dsecure-algorithms=true`. Consumers can disable the default set with `-Dsecure-algorithms=false` and selectively enable individual algorithms at compile time (for example, to enforce a strict CNSA 2.0 / NIST profile):
+
+- **KEX options:** `-Dmlkem1024nistp384-sha384`, `-Dmlkem768nistp256-sha256`, `-Dmlkem768x25519-sha256`, `-Dcurve25519-sha256` (also gates `curve25519-sha256@libssh.org`), `-Decdh-sha2-nistp384`, `-Decdh-sha2-nistp256`
+- **Cipher options:** `-Daes256-gcm`, `-Dchacha20-poly1305`, `-Daes128-gcm`, `-Daes256-ctr`, `-Daes192-ctr`, `-Daes128-ctr`
+- **MAC options:** `-Dhmac-sha2-512-etm`, `-Dhmac-sha2-256-etm`, `-Dhmac-sha2-512`, `-Dhmac-sha2-256`
+- **Signature options:** `-Dssh-mldsa87-p384`, `-Dssh-mldsa44-ed25519`, `-Decdsa-sha2-nistp384`, `-Dssh-ed25519`, `-Decdsa-sha2-nistp256`, `-Drsa-sha2-512`, `-Drsa-sha2-256`
+
+`src/protocol.zig` and `src/key.zig` enforce at `comptime` that at least one KEX algorithm is enabled, at least one signature algorithm is enabled, at least one cipher algorithm is enabled, and either at least one MAC algorithm or at least one AEAD cipher is enabled. Disabled algorithms are omitted from `SSH_MSG_KEXINIT` offers at `comptime` and rejected during negotiation.
 
 The client host-key preference is:
 
@@ -161,12 +172,10 @@ policy forbids:
 - MD5, SHA-1, truncated, or `none` MACs; and
 - immediate `zlib` compression.
 
-Algorithms that may be sound but are not implemented, including other
-Curve25519 aliases, finite-field KEX, other NIST curves, security-key
-signatures, AES-GCM, ChaCha20-Poly1305, and encrypt-then-MAC names, are
-unsupported rather than implicitly approved. Adding one requires the review
-process below; accepting its name before implementing its exact construction
-is forbidden.
+Algorithms that may be sound but are not implemented, including finite-field
+KEX, `nistp521`, and security-key signatures, are unsupported rather than
+implicitly approved. Adding one requires the review process below; accepting
+its name before implementing its exact construction is forbidden.
 
 ## Compression policy
 

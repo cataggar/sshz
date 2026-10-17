@@ -69,7 +69,23 @@ fn addTraceLevel(options: *std.Build.Step.Options, level: TraceLevel) void {
     options.addOption([]const u8, "trace_level", @tagName(level));
 }
 
-const SignatureAlgorithmOptions = struct {
+pub const AlgorithmOptions = struct {
+    kex_mlkem1024nistp384_sha384: bool = true,
+    kex_mlkem768nistp256_sha256: bool = true,
+    kex_mlkem768x25519_sha256: bool = true,
+    kex_curve25519_sha256: bool = true,
+    kex_ecdh_sha2_nistp384: bool = true,
+    kex_ecdh_sha2_nistp256: bool = true,
+    cipher_aes256_gcm: bool = true,
+    cipher_chacha20_poly1305: bool = true,
+    cipher_aes128_gcm: bool = true,
+    cipher_aes256_ctr: bool = true,
+    cipher_aes192_ctr: bool = true,
+    cipher_aes128_ctr: bool = true,
+    mac_hmac_sha2_512_etm: bool = true,
+    mac_hmac_sha2_256_etm: bool = true,
+    mac_hmac_sha2_512: bool = true,
+    mac_hmac_sha2_256: bool = true,
     sig_ssh_mldsa87_p384: bool = true,
     sig_ssh_mldsa44_ed25519: bool = true,
     sig_ecdsa_sha2_nistp384: bool = true,
@@ -79,25 +95,43 @@ const SignatureAlgorithmOptions = struct {
     sig_rsa_sha2_256: bool = true,
 };
 
+fn addAlgorithmOptions(options: *std.Build.Step.Options, alg: AlgorithmOptions) void {
+    options.addOption(bool, "kex_mlkem1024nistp384_sha384", alg.kex_mlkem1024nistp384_sha384);
+    options.addOption(bool, "kex_mlkem768nistp256_sha256", alg.kex_mlkem768nistp256_sha256);
+    options.addOption(bool, "kex_mlkem768x25519_sha256", alg.kex_mlkem768x25519_sha256);
+    options.addOption(bool, "kex_curve25519_sha256", alg.kex_curve25519_sha256);
+    options.addOption(bool, "kex_ecdh_sha2_nistp384", alg.kex_ecdh_sha2_nistp384);
+    options.addOption(bool, "kex_ecdh_sha2_nistp256", alg.kex_ecdh_sha2_nistp256);
+    options.addOption(bool, "cipher_aes256_gcm", alg.cipher_aes256_gcm);
+    options.addOption(bool, "cipher_chacha20_poly1305", alg.cipher_chacha20_poly1305);
+    options.addOption(bool, "cipher_aes128_gcm", alg.cipher_aes128_gcm);
+    options.addOption(bool, "cipher_aes256_ctr", alg.cipher_aes256_ctr);
+    options.addOption(bool, "cipher_aes192_ctr", alg.cipher_aes192_ctr);
+    options.addOption(bool, "cipher_aes128_ctr", alg.cipher_aes128_ctr);
+    options.addOption(bool, "mac_hmac_sha2_512_etm", alg.mac_hmac_sha2_512_etm);
+    options.addOption(bool, "mac_hmac_sha2_256_etm", alg.mac_hmac_sha2_256_etm);
+    options.addOption(bool, "mac_hmac_sha2_512", alg.mac_hmac_sha2_512);
+    options.addOption(bool, "mac_hmac_sha2_256", alg.mac_hmac_sha2_256);
+    options.addOption(bool, "sig_ssh_mldsa87_p384", alg.sig_ssh_mldsa87_p384);
+    options.addOption(bool, "sig_ssh_mldsa44_ed25519", alg.sig_ssh_mldsa44_ed25519);
+    options.addOption(bool, "sig_ecdsa_sha2_nistp384", alg.sig_ecdsa_sha2_nistp384);
+    options.addOption(bool, "sig_ssh_ed25519", alg.sig_ssh_ed25519);
+    options.addOption(bool, "sig_ecdsa_sha2_nistp256", alg.sig_ecdsa_sha2_nistp256);
+    options.addOption(bool, "sig_rsa_sha2_512", alg.sig_rsa_sha2_512);
+    options.addOption(bool, "sig_rsa_sha2_256", alg.sig_rsa_sha2_256);
+}
+
 fn addSshzOptions(
     options: *std.Build.Step.Options,
     unsafe_secret_tracing: bool,
     trace_level: TraceLevel,
     channel_capacity: u8,
     version: []const u8,
-    sig_options: SignatureAlgorithmOptions,
 ) void {
     options.addOption(bool, "unsafe_secret_tracing", unsafe_secret_tracing);
     addTraceLevel(options, trace_level);
     options.addOption(u8, "channel_capacity", channel_capacity);
     options.addOption([]const u8, "version", version);
-    options.addOption(bool, "sig_ssh_mldsa87_p384", sig_options.sig_ssh_mldsa87_p384);
-    options.addOption(bool, "sig_ssh_mldsa44_ed25519", sig_options.sig_ssh_mldsa44_ed25519);
-    options.addOption(bool, "sig_ecdsa_sha2_nistp384", sig_options.sig_ecdsa_sha2_nistp384);
-    options.addOption(bool, "sig_ssh_ed25519", sig_options.sig_ssh_ed25519);
-    options.addOption(bool, "sig_ecdsa_sha2_nistp256", sig_options.sig_ecdsa_sha2_nistp256);
-    options.addOption(bool, "sig_rsa_sha2_512", sig_options.sig_rsa_sha2_512);
-    options.addOption(bool, "sig_rsa_sha2_256", sig_options.sig_rsa_sha2_256);
 }
 
 pub fn build(b: *std.Build) void {
@@ -130,47 +164,36 @@ pub fn build(b: *std.Build) void {
     const secure_algorithms = b.option(
         bool,
         "secure-algorithms",
-        "Enable default secure signature algorithms unless overridden individually (default: true)",
+        "Enable the default suite of modern SSH algorithms (default: true). Set false to select individual algorithms.",
     ) orelse true;
-    const sig_options: SignatureAlgorithmOptions = .{
-        .sig_ssh_mldsa87_p384 = b.option(
-            bool,
-            "ssh-mldsa87-p384",
-            "Enable the ssh-mldsa87-p384 composite signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
-        .sig_ssh_mldsa44_ed25519 = b.option(
-            bool,
-            "ssh-mldsa44-ed25519",
-            "Enable the ssh-mldsa44-ed25519 composite signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
-        .sig_ecdsa_sha2_nistp384 = b.option(
-            bool,
-            "ecdsa-sha2-nistp384",
-            "Enable the ecdsa-sha2-nistp384 signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
-        .sig_ssh_ed25519 = b.option(
-            bool,
-            "ssh-ed25519",
-            "Enable the ssh-ed25519 signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
-        .sig_ecdsa_sha2_nistp256 = b.option(
-            bool,
-            "ecdsa-sha2-nistp256",
-            "Enable the ecdsa-sha2-nistp256 signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
-        .sig_rsa_sha2_512 = b.option(
-            bool,
-            "rsa-sha2-512",
-            "Enable the rsa-sha2-512 signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
-        .sig_rsa_sha2_256 = b.option(
-            bool,
-            "rsa-sha2-256",
-            "Enable the rsa-sha2-256 signature algorithm (default: -Dsecure-algorithms)",
-        ) orelse secure_algorithms,
+    const alg_options = AlgorithmOptions{
+        .kex_mlkem1024nistp384_sha384 = b.option(bool, "mlkem1024nistp384-sha384", "Enable mlkem1024nistp384-sha384 KEX") orelse secure_algorithms,
+        .kex_mlkem768nistp256_sha256 = b.option(bool, "mlkem768nistp256-sha256", "Enable mlkem768nistp256-sha256 KEX") orelse secure_algorithms,
+        .kex_mlkem768x25519_sha256 = b.option(bool, "mlkem768x25519-sha256", "Enable mlkem768x25519-sha256 KEX") orelse secure_algorithms,
+        .kex_curve25519_sha256 = b.option(bool, "curve25519-sha256", "Enable curve25519-sha256 and curve25519-sha256@libssh.org KEX") orelse secure_algorithms,
+        .kex_ecdh_sha2_nistp384 = b.option(bool, "ecdh-sha2-nistp384", "Enable ecdh-sha2-nistp384 KEX") orelse secure_algorithms,
+        .kex_ecdh_sha2_nistp256 = b.option(bool, "ecdh-sha2-nistp256", "Enable ecdh-sha2-nistp256 KEX") orelse secure_algorithms,
+        .cipher_aes256_gcm = b.option(bool, "aes256-gcm", "Enable aes256-gcm@openssh.com cipher") orelse secure_algorithms,
+        .cipher_chacha20_poly1305 = b.option(bool, "chacha20-poly1305", "Enable chacha20-poly1305@openssh.com cipher") orelse secure_algorithms,
+        .cipher_aes128_gcm = b.option(bool, "aes128-gcm", "Enable aes128-gcm@openssh.com cipher") orelse secure_algorithms,
+        .cipher_aes256_ctr = b.option(bool, "aes256-ctr", "Enable aes256-ctr cipher") orelse secure_algorithms,
+        .cipher_aes192_ctr = b.option(bool, "aes192-ctr", "Enable aes192-ctr cipher") orelse secure_algorithms,
+        .cipher_aes128_ctr = b.option(bool, "aes128-ctr", "Enable aes128-ctr cipher") orelse secure_algorithms,
+        .mac_hmac_sha2_512_etm = b.option(bool, "hmac-sha2-512-etm", "Enable hmac-sha2-512-etm@openssh.com MAC") orelse secure_algorithms,
+        .mac_hmac_sha2_256_etm = b.option(bool, "hmac-sha2-256-etm", "Enable hmac-sha2-256-etm@openssh.com MAC") orelse secure_algorithms,
+        .mac_hmac_sha2_512 = b.option(bool, "hmac-sha2-512", "Enable hmac-sha2-512 MAC") orelse secure_algorithms,
+        .mac_hmac_sha2_256 = b.option(bool, "hmac-sha2-256", "Enable hmac-sha2-256 MAC") orelse secure_algorithms,
+        .sig_ssh_mldsa87_p384 = b.option(bool, "ssh-mldsa87-p384", "Enable the ssh-mldsa87-p384 composite signature algorithm") orelse secure_algorithms,
+        .sig_ssh_mldsa44_ed25519 = b.option(bool, "ssh-mldsa44-ed25519", "Enable the ssh-mldsa44-ed25519 composite signature algorithm") orelse secure_algorithms,
+        .sig_ecdsa_sha2_nistp384 = b.option(bool, "ecdsa-sha2-nistp384", "Enable the ecdsa-sha2-nistp384 signature algorithm") orelse secure_algorithms,
+        .sig_ssh_ed25519 = b.option(bool, "ssh-ed25519", "Enable the ssh-ed25519 signature algorithm") orelse secure_algorithms,
+        .sig_ecdsa_sha2_nistp256 = b.option(bool, "ecdsa-sha2-nistp256", "Enable the ecdsa-sha2-nistp256 signature algorithm") orelse secure_algorithms,
+        .sig_rsa_sha2_512 = b.option(bool, "rsa-sha2-512", "Enable the rsa-sha2-512 signature algorithm") orelse secure_algorithms,
+        .sig_rsa_sha2_256 = b.option(bool, "rsa-sha2-256", "Enable the rsa-sha2-256 signature algorithm") orelse secure_algorithms,
     };
     const options = b.addOptions();
-    addSshzOptions(options, unsafe_secret_tracing, trace_level, channel_capacity, version, sig_options);
+    addSshzOptions(options, unsafe_secret_tracing, trace_level, channel_capacity, version);
+    addAlgorithmOptions(options, alg_options);
 
     const mod = b.addModule("sshz", .{
         .root_source_file = b.path("src/sshz.zig"),
@@ -197,7 +220,8 @@ pub fn build(b: *std.Build) void {
     const run_lib_tests = b.addRunArtifact(lib_tests);
 
     const safe_trace_options = b.addOptions();
-    addSshzOptions(safe_trace_options, false, trace_level, channel_capacity, version, sig_options);
+    addSshzOptions(safe_trace_options, false, trace_level, channel_capacity, version);
+    addAlgorithmOptions(safe_trace_options, alg_options);
     const safe_trace_test_mod = b.createModule(.{
         .root_source_file = b.path("src/trace_gate_test.zig"),
         .target = target,
@@ -214,7 +238,8 @@ pub fn build(b: *std.Build) void {
     // was given, so `zig build test -Dtrace=info` does not silently excuse
     // the default from staying quiet.
     const default_trace_options = b.addOptions();
-    addSshzOptions(default_trace_options, false, default_trace_level, default_channel_capacity, version, .{});
+    addSshzOptions(default_trace_options, false, default_trace_level, default_channel_capacity, version);
+    addAlgorithmOptions(default_trace_options, .{});
     const trace_off_test_mod = b.createModule(.{
         .root_source_file = b.path("src/trace_off_test.zig"),
         .target = target,
@@ -228,7 +253,8 @@ pub fn build(b: *std.Build) void {
     const run_trace_off_tests = b.addRunArtifact(trace_off_tests);
 
     const configured_capacity_options = b.addOptions();
-    addSshzOptions(configured_capacity_options, false, default_trace_level, 8, version, .{});
+    addSshzOptions(configured_capacity_options, false, default_trace_level, 8, version);
+    addAlgorithmOptions(configured_capacity_options, .{});
     const configured_capacity_test_mod = b.createModule(.{
         .root_source_file = b.path("src/test.zig"),
         .target = target,
@@ -244,7 +270,8 @@ pub fn build(b: *std.Build) void {
     const run_configured_capacity_tests = b.addRunArtifact(configured_capacity_tests);
 
     const restricted_sig_options = b.addOptions();
-    addSshzOptions(restricted_sig_options, false, default_trace_level, default_channel_capacity, version, .{
+    addSshzOptions(restricted_sig_options, false, default_trace_level, default_channel_capacity, version);
+    addAlgorithmOptions(restricted_sig_options, .{
         .sig_ssh_mldsa87_p384 = true,
         .sig_ssh_mldsa44_ed25519 = false,
         .sig_ecdsa_sha2_nistp384 = true,
@@ -267,12 +294,54 @@ pub fn build(b: *std.Build) void {
     });
     const run_restricted_sig_tests = b.addRunArtifact(restricted_sig_tests);
 
+    const restricted_algorithm_options = b.addOptions();
+    addSshzOptions(restricted_algorithm_options, false, default_trace_level, default_channel_capacity, version);
+    addAlgorithmOptions(restricted_algorithm_options, .{
+        .kex_mlkem1024nistp384_sha384 = true,
+        .kex_mlkem768nistp256_sha256 = true,
+        .kex_mlkem768x25519_sha256 = false,
+        .kex_curve25519_sha256 = false,
+        .kex_ecdh_sha2_nistp384 = true,
+        .kex_ecdh_sha2_nistp256 = false,
+        .cipher_aes256_gcm = true,
+        .cipher_chacha20_poly1305 = false,
+        .cipher_aes128_gcm = false,
+        .cipher_aes256_ctr = true,
+        .cipher_aes192_ctr = false,
+        .cipher_aes128_ctr = false,
+        .mac_hmac_sha2_512_etm = true,
+        .mac_hmac_sha2_256_etm = false,
+        .mac_hmac_sha2_512 = false,
+        .mac_hmac_sha2_256 = false,
+        .sig_ssh_mldsa87_p384 = true,
+        .sig_ssh_mldsa44_ed25519 = false,
+        .sig_ecdsa_sha2_nistp384 = true,
+        .sig_ssh_ed25519 = false,
+        .sig_ecdsa_sha2_nistp256 = false,
+        .sig_rsa_sha2_512 = false,
+        .sig_rsa_sha2_256 = false,
+    });
+    const restricted_algorithm_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/restricted_algorithms_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    restricted_algorithm_test_mod.addOptions("sshz_build_options", restricted_algorithm_options);
+    linkZlib(b, restricted_algorithm_test_mod);
+    const restricted_algorithm_tests = b.addTest(.{
+        .root_module = restricted_algorithm_test_mod,
+        .filters = &.{"restricted CNSA/NIST algorithm build"},
+    });
+    const run_restricted_algorithm_tests = b.addRunArtifact(restricted_algorithm_tests);
+
     const test_step = b.step("test", "Run library tests");
     test_step.dependOn(&run_lib_tests.step);
     test_step.dependOn(&run_safe_trace_tests.step);
     test_step.dependOn(&run_trace_off_tests.step);
     test_step.dependOn(&run_configured_capacity_tests.step);
     test_step.dependOn(&run_restricted_sig_tests.step);
+    test_step.dependOn(&run_restricted_algorithm_tests.step);
 
     const production_client_mod = b.createModule(.{
         .root_source_file = b.path("examples/production/client.zig"),

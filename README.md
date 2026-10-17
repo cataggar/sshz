@@ -7,6 +7,9 @@ ordered byte stream.
 ## Features
 
 - Client and server APIs with no internal transport I/O
+- Post-quantum ML-KEM hybrid KEX (`mlkem1024nistp384-sha384`, `mlkem768nistp256-sha256`, `mlkem768x25519-sha256`), Curve25519 (`curve25519-sha256`, `curve25519-sha256@libssh.org`), and NIST ECDH (`ecdh-sha2-nistp384`, `ecdh-sha2-nistp256`)
+- AEAD (`aes256-gcm@openssh.com`, `chacha20-poly1305@openssh.com`, `aes128-gcm@openssh.com`) and AES-CTR (`aes256-ctr`, `aes192-ctr`, `aes128-ctr`) ciphers with Encrypt-then-MAC (`hmac-sha2-512-etm@openssh.com`, `hmac-sha2-256-etm@openssh.com`) and Encrypt-and-MAC (`hmac-sha2-512`, `hmac-sha2-256`)
+- Per-algorithm compile-time build options (`-Dsecure-algorithms=false` plus individual `-D<alg>=true` flags for custom CNSA/NIST/minimal profiles)
 - Client keyboard-interactive plus client/server public-key, password, and none authentication
 - Post-quantum composite ML-DSA (`ssh-mldsa87-p384`, `ssh-mldsa44-ed25519`), Ed25519, ECDSA (`nistp384`, `nistp256`), and RSA SHA-2 host keys and user-authentication signatures, with per-algorithm compile-time `-D` build flags
 - Multiple channels, sessions, port forwarding, and agent forwarding
