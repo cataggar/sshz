@@ -578,4 +578,220 @@ else
     log "skipping libssh lane; set SSHZ_INTEROP_ENABLE_LIBSSH=1 to run it or SSHZ_INTEROP_REQUIRE_LIBSSH=1 to require it"
 fi
 
+if [[ "${SSHZ_INTEROP_ENABLE_RUSSH:-}" == "1" || "${SSHZ_INTEROP_REQUIRE_RUSSH:-}" == "1" ]]; then
+    RUSSH_DIR="${SSHZ_INTEROP_RUSSH_DIR:-$ROOT/../russh}"
+    if [[ ! -f "$RUSSH_DIR/russh/Cargo.toml" ]] || ! command -v cargo >/dev/null 2>&1; then
+        if [[ "${SSHZ_INTEROP_REQUIRE_RUSSH:-}" == "1" ]]; then
+            fail "required russh lane needs cargo and russh checkout at $RUSSH_DIR"
+        fi
+        log "skipping russh lane; cargo or $RUSSH_DIR/russh/Cargo.toml is unavailable"
+    else
+        RUSSH_DIR="$(cd "$RUSSH_DIR" && pwd)"
+        RUSSH_PROBE_DIR="$RUNTIME_DIR/russh_probe"
+        RUSSH_KEYS_DIR="$PRIVATE_DIR/russh_keys"
+        mkdir -p "$RUSSH_PROBE_DIR/src" "$RUSSH_KEYS_DIR"
+        chmod 700 "$RUSSH_KEYS_DIR"
+
+        cat >"$RUSSH_PROBE_DIR/Cargo.toml" <<EOF
+[package]
+name = "russh_probe"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+russh = { path = "$RUSSH_DIR/russh" }
+tokio = { version = "1.17.0", features = ["full"] }
+EOF
+        if [[ -f "$RUSSH_DIR/Cargo.lock" ]]; then
+            cp "$RUSSH_DIR/Cargo.lock" "$RUSSH_PROBE_DIR/Cargo.lock"
+        fi
+        cp "$ROOT/interop/russh_probe.rs" "$RUSSH_PROBE_DIR/src/main.rs"
+
+        log "building russh interop probe against $RUSSH_DIR"
+        CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK/russh-target}" \
+            cargo build --manifest-path "$RUSSH_PROBE_DIR/Cargo.toml" \
+            >"$LOG_DIR/russh-build.out" 2>"$LOG_DIR/russh-build.err" || {
+            sed -n '1,160p' "$LOG_DIR/russh-build.err" >&2 || true
+            fail "russh_probe build failed"
+        }
+        RUSSH_PROBE_BIN="${CARGO_TARGET_DIR:-$WORK/russh-target}/debug/russh_probe"
+        [[ -x "$RUSSH_PROBE_BIN" ]] || fail "missing built russh_probe binary"
+
+        log "generating OpenSSH keys with russh (including ssh-mldsa87-p384 and ecdsa-sha2-nistp384)"
+        "$RUSSH_PROBE_BIN" keygen "$RUSSH_KEYS_DIR" \
+            >"$LOG_DIR/russh-keygen.out" 2>"$LOG_DIR/russh-keygen.err"
+        chmod 600 "$RUSSH_KEYS_DIR"/id_* "$RUSSH_KEYS_DIR/authorized_keys"
+
+        run_russh_client_case() {
+            local case_name="$1"
+            local port="$2"
+            local client_key="$3"
+            local host_pubkey="$4"
+            local kex="$5"
+            local sig_alg="$6"
+            local cipher="$7"
+            local mac="$8"
+            local payload="sshz-russh-c2s:${case_name}:0123456789abcdef"
+
+            if ! run_capture "$TIMEOUT" "$LOG_DIR/russh-c2s-${case_name}.out" "$LOG_DIR/russh-c2s-${case_name}.err" \
+                "$RUSSH_PROBE_BIN" client "$HOST" "$port" "interop" \
+                "$client_key" "$host_pubkey" "$kex" "$sig_alg" "$cipher" "$mac" "$payload"
+            then
+                sed -n '1,160p' "$LOG_DIR/russh-c2s-${case_name}.err" >&2 || true
+                fail "russh client -> sshzd failed for case $case_name"
+            fi
+            assert_contains "$LOG_DIR/russh-c2s-${case_name}.out" "You said '$payload"
+            assert_contains "$LOG_DIR/russh-c2s-${case_name}.out" \
+                "negotiated kex=$kex sig=$sig_alg cipher=$cipher mac=$mac"
+        }
+
+        run_sshz_to_russh_server_case() {
+            local case_name="$1"
+            local key_stem="$2"
+            local kex="$3"
+            local sig_alg="$4"
+            local cipher="$5"
+            local mac="$6"
+            local port
+            port="$(pick_port)"
+            local host_key="$RUSSH_KEYS_DIR/$key_stem"
+            local known_hosts_file="$RUNTIME_DIR/russh-known_hosts-${case_name}"
+            local payload="sshz-russh-s2c:${case_name}:fedcba9876543210"
+
+            "$RUSSH_PROBE_BIN" server "$port" "$host_key" "$RUSSH_KEYS_DIR/authorized_keys" \
+                "$kex" "$sig_alg" "$cipher" "$mac" \
+                >"$LOG_DIR/russh-srv-${case_name}.out" 2>"$LOG_DIR/russh-srv-${case_name}.err" &
+            local srv_pid=$!
+            PIDS+=("$srv_pid")
+            wait_for_log "$srv_pid" "$LOG_DIR/russh-srv-${case_name}.err" "russh server listening on port $port"
+
+            if ! run_sshz_command "$TIMEOUT" "$LOG_DIR/sshz-russh-${case_name}.out" "$LOG_DIR/sshz-russh-${case_name}.err" \
+                "$payload" \
+                "$SSHZ_BIN" "interop@$HOST" "$port" \
+                --accept-new --known-hosts "$known_hosts_file" "$host_key"
+            then
+                sed -n '1,160p' "$LOG_DIR/sshz-russh-${case_name}.err" >&2 || true
+                sed -n '1,160p' "$LOG_DIR/russh-srv-${case_name}.err" >&2 || true
+                fail "sshz -> russh server failed for case $case_name"
+            fi
+            assert_contains "$LOG_DIR/sshz-russh-${case_name}.out" "russh-server-echo:$payload"
+            assert_contains "$LOG_DIR/sshz-russh-${case_name}.err" "Connected!"
+
+            if ! run_sshz_command "$TIMEOUT" "$LOG_DIR/sshz-russh-${case_name}-strict.out" "$LOG_DIR/sshz-russh-${case_name}-strict.err" \
+                "${payload}:strict" \
+                "$SSHZ_BIN" "interop@$HOST" "$port" \
+                --known-hosts "$known_hosts_file" "$host_key"
+            then
+                sed -n '1,160p' "$LOG_DIR/sshz-russh-${case_name}-strict.err" >&2 || true
+                sed -n '1,160p' "$LOG_DIR/russh-srv-${case_name}.err" >&2 || true
+                fail "sshz -> russh server strict known_hosts failed for case $case_name"
+            fi
+            assert_contains "$LOG_DIR/sshz-russh-${case_name}-strict.out" "russh-server-echo:${payload}:strict"
+            assert_contains "$LOG_DIR/sshz-russh-${case_name}-strict.err" "Connected!"
+
+            kill "$srv_pid" 2>/dev/null || true
+            wait "$srv_pid" 2>/dev/null || true
+        }
+
+        log "starting sshzd with russh-generated ssh-mldsa87-p384 host key and authorized_keys"
+        RUSSH_MLDSA_PORT="$(pick_port)"
+        "$SSHZD_BIN" "$RUSSH_MLDSA_PORT" "$RUSSH_KEYS_DIR/id_mldsa87_p384" \
+            --authorized-keys "$RUSSH_KEYS_DIR/authorized_keys" \
+            >"$LOG_DIR/sshzd-mldsa.out" 2>"$LOG_DIR/sshzd-mldsa.err" &
+        SSHZD_MLDSA_PID=$!
+        PIDS+=("$SSHZD_MLDSA_PID")
+        wait_for_log "$SSHZD_MLDSA_PID" "$LOG_DIR/sshzd-mldsa.err" "Server listening on port $RUSSH_MLDSA_PORT"
+
+        log "testing russh client -> sshzd across PQ/classical KEX, ciphers, and MACs with ssh-mldsa87-p384"
+        for kex_alg in \
+            mlkem1024nistp384-sha384 \
+            mlkem768nistp256-sha256 \
+            mlkem768x25519-sha256 \
+            curve25519-sha256 \
+            curve25519-sha256@libssh.org \
+            ecdh-sha2-nistp384 \
+            ecdh-sha2-nistp256; do
+            run_russh_client_case "kex-${kex_alg//@/-}" "$RUSSH_MLDSA_PORT" \
+                "$RUSSH_KEYS_DIR/id_mldsa87_p384" "$RUSSH_KEYS_DIR/id_mldsa87_p384.pub" \
+                "$kex_alg" "ssh-mldsa87-p384" "aes256-gcm@openssh.com" "hmac-sha2-512-etm@openssh.com"
+        done
+
+        for cipher_alg in \
+            aes256-gcm@openssh.com \
+            chacha20-poly1305@openssh.com \
+            aes128-gcm@openssh.com \
+            aes256-ctr \
+            aes192-ctr \
+            aes128-ctr; do
+            for mac_alg in \
+                hmac-sha2-512-etm@openssh.com \
+                hmac-sha2-256-etm@openssh.com \
+                hmac-sha2-512 \
+                hmac-sha2-256; do
+                if [[ "$cipher_alg" == *@openssh.com && "$mac_alg" != "hmac-sha2-512-etm@openssh.com" ]]; then
+                    continue
+                fi
+                run_russh_client_case "cipher-${cipher_alg//@/-}-${mac_alg//@/-}" "$RUSSH_MLDSA_PORT" \
+                    "$RUSSH_KEYS_DIR/id_mldsa87_p384" "$RUSSH_KEYS_DIR/id_mldsa87_p384.pub" \
+                    "mlkem1024nistp384-sha384" "ssh-mldsa87-p384" "$cipher_alg" "$mac_alg"
+            done
+        done
+
+        log "testing russh client -> sshzd across all host key and userauth key algorithms"
+        for spec in \
+            "id_ed25519:ssh-ed25519" \
+            "id_ecdsa_p384:ecdsa-sha2-nistp384" \
+            "id_ecdsa_p256:ecdsa-sha2-nistp256" \
+            "id_rsa:rsa-sha2-512" \
+            "id_rsa:rsa-sha2-256"; do
+            key_stem="${spec%%:*}"
+            sig_alg="${spec##*:}"
+            key_port="$(pick_port)"
+            "$SSHZD_BIN" "$key_port" "$RUSSH_KEYS_DIR/$key_stem" \
+                --authorized-keys "$RUSSH_KEYS_DIR/authorized_keys" \
+                >"$LOG_DIR/sshzd-${sig_alg}.out" 2>"$LOG_DIR/sshzd-${sig_alg}.err" &
+            key_pid=$!
+            PIDS+=("$key_pid")
+            wait_for_log "$key_pid" "$LOG_DIR/sshzd-${sig_alg}.err" "Server listening on port $key_port"
+
+            run_russh_client_case "sig-${sig_alg}" "$key_port" \
+                "$RUSSH_KEYS_DIR/$key_stem" "$RUSSH_KEYS_DIR/${key_stem}.pub" \
+                "mlkem768x25519-sha256" "$sig_alg" "chacha20-poly1305@openssh.com" "hmac-sha2-256-etm@openssh.com"
+
+            kill "$key_pid" 2>/dev/null || true
+            wait "$key_pid" 2>/dev/null || true
+        done
+
+        log "testing sshz client -> russh server across PQ/classical KEX, signatures, ciphers, and MACs"
+        for kex_alg in \
+            mlkem1024nistp384-sha384 \
+            mlkem768nistp256-sha256 \
+            mlkem768x25519-sha256 \
+            curve25519-sha256 \
+            curve25519-sha256@libssh.org \
+            ecdh-sha2-nistp384 \
+            ecdh-sha2-nistp256; do
+            run_sshz_to_russh_server_case "kex-${kex_alg//@/-}" \
+                "id_mldsa87_p384" "$kex_alg" "ssh-mldsa87-p384" \
+                "aes256-gcm@openssh.com" "hmac-sha2-512-etm@openssh.com"
+        done
+
+        for spec in \
+            "id_ed25519:ssh-ed25519:chacha20-poly1305@openssh.com:hmac-sha2-512-etm@openssh.com" \
+            "id_ecdsa_p384:ecdsa-sha2-nistp384:aes128-gcm@openssh.com:hmac-sha2-256-etm@openssh.com" \
+            "id_ecdsa_p256:ecdsa-sha2-nistp256:aes256-ctr:hmac-sha2-512-etm@openssh.com" \
+            "id_rsa:rsa-sha2-512:aes192-ctr:hmac-sha2-256-etm@openssh.com" \
+            "id_rsa:rsa-sha2-256:aes128-ctr:hmac-sha2-512" \
+            "id_mldsa87_p384:ssh-mldsa87-p384:aes256-ctr:hmac-sha2-256"; do
+            IFS=':' read -r key_stem sig_alg cipher_alg mac_alg <<<"$spec"
+            run_sshz_to_russh_server_case "combo-${sig_alg}-${cipher_alg//@/-}-${mac_alg//@/-}" \
+                "$key_stem" "mlkem768nistp256-sha256" "$sig_alg" "$cipher_alg" "$mac_alg"
+        done
+    fi
+else
+    log "skipping russh lane; set SSHZ_INTEROP_ENABLE_RUSSH=1 to run it or SSHZ_INTEROP_REQUIRE_RUSSH=1 to require it"
+fi
+
 log "interop tests passed"

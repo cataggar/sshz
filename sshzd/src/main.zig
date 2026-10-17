@@ -10,8 +10,9 @@ fn printUsage(program: []const u8) void {
         \\
         \\Authentication options:
         \\  --authorized-keys <file>  Authorize public keys globally from a plain authorized_keys file.
-        \\                            Supported key types: ssh-ed25519,
-        \\                            ecdsa-sha2-nistp256, and ssh-rsa.
+        \\                            Supported key types: ssh-mldsa87-p384, ssh-mldsa44-ed25519,
+        \\                            ssh-ed25519, ecdsa-sha2-nistp384, ecdsa-sha2-nistp256,
+        \\                            and ssh-rsa.
         \\                            Key options and markers are not supported.
         \\  --insecure-demo-auth      INSECURE demo mode: accept any cryptographically verified
         \\                            public key, or a password equal to the username.
@@ -136,7 +137,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("WARNING: no authentication policy configured; all authentication attempts will be rejected\n", .{});
     }
 
-    const hostkey_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, args[2], allocator, .limited(1024)) catch |err| {
+    const hostkey_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, args[2], allocator, .limited(16384)) catch |err| {
         cliError(args[0], "cannot read host key file '{s}': {s}", .{ args[2], @errorName(err) });
     };
     defer allocator.free(hostkey_ascii);

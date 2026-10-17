@@ -9,20 +9,26 @@ Run the required OpenSSH lanes from the repository root:
 zig build interop
 ```
 
-The harness requires OpenSSH client/server tools. Optional lanes cover Dropbear
-and the libssh client probe:
+The harness requires OpenSSH client/server tools. Optional lanes cover Dropbear,
+the libssh client probe, and bidirectional `russh` interoperability:
 
 ```sh
 SSHZ_INTEROP_ENABLE_DROPBEAR=1 \
 SSHZ_INTEROP_ENABLE_LIBSSH=1 \
+SSHZ_INTEROP_ENABLE_RUSSH=1 \
 zig build interop
 ```
 
-Use `SSHZ_INTEROP_REQUIRE_DROPBEAR=1` or
-`SSHZ_INTEROP_REQUIRE_LIBSSH=1` when a missing dependency must fail the run
-instead of skipping that lane. Dropbear coverage requires its client, server,
-key, and conversion tools plus non-interactive privilege escalation to create
-and remove a dedicated local account.
+Use `SSHZ_INTEROP_REQUIRE_DROPBEAR=1`,
+`SSHZ_INTEROP_REQUIRE_LIBSSH=1`, or `SSHZ_INTEROP_REQUIRE_RUSSH=1` when a
+missing dependency must fail the run instead of skipping that lane. Dropbear
+coverage requires its client, server, key, and conversion tools plus
+non-interactive privilege escalation to create and remove a dedicated local
+account. The `russh` lane builds `interop/russh_probe.rs` against a local
+`russh` checkout (`SSHZ_INTEROP_RUSSH_DIR`, defaulting to `../russh`) and tests
+key generation, `russh` client to `sshzd`, and `sshz` client to `russh` server
+across post-quantum/hybrid and classical KEX, signature, cipher, and MAC
+algorithms.
 
 ## Configuration
 
@@ -38,6 +44,9 @@ and remove a dedicated local account.
 | `SSHZ_INTEROP_REQUIRE_DROPBEAR` | Require Dropbear lanes and dependencies. |
 | `SSHZ_INTEROP_ENABLE_LIBSSH` | Run the libssh client lane when available. |
 | `SSHZ_INTEROP_REQUIRE_LIBSSH` | Require the libssh client lane and dependencies. |
+| `SSHZ_INTEROP_ENABLE_RUSSH` | Run bidirectional `russh` lanes when available. |
+| `SSHZ_INTEROP_REQUIRE_RUSSH` | Require bidirectional `russh` lanes and dependencies. |
+| `SSHZ_INTEROP_RUSSH_DIR` | Override the path to the `russh` workspace (default `../russh`). |
 
 The harness also supports tool-specific Dropbear binary overrides defined in
 [`interop/run.sh`](../interop/run.sh).

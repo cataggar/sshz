@@ -195,11 +195,14 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
             return PrivKeyError.BadPrivKey;
         }
 
-        const mldsa_seed_slice = try encbuffer.readBytes(Key.Mldsa87.seed_length);
+        const composite_priv = try encbuffer.readU32LenString();
+        var comp_priv_r = BufferReader.init(composite_priv);
+        const mldsa_seed_slice = comp_priv_r.readBytes(Key.Mldsa87.seed_length) catch return PrivKeyError.BadPrivKey;
         var mldsa_seed: [Key.Mldsa87.seed_length]u8 = mldsa_seed_slice[0..Key.Mldsa87.seed_length].*;
         defer crypto.secureZero(u8, &mldsa_seed);
 
-        const secret_mpint = try encbuffer.readU32LenString();
+        const secret_mpint = comp_priv_r.readU32LenString() catch return PrivKeyError.BadPrivKey;
+        if (comp_priv_r.off != comp_priv_r.payload.len) return PrivKeyError.BadPrivKey;
         var ecdsa_scalar = try mpintToFixed(Key.EcdsaP384.SecretKey.encoded_length, secret_mpint);
         defer crypto.secureZero(u8, &ecdsa_scalar);
 
@@ -231,12 +234,14 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
         const mldsa_pub = composite_pub[0..Key.Mldsa44.PublicKey.encoded_length].*;
         const ed_pub = composite_pub[Key.Mldsa44.PublicKey.encoded_length..][0..Key.Ed25519.PublicKey.encoded_length].*;
 
-        const mldsa_seed_slice = try encbuffer.readBytes(Key.Mldsa44.seed_length);
+        const composite_priv = try encbuffer.readU32LenString();
+        var comp_priv_r = BufferReader.init(composite_priv);
+        const mldsa_seed_slice = comp_priv_r.readBytes(Key.Mldsa44.seed_length) catch return PrivKeyError.BadPrivKey;
         var mldsa_seed: [Key.Mldsa44.seed_length]u8 = mldsa_seed_slice[0..Key.Mldsa44.seed_length].*;
         defer crypto.secureZero(u8, &mldsa_seed);
 
-        const ed_sk = try encbuffer.readU32LenString();
-        if (ed_sk.len != Key.Ed25519.SecretKey.encoded_length) return PrivKeyError.BadPrivKey;
+        const ed_sk = comp_priv_r.readU32LenString() catch return PrivKeyError.BadPrivKey;
+        if (comp_priv_r.off != comp_priv_r.payload.len or ed_sk.len != Key.Ed25519.SecretKey.encoded_length) return PrivKeyError.BadPrivKey;
         var ed_seed: [Key.Ed25519.KeyPair.seed_length]u8 = ed_sk[0..Key.Ed25519.KeyPair.seed_length].*;
         defer crypto.secureZero(u8, &ed_seed);
         if (!std.mem.eql(u8, ed_sk[Key.Ed25519.KeyPair.seed_length..], &ed_pub)) return PrivKeyError.BadPrivKey;
@@ -533,10 +538,15 @@ pub fn encodeTestOpenSshPrivateKeyPem(
             try inner_pub.writeBytes(&comp.mldsa_public);
             try inner_pub.writeU32LenString(&comp.ecdsa_sec1);
 
+            var inner_priv_buf: [Key.Mldsa87.seed_length + 4 + Key.EcdsaP384.SecretKey.encoded_length + 1]u8 = undefined;
+            defer crypto.secureZero(u8, &inner_priv_buf);
+            var inner_priv = BufferWriter.init(&inner_priv_buf, 0);
+            try inner_priv.writeBytes(&comp.mldsa_seed);
+            try Key.writeMpint(&inner_priv, &comp.ecdsa_scalar);
+
             try priv_w.writeU32LenString(Key.mldsa87_p384_name);
             try priv_w.writeU32LenString(inner_pub.active());
-            try priv_w.writeBytes(&comp.mldsa_seed);
-            try Key.writeMpint(&priv_w, &comp.ecdsa_scalar);
+            try priv_w.writeU32LenString(inner_priv.active());
         },
         .Mldsa44Ed25519 => |*comp| {
             var inner_pub_buf: [Key.MaxMldsa44Ed25519PublicKeyPayloadLen]u8 = undefined;
@@ -548,10 +558,15 @@ pub fn encodeTestOpenSshPrivateKeyPem(
             @memcpy(ed_sk[0..Key.Ed25519.KeyPair.seed_length], &comp.ed25519_seed);
             @memcpy(ed_sk[Key.Ed25519.KeyPair.seed_length..], &comp.ed25519_public);
 
+            var inner_priv_buf: [Key.Mldsa44.seed_length + 4 + Key.Ed25519.SecretKey.encoded_length]u8 = undefined;
+            defer crypto.secureZero(u8, &inner_priv_buf);
+            var inner_priv = BufferWriter.init(&inner_priv_buf, 0);
+            try inner_priv.writeBytes(&comp.mldsa_seed);
+            try inner_priv.writeU32LenString(&ed_sk);
+
             try priv_w.writeU32LenString(Key.mldsa44_ed25519_name);
             try priv_w.writeU32LenString(&inner_pub_buf);
-            try priv_w.writeBytes(&comp.mldsa_seed);
-            try priv_w.writeU32LenString(&ed_sk);
+            try priv_w.writeU32LenString(inner_priv.active());
         },
         .Ed25519 => |*ed| {
             try priv_w.writeU32LenString(Key.ed25519_name);
