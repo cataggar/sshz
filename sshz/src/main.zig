@@ -625,7 +625,7 @@ pub fn main(init: std.process.Init) !void {
                             },
                             .GetPrivateKey => {
                                 if (idfile) |path| {
-                                    const keydata_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(1024)) catch {
+                                    const keydata_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(16384)) catch {
                                         std.debug.print("Failed to open idfile {s}\n", .{path});
                                         std.process.exit(1);
                                     };
