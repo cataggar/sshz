@@ -11,6 +11,7 @@ const BufferReader = @import("buffer.zig").BufferReader;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const decodePrivKey = @import("privkey.zig").decodePrivKey;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
+const Key = @import("key.zig");
 const zlib = @import("zlib-c");
 
 pub const CommDir = enum {
@@ -336,6 +337,11 @@ pub fn negotiateAlgorithms(
         return IoError.AlgorithmNegotiationFailed;
     const selected_host_key = selectClientPreferred(client.host_key, server.host_key) orelse
         return IoError.AlgorithmNegotiationFailed;
+    const selected_host_key_alg = Key.SignatureAlgorithm.fromName(selected_host_key) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    if (!selected_host_key_alg.isEnabled()) {
+        return IoError.AlgorithmNegotiationFailed;
+    }
     _ = selectClientPreferred(client.encryption_c2s, server.encryption_c2s) orelse
         return IoError.AlgorithmNegotiationFailed;
     _ = selectClientPreferred(client.encryption_s2c, server.encryption_s2c) orelse

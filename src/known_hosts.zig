@@ -44,7 +44,10 @@ pub const Match = enum {
 };
 
 const supported_key_types = [_][]const u8{
+    "ssh-mldsa87-p384",
+    "ssh-mldsa44-ed25519",
     "ssh-ed25519",
+    "ecdsa-sha2-nistp384",
     "ecdsa-sha2-nistp256",
     "ssh-rsa",
 };
@@ -92,9 +95,38 @@ pub fn keyType(raw_key: []const u8) ![]const u8 {
     const key_type = try reader.readString();
     if (!isSupportedKeyType(key_type)) return error.UnsupportedKeyType;
 
-    if (std.mem.eql(u8, key_type, "ssh-ed25519")) {
+    if (std.mem.eql(u8, key_type, "ssh-mldsa87-p384")) {
+        const Mldsa87 = std.crypto.sign.mldsa.MLDSA87;
+        const P384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey;
+        const composite = try reader.readString();
+        if (composite.len != 2592 + 4 + 97 or !reader.atEnd()) return error.MalformedKeyBlob;
+        const q_len = std.mem.readInt(u32, composite[2592..2596], .big);
+        const q = composite[2596..2693];
+        if (q_len != 97 or q[0] != 0x04) return error.MalformedKeyBlob;
+        _ = Mldsa87.PublicKey.fromBytes(composite[0..2592].*) catch return error.MalformedKeyBlob;
+        _ = P384.fromSec1(q) catch return error.MalformedKeyBlob;
+    } else if (std.mem.eql(u8, key_type, "ssh-mldsa44-ed25519")) {
+        const Mldsa44 = std.crypto.sign.mldsa.MLDSA44;
+        const Ed25519 = std.crypto.sign.Ed25519.PublicKey;
+        const composite = try reader.readString();
+        if (composite.len != 1312 + 32 or !reader.atEnd()) return error.MalformedKeyBlob;
+        _ = Mldsa44.PublicKey.fromBytes(composite[0..1312].*) catch return error.MalformedKeyBlob;
+        _ = Ed25519.fromBytes(composite[1312..1344].*) catch return error.MalformedKeyBlob;
+    } else if (std.mem.eql(u8, key_type, "ssh-ed25519")) {
         const public_key = try reader.readString();
         if (public_key.len != 32 or !reader.atEnd()) return error.MalformedKeyBlob;
+    } else if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp384")) {
+        const P384 = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey;
+        const curve = try reader.readString();
+        const public_key = try reader.readString();
+        if (!std.mem.eql(u8, curve, "nistp384") or
+            public_key.len != 97 or
+            public_key[0] != 0x04 or
+            !reader.atEnd())
+        {
+            return error.MalformedKeyBlob;
+        }
+        _ = P384.fromSec1(public_key) catch return error.MalformedKeyBlob;
     } else if (std.mem.eql(u8, key_type, "ecdsa-sha2-nistp256")) {
         const curve = try reader.readString();
         const public_key = try reader.readString();
@@ -430,4 +462,44 @@ test "formats default and nondefault endpoints" {
     try std.testing.expectEqualStrings("2001:db8::1", try formatEndpoint(&buffer, "2001:db8::1", 22));
     try std.testing.expectEqualStrings("[example.com]:2222", try formatEndpoint(&buffer, "example.com", 2222));
     try std.testing.expectEqualStrings("[2001:db8::1]:2222", try formatEndpoint(&buffer, "2001:db8::1", 2222));
+}
+
+test "known_hosts supports ssh-mldsa87-p384, ssh-mldsa44-ed25519, and ecdsa-sha2-nistp384" {
+    const PrivKey = @import("privkey.zig");
+    const Key = @import("key.zig");
+
+    var mldsa87_priv = PrivKey.testKeyMldsa87P384();
+    defer mldsa87_priv.clear();
+    var mldsa44_priv = PrivKey.testKeyMldsa44Ed25519();
+    defer mldsa44_priv.clear();
+    var p384_priv = PrivKey.testKeyEcdsaP384();
+    defer p384_priv.clear();
+
+    const cases = [_]struct {
+        key: *const Key.PrivateKey,
+        expected_type: []const u8,
+    }{
+        .{ .key = &mldsa87_priv, .expected_type = "ssh-mldsa87-p384" },
+        .{ .key = &mldsa44_priv, .expected_type = "ssh-mldsa44-ed25519" },
+        .{ .key = &p384_priv, .expected_type = "ecdsa-sha2-nistp384" },
+    };
+
+    for (cases) |case| {
+        var pub_blob: Key.Blob = .{};
+        const raw_key = try case.key.publicBlob(&pub_blob);
+        try std.testing.expectEqualStrings(case.expected_type, try keyType(raw_key));
+
+        var entry_buf: [max_line_length]u8 = undefined;
+        const entry = try encodeEntry(&entry_buf, "example.com", raw_key);
+        try std.testing.expectEqual(Match.match, try checkContents(entry, "example.com", raw_key));
+        try std.testing.expectEqual(Match.unknown, try checkContents(entry, "other.example", raw_key));
+
+        var bad_blob = pub_blob;
+        bad_blob.buf[bad_blob.len - 1] ^= 0x01;
+        // Corrupting P-384 SEC1 point (or truncating) is rejected as MalformedKeyBlob
+        try std.testing.expectError(error.MalformedKeyBlob, keyType(raw_key[0 .. raw_key.len - 1]));
+        if (!std.mem.eql(u8, case.expected_type, "ssh-mldsa44-ed25519")) {
+            try std.testing.expectError(error.MalformedKeyBlob, keyType(bad_blob.slice()));
+        }
+    }
 }

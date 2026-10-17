@@ -5,6 +5,7 @@ const TRACE = util.trace;
 const UNSAFE_TRACEDUMP = util.unsafeTracedump;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const BufferReader = @import("buffer.zig").BufferReader;
+const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const Key = @import("key.zig");
 
@@ -56,7 +57,7 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
 pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8) PrivKeyError!Key.PrivateKey {
     // Input text and the optional passphrase are borrowed; this function owns and
     // scrubs all decoded, KDF, and decrypted scratch that it creates.
-    var keydata_bin_buf: [8192]u8 = undefined;
+    var keydata_bin_buf: [16384]u8 = undefined;
     defer crypto.secureZero(u8, &keydata_bin_buf);
     const bin = try decodeAsciiToBinary(keydata_ascii, &keydata_bin_buf);
     UNSAFE_TRACEDUMP(.Debug, "raw len={d}", .{bin.len}, bin);
@@ -114,7 +115,7 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
                 // https://www.thedigitalcatonline.com/blog/2021/06/03/public-key-cryptography-openssh-private-keys/#a-poorly-documented-format-2ea8
                 var aesctr = AesCtrT.init(hash[AesCtrT.key_size..].*, hash[0..AesCtrT.key_size].*);
                 defer aesctr.clear();
-                var dec: [8192]u8 = undefined;
+                var dec: [16384]u8 = undefined;
                 defer crypto.secureZero(u8, &dec);
                 if (enc_section.len > dec.len) return PrivKeyError.PrivKeyOutofSpace;
                 aesctr.encrypt(enc_section, dec[0..enc_section.len]) catch
@@ -152,6 +153,7 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
 
     var private_key = try parsePrivateSectionKey(key_algo, &encbuffer);
     errdefer private_key.clear();
+    private_key.validate() catch return PrivKeyError.BadPrivKey;
 
     var private_pubkey_blob: Key.Blob = .{};
     const generated_pubkey = try private_key.publicBlob(&private_pubkey_blob);
@@ -181,6 +183,82 @@ pub fn decodePrivKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8, pri
 }
 
 fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKeyError!Key.PrivateKey {
+    if (std.mem.eql(u8, key_algo, Key.mldsa87_p384_name)) {
+        const composite_pub = try encbuffer.readU32LenString();
+        var comp_r = BufferReader.init(composite_pub);
+        const mldsa_pub = comp_r.readBytes(Key.Mldsa87.PublicKey.encoded_length) catch return PrivKeyError.BadPrivKey;
+        const sec1 = comp_r.readU32LenString() catch return PrivKeyError.BadPrivKey;
+        if (comp_r.off != comp_r.payload.len or
+            sec1.len != Key.EcdsaP384.PublicKey.uncompressed_sec1_encoded_length or
+            sec1[0] != 0x04)
+        {
+            return PrivKeyError.BadPrivKey;
+        }
+
+        const mldsa_seed_slice = try encbuffer.readBytes(Key.Mldsa87.seed_length);
+        var mldsa_seed: [Key.Mldsa87.seed_length]u8 = mldsa_seed_slice[0..Key.Mldsa87.seed_length].*;
+        defer crypto.secureZero(u8, &mldsa_seed);
+
+        const secret_mpint = try encbuffer.readU32LenString();
+        var ecdsa_scalar = try mpintToFixed(Key.EcdsaP384.SecretKey.encoded_length, secret_mpint);
+        defer crypto.secureZero(u8, &ecdsa_scalar);
+
+        _ = Key.Mldsa87.PublicKey.fromBytes(mldsa_pub[0..Key.Mldsa87.PublicKey.encoded_length].*) catch return PrivKeyError.BadPrivKey;
+        var mldsa_kp = Key.Mldsa87.newKeyFromSeed(&mldsa_seed);
+        defer crypto.secureZero(u8, std.mem.asBytes(&mldsa_kp.sk));
+        if (!std.mem.eql(u8, &mldsa_kp.pk.toBytes(), mldsa_pub)) return PrivKeyError.BadPrivKey;
+
+        _ = Key.EcdsaP384.PublicKey.fromSec1(sec1) catch return PrivKeyError.BadPrivKey;
+        var secret_key = Key.EcdsaP384.SecretKey.fromBytes(ecdsa_scalar) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+        var keypair = Key.EcdsaP384.KeyPair.fromSecretKey(secret_key) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&keypair));
+        if (!std.mem.eql(u8, &keypair.public_key.toUncompressedSec1(), sec1)) return PrivKeyError.BadPrivKey;
+
+        return .{ .Mldsa87P384 = .{
+            .mldsa_public = mldsa_pub[0..Key.Mldsa87.PublicKey.encoded_length].*,
+            .ecdsa_sec1 = sec1[0..Key.EcdsaP384.PublicKey.uncompressed_sec1_encoded_length].*,
+            .mldsa_seed = mldsa_seed,
+            .ecdsa_scalar = ecdsa_scalar,
+        } };
+    }
+
+    if (std.mem.eql(u8, key_algo, Key.mldsa44_ed25519_name)) {
+        const composite_pub = try encbuffer.readU32LenString();
+        if (composite_pub.len != Key.Mldsa44.PublicKey.encoded_length + Key.Ed25519.PublicKey.encoded_length) {
+            return PrivKeyError.BadPrivKey;
+        }
+        const mldsa_pub = composite_pub[0..Key.Mldsa44.PublicKey.encoded_length].*;
+        const ed_pub = composite_pub[Key.Mldsa44.PublicKey.encoded_length..][0..Key.Ed25519.PublicKey.encoded_length].*;
+
+        const mldsa_seed_slice = try encbuffer.readBytes(Key.Mldsa44.seed_length);
+        var mldsa_seed: [Key.Mldsa44.seed_length]u8 = mldsa_seed_slice[0..Key.Mldsa44.seed_length].*;
+        defer crypto.secureZero(u8, &mldsa_seed);
+
+        const ed_sk = try encbuffer.readU32LenString();
+        if (ed_sk.len != Key.Ed25519.SecretKey.encoded_length) return PrivKeyError.BadPrivKey;
+        var ed_seed: [Key.Ed25519.KeyPair.seed_length]u8 = ed_sk[0..Key.Ed25519.KeyPair.seed_length].*;
+        defer crypto.secureZero(u8, &ed_seed);
+        if (!std.mem.eql(u8, ed_sk[Key.Ed25519.KeyPair.seed_length..], &ed_pub)) return PrivKeyError.BadPrivKey;
+
+        _ = Key.Mldsa44.PublicKey.fromBytes(mldsa_pub) catch return PrivKeyError.BadPrivKey;
+        var mldsa_kp = Key.Mldsa44.newKeyFromSeed(&mldsa_seed);
+        defer crypto.secureZero(u8, std.mem.asBytes(&mldsa_kp.sk));
+        if (!std.mem.eql(u8, &mldsa_kp.pk.toBytes(), &mldsa_pub)) return PrivKeyError.BadPrivKey;
+
+        _ = Key.Ed25519.PublicKey.fromBytes(ed_pub) catch return PrivKeyError.BadPrivKey;
+        var ed_kp = Key.Ed25519.KeyPair.generateDeterministic(ed_seed) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&ed_kp));
+        if (!std.mem.eql(u8, &ed_kp.public_key.toBytes(), &ed_pub)) return PrivKeyError.BadPrivKey;
+
+        return .{ .Mldsa44Ed25519 = .{
+            .mldsa_public = mldsa_pub,
+            .ed25519_public = ed_pub,
+            .mldsa_seed = mldsa_seed,
+            .ed25519_seed = ed_seed,
+        } };
+    }
+
     if (std.mem.eql(u8, key_algo, Key.ed25519_name)) {
         const key_blob_pub = try encbuffer.readU32LenString();
         const key_blob_prv = try encbuffer.readU32LenString();
@@ -194,6 +272,28 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
         return .{ .Ed25519 = .{
             .public = key_blob_pub[0..std.crypto.sign.Ed25519.PublicKey.encoded_length].*,
             .secret = key_blob_prv[0..std.crypto.sign.Ed25519.SecretKey.encoded_length].*,
+        } };
+    }
+
+    if (std.mem.eql(u8, key_algo, Key.ecdsa_p384_name)) {
+        const curve = try encbuffer.readU32LenString();
+        if (!std.mem.eql(u8, curve, Key.ecdsa_p384_curve_name)) return PrivKeyError.UnsupportedPrivKey;
+        const sec1 = try encbuffer.readU32LenString();
+        if (sec1.len != Key.EcdsaP384.PublicKey.uncompressed_sec1_encoded_length or sec1[0] != 0x04) {
+            return PrivKeyError.BadPrivKey;
+        }
+        const secret_mpint = try encbuffer.readU32LenString();
+        var secret_scalar = try mpintToFixed(Key.EcdsaP384.SecretKey.encoded_length, secret_mpint);
+        defer crypto.secureZero(u8, &secret_scalar);
+        _ = Key.EcdsaP384.PublicKey.fromSec1(sec1) catch return PrivKeyError.BadPrivKey;
+        var secret_key = Key.EcdsaP384.SecretKey.fromBytes(secret_scalar) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+        var keypair = Key.EcdsaP384.KeyPair.fromSecretKey(secret_key) catch return PrivKeyError.BadPrivKey;
+        defer crypto.secureZero(u8, std.mem.asBytes(&keypair));
+        if (!std.mem.eql(u8, &keypair.public_key.toUncompressedSec1(), sec1)) return PrivKeyError.BadPrivKey;
+        return .{ .EcdsaP384 = .{
+            .public_sec1 = sec1[0..Key.EcdsaP384.PublicKey.uncompressed_sec1_encoded_length].*,
+            .secret_scalar = secret_scalar,
         } };
     }
 
@@ -234,8 +334,8 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
 }
 
 fn mpintToFixed(comptime len: usize, mpint: []const u8) PrivKeyError![len]u8 {
-    const trimmed = Key.trimMpint(mpint);
-    if (trimmed.len > len) return PrivKeyError.BadPrivKey;
+    const trimmed = Key.parsePositiveMpint(mpint, error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey;
+    if (trimmed.len == 0 or trimmed.len > len) return PrivKeyError.BadPrivKey;
     var out: [len]u8 = @splat(0);
     @memcpy(out[len - trimmed.len ..], trimmed);
     return out;
@@ -363,6 +463,172 @@ test "a private key with CRLF line endings decodes the same as one with LF" {
     try std.testing.expectEqualSlices(u8, &lf_pub, &crlf_pub);
 }
 
+pub fn testKeyMldsa87P384() Key.PrivateKey {
+    const mldsa_seed: [Key.Mldsa87.seed_length]u8 = @splat(0x42);
+    var mldsa_kp = Key.Mldsa87.newKeyFromSeed(&mldsa_seed);
+    defer crypto.secureZero(u8, std.mem.asBytes(&mldsa_kp.sk));
+
+    const ecdsa_scalar: [Key.EcdsaP384.SecretKey.encoded_length]u8 = @splat(0x11);
+    var secret_key = Key.EcdsaP384.SecretKey.fromBytes(ecdsa_scalar) catch unreachable;
+    defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+    var ecdsa_kp = Key.EcdsaP384.KeyPair.fromSecretKey(secret_key) catch unreachable;
+    defer crypto.secureZero(u8, std.mem.asBytes(&ecdsa_kp));
+
+    return .{ .Mldsa87P384 = .{
+        .mldsa_public = mldsa_kp.pk.toBytes(),
+        .ecdsa_sec1 = ecdsa_kp.public_key.toUncompressedSec1(),
+        .mldsa_seed = mldsa_seed,
+        .ecdsa_scalar = ecdsa_scalar,
+    } };
+}
+
+pub fn testKeyMldsa44Ed25519() Key.PrivateKey {
+    const mldsa_seed: [Key.Mldsa44.seed_length]u8 = @splat(0x24);
+    var mldsa_kp = Key.Mldsa44.newKeyFromSeed(&mldsa_seed);
+    defer crypto.secureZero(u8, std.mem.asBytes(&mldsa_kp.sk));
+
+    const ed_seed: [Key.Ed25519.KeyPair.seed_length]u8 = @splat(0x33);
+    var ed_kp = Key.Ed25519.KeyPair.generateDeterministic(ed_seed) catch unreachable;
+    defer crypto.secureZero(u8, std.mem.asBytes(&ed_kp));
+
+    return .{ .Mldsa44Ed25519 = .{
+        .mldsa_public = mldsa_kp.pk.toBytes(),
+        .ed25519_public = ed_kp.public_key.toBytes(),
+        .mldsa_seed = mldsa_seed,
+        .ed25519_seed = ed_seed,
+    } };
+}
+
+pub fn testKeyEcdsaP384() Key.PrivateKey {
+    const secret_scalar: [Key.EcdsaP384.SecretKey.encoded_length]u8 = @splat(0x22);
+    var secret_key = Key.EcdsaP384.SecretKey.fromBytes(secret_scalar) catch unreachable;
+    defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+    var keypair = Key.EcdsaP384.KeyPair.fromSecretKey(secret_key) catch unreachable;
+    defer crypto.secureZero(u8, std.mem.asBytes(&keypair));
+
+    return .{ .EcdsaP384 = .{
+        .public_sec1 = keypair.public_key.toUncompressedSec1(),
+        .secret_scalar = secret_scalar,
+    } };
+}
+
+pub fn encodeTestOpenSshPrivateKeyPem(
+    key: *const Key.PrivateKey,
+    passphrase_opt: ?[]const u8,
+    out_pem: []u8,
+) ![]const u8 {
+    var pub_blob_buf: Key.Blob = .{};
+    const pub_blob = try key.publicBlob(&pub_blob_buf);
+
+    var priv_buf: [8192]u8 = undefined;
+    defer crypto.secureZero(u8, &priv_buf);
+    var priv_w = BufferWriter.init(&priv_buf, 0);
+    try priv_w.writeU32(0x12345678);
+    try priv_w.writeU32(0x12345678);
+
+    switch (key.*) {
+        .Mldsa87P384 => |*comp| {
+            var inner_pub_buf: [Key.MaxMldsa87P384PublicKeyPayloadLen]u8 = undefined;
+            var inner_pub = BufferWriter.init(&inner_pub_buf, 0);
+            try inner_pub.writeBytes(&comp.mldsa_public);
+            try inner_pub.writeU32LenString(&comp.ecdsa_sec1);
+
+            try priv_w.writeU32LenString(Key.mldsa87_p384_name);
+            try priv_w.writeU32LenString(inner_pub.active());
+            try priv_w.writeBytes(&comp.mldsa_seed);
+            try Key.writeMpint(&priv_w, &comp.ecdsa_scalar);
+        },
+        .Mldsa44Ed25519 => |*comp| {
+            var inner_pub_buf: [Key.MaxMldsa44Ed25519PublicKeyPayloadLen]u8 = undefined;
+            @memcpy(inner_pub_buf[0..Key.Mldsa44.PublicKey.encoded_length], &comp.mldsa_public);
+            @memcpy(inner_pub_buf[Key.Mldsa44.PublicKey.encoded_length..], &comp.ed25519_public);
+
+            var ed_sk: [Key.Ed25519.SecretKey.encoded_length]u8 = undefined;
+            defer crypto.secureZero(u8, &ed_sk);
+            @memcpy(ed_sk[0..Key.Ed25519.KeyPair.seed_length], &comp.ed25519_seed);
+            @memcpy(ed_sk[Key.Ed25519.KeyPair.seed_length..], &comp.ed25519_public);
+
+            try priv_w.writeU32LenString(Key.mldsa44_ed25519_name);
+            try priv_w.writeU32LenString(&inner_pub_buf);
+            try priv_w.writeBytes(&comp.mldsa_seed);
+            try priv_w.writeU32LenString(&ed_sk);
+        },
+        .Ed25519 => |*ed| {
+            try priv_w.writeU32LenString(Key.ed25519_name);
+            try priv_w.writeU32LenString(&ed.public);
+            try priv_w.writeU32LenString(&ed.secret);
+        },
+        .EcdsaP384 => |*ecdsa| {
+            try priv_w.writeU32LenString(Key.ecdsa_p384_name);
+            try priv_w.writeU32LenString(Key.ecdsa_p384_curve_name);
+            try priv_w.writeU32LenString(&ecdsa.public_sec1);
+            try Key.writeMpint(&priv_w, &ecdsa.secret_scalar);
+        },
+        .EcdsaP256 => |*ecdsa| {
+            try priv_w.writeU32LenString(Key.ecdsa_p256_name);
+            try priv_w.writeU32LenString(Key.ecdsa_p256_curve_name);
+            try priv_w.writeU32LenString(&ecdsa.public_sec1);
+            try Key.writeMpint(&priv_w, &ecdsa.secret_scalar);
+        },
+        .Rsa => unreachable,
+    }
+
+    try priv_w.writeU32LenString("sshz-test");
+    const block_size: usize = if (passphrase_opt != null) 16 else 8;
+    var pad_byte: u8 = 1;
+    while (priv_w.active().len % block_size != 0) : (pad_byte += 1) {
+        try priv_w.writeU8(pad_byte);
+    }
+
+    var bin_buf: [12288]u8 = undefined;
+    defer crypto.secureZero(u8, &bin_buf);
+    var bin_w = BufferWriter.init(&bin_buf, 0);
+    try bin_w.writeBytes("openssh-key-v1\x00");
+
+    if (passphrase_opt) |passphrase| {
+        const salt = "0123456789abcdef";
+        const rounds: u32 = 4;
+        var kdfopt_buf: [32]u8 = undefined;
+        var kdfopt_w = BufferWriter.init(&kdfopt_buf, 0);
+        try kdfopt_w.writeU32LenString(salt);
+        try kdfopt_w.writeU32(rounds);
+
+        const AesCtrT = AesCtr(crypto.core.aes.Aes256);
+        var hash: [AesCtrT.key_size + AesCtrT.iv_size]u8 = undefined;
+        defer crypto.secureZero(u8, &hash);
+        try crypto.pwhash.bcrypt.opensshKdf(passphrase, salt[0..16], &hash, rounds);
+        var aesctr = AesCtrT.init(hash[AesCtrT.key_size..].*, hash[0..AesCtrT.key_size].*);
+        defer aesctr.clear();
+
+        var enc_buf: [8192]u8 = undefined;
+        defer crypto.secureZero(u8, &enc_buf);
+        const plain = priv_w.active();
+        try aesctr.encrypt(plain, enc_buf[0..plain.len]);
+
+        try bin_w.writeU32LenString("aes256-ctr");
+        try bin_w.writeU32LenString("bcrypt");
+        try bin_w.writeU32LenString(kdfopt_w.active());
+        try bin_w.writeU32(1);
+        try bin_w.writeU32LenString(pub_blob);
+        try bin_w.writeU32LenString(enc_buf[0..plain.len]);
+    } else {
+        try bin_w.writeU32LenString("none");
+        try bin_w.writeU32LenString("none");
+        try bin_w.writeU32LenString("");
+        try bin_w.writeU32(1);
+        try bin_w.writeU32LenString(pub_blob);
+        try bin_w.writeU32LenString(priv_w.active());
+    }
+
+    var b64_buf: [16384]u8 = undefined;
+    const b64 = std.base64.standard.Encoder.encode(&b64_buf, bin_w.active());
+    return std.fmt.bufPrint(
+        out_pem,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{s}\n-----END OPENSSH PRIVATE KEY-----\n",
+        .{b64},
+    );
+}
+
 test "decode OpenSSH private key algorithms and sign/verify" {
     const cases = .{
         .{ testkey_valid, Key.KeyAlgorithm.Ed25519 },
@@ -385,4 +651,75 @@ test "decode OpenSSH private key algorithms and sign/verify" {
         try Key.verifySignature(public_key, sig, "sshz message");
         try std.testing.expectError(Key.KeyError.InvalidSignature, Key.verifySignature(public_key, sig, "tampered message"));
     }
+}
+
+test "decode OpenSSH private keys for ssh-mldsa87-p384, ssh-mldsa44-ed25519, and ecdsa-sha2-nistp384" {
+    var mldsa87_key = testKeyMldsa87P384();
+    defer mldsa87_key.clear();
+    var mldsa44_key = testKeyMldsa44Ed25519();
+    defer mldsa44_key.clear();
+    var p384_key = testKeyEcdsaP384();
+    defer p384_key.clear();
+
+    const keys = [_]*const Key.PrivateKey{ &mldsa87_key, &mldsa44_key, &p384_key };
+    for (keys) |orig_key| {
+        var pem_buf: [16384]u8 = undefined;
+        const pem = try encodeTestOpenSshPrivateKeyPem(orig_key, null, &pem_buf);
+        var decoded = try decodeOpenSshPrivateKey(pem, null);
+        defer decoded.clear();
+        try std.testing.expectEqual(orig_key.algorithm(), decoded.algorithm());
+
+        var enc_pem_buf: [16384]u8 = undefined;
+        const enc_pem = try encodeTestOpenSshPrivateKeyPem(orig_key, "composite-passphrase", &enc_pem_buf);
+        try std.testing.expectError(PrivKeyError.InvalidKeyDecrypt, decodeOpenSshPrivateKey(enc_pem, "wrong-passphrase"));
+        var dec_encrypted = try decodeOpenSshPrivateKey(enc_pem, "composite-passphrase");
+        defer dec_encrypted.clear();
+
+        var pub_blob: Key.Blob = .{};
+        const pub_bytes = try dec_encrypted.publicBlob(&pub_blob);
+        const parsed_pub = try Key.parsePublicKeyBlob(pub_bytes);
+
+        var sig_blob: Key.SignatureBlob = .{};
+        defer sig_blob.clear();
+        const sig = try dec_encrypted.sign(dec_encrypted.defaultSignatureAlgorithm(), "composite key test", &sig_blob);
+        try Key.verifySignature(parsed_pub, sig, "composite key test");
+    }
+}
+
+test "OpenSSH P-384 private key pads short 47-byte positive scalar and rejects mismatched keys" {
+    var short_scalar: [Key.EcdsaP384.SecretKey.encoded_length]u8 = @splat(0x2a);
+    short_scalar[0] = 0x00;
+    short_scalar[1] = 0x7f;
+    var secret_key = try Key.EcdsaP384.SecretKey.fromBytes(short_scalar);
+    defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
+    var kp = try Key.EcdsaP384.KeyPair.fromSecretKey(secret_key);
+    defer crypto.secureZero(u8, std.mem.asBytes(&kp));
+
+    var p384_short = Key.PrivateKey{ .EcdsaP384 = .{
+        .public_sec1 = kp.public_key.toUncompressedSec1(),
+        .secret_scalar = short_scalar,
+    } };
+    defer p384_short.clear();
+
+    var pem_buf: [16384]u8 = undefined;
+    const pem = try encodeTestOpenSshPrivateKeyPem(&p384_short, null, &pem_buf);
+    var decoded = try decodeOpenSshPrivateKey(pem, null);
+    defer decoded.clear();
+    try std.testing.expectEqualSlices(u8, &short_scalar, &decoded.EcdsaP384.secret_scalar);
+
+    // Mismatched ML-DSA seed or classical secret in ssh-mldsa87-p384 must fail decoding
+    var bad_mldsa87 = testKeyMldsa87P384();
+    defer bad_mldsa87.clear();
+    bad_mldsa87.Mldsa87P384.mldsa_seed[0] ^= 0x01;
+    try std.testing.expectError(Key.KeyError.InvalidKeyBlob, bad_mldsa87.validate());
+
+    var bad_mldsa87_ecdsa = testKeyMldsa87P384();
+    defer bad_mldsa87_ecdsa.clear();
+    bad_mldsa87_ecdsa.Mldsa87P384.ecdsa_scalar[47] ^= 0x01;
+    try std.testing.expectError(Key.KeyError.InvalidKeyBlob, bad_mldsa87_ecdsa.validate());
+
+    var bad_mldsa44 = testKeyMldsa44Ed25519();
+    defer bad_mldsa44.clear();
+    bad_mldsa44.Mldsa44Ed25519.ed25519_seed[0] ^= 0x01;
+    try std.testing.expectError(Key.KeyError.InvalidKeyBlob, bad_mldsa44.validate());
 }
