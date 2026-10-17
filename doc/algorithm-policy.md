@@ -24,7 +24,7 @@ sshz has no API for broadening these lists at runtime.
 | Purpose | SSH name and construction | Role and direction | Current rationale and status |
 | --- | --- | --- | --- |
 | Key exchange | `curve25519-sha256` (X25519 with SHA-256) | Client and server | The only advertised KEX. It provides ephemeral key agreement and a SHA-256 exchange hash. Enforced now. |
-| Server host-key signature | `ssh-ed25519`, `ecdsa-sha2-nistp256`, `rsa-sha2-512`, `rsa-sha2-256` | The client advertises this order. The server advertises only algorithms usable with its single loaded host key. | Ed25519 and P-256 provide compact modern signatures. RSA is retained for compatibility, but only with SHA-2. Signature verification, key-family matching, client-ordered selection, and RSA size bounds are enforced now. |
+| Server host-key signature | `ssh-mldsa87-p384`, `ssh-mldsa44-ed25519`, `ssh-ed25519`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp256`, `rsa-sha2-512`, `rsa-sha2-256` | The client advertises this order (filtered by compile-time enabled signature algorithms). The server advertises only enabled algorithms usable with its single loaded host key. | Post-quantum composite ML-DSA signatures (`draft-ietf-sshm-composite-sigs-00`), Ed25519, and ECDSA P-384/P-256 provide modern signatures. RSA is retained for compatibility, but only with SHA-2. Signature verification, key-family matching, client-ordered selection, and RSA size bounds are enforced now. |
 | Encryption | `aes256-ctr` | Independently named for client-to-server (c2s) and server-to-client (s2c), but it is the only choice in both directions | A widely interoperable 256-bit cipher. Enforced now. The current construction is the original SSH encrypt-and-MAC construction, not AEAD or encrypt-then-MAC; its production suitability still requires review. |
 | MAC | `hmac-sha2-256` | Independently negotiated c2s and s2c; the full 32-byte MAC is used | SHA-256 HMAC over the packet sequence number and plaintext packet. Enforced now, including timing-safe comparison of equal-sized MACs. |
 | Compression | `zlib@openssh.com`, then `none` | Independently negotiated c2s and s2c using client preference | Only delayed zlib and no compression are allowed. Delayed zlib is activated after `SSH_MSG_USERAUTH_SUCCESS`; authentication traffic is not compressed. Enforced now, subject to the compression policy below. |
@@ -32,26 +32,39 @@ sshz has no API for broadening these lists at runtime.
 
 The client host-key preference is:
 
-1. `ssh-ed25519`
-2. `ecdsa-sha2-nistp256`
-3. `rsa-sha2-512`
-4. `rsa-sha2-256`
+1. `ssh-mldsa87-p384`
+2. `ssh-mldsa44-ed25519`
+3. `ssh-ed25519`
+4. `ecdsa-sha2-nistp384`
+5. `ecdsa-sha2-nistp256`
+6. `rsa-sha2-512`
+7. `rsa-sha2-256`
+
+Individual signature algorithms can be enabled or disabled at compile time via
+`-Dsecure-algorithms=bool` (default `true`) and per-algorithm build options
+(`-Dssh-mldsa87-p384`, `-Dssh-mldsa44-ed25519`, `-Decdsa-sha2-nistp384`,
+`-Dssh-ed25519`, `-Decdsa-sha2-nistp256`, `-Drsa-sha2-512`, `-Drsa-sha2-256`),
+queried via `SignatureAlgorithm.isEnabled()` and `KeyAlgorithm.isEnabled()`.
 
 For RSA, `ssh-rsa` is still the required public-key *blob format identifier*.
 It is not accepted as a signature algorithm: RSA signatures use PKCS#1 v1.5
 with SHA-512 or SHA-256 under the `rsa-sha2-*` names.
 
 The same signature families are accepted for server-side public-key user
-authentication. The sshz client signs user authentication with Ed25519,
-ECDSA P-256/SHA-256, or RSA/SHA-512 according to the loaded key; it does not
-currently negotiate an RSA/SHA-256 fallback from `server-sig-algs`.
+authentication. The sshz client signs user authentication with
+`ssh-mldsa87-p384`, `ssh-mldsa44-ed25519`, `ssh-ed25519`,
+`ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp256`, or `rsa-sha2-512` (or
+`rsa-sha2-256` when `rsa-sha2-512` is disabled at compile time) according to
+the loaded key; it does not currently negotiate an RSA/SHA-256 fallback from
+`server-sig-algs`.
 
 ## Private- and public-key parsing
 
 The current private-key loader accepts one key from the
 `openssh-key-v1` format:
 
-- key types: Ed25519, ECDSA on `nistp256`, and RSA;
+- key types: `ssh-mldsa87-p384`, `ssh-mldsa44-ed25519`, Ed25519, ECDSA on
+  `nistp384` and `nistp256`, and RSA;
 - unencrypted files with cipher `none`;
 - passphrase-protected files with cipher `aes256-ctr` and the OpenSSH `bcrypt`
   KDF (a 16-byte salt is required).
@@ -59,12 +72,17 @@ The current private-key loader accepts one key from the
 Other private-key formats, multiple-key containers, other curves, other
 private-key ciphers, and other KDFs are unsupported. Transport cipher `none`
 remains forbidden even though `none` is a valid at-rest private-key encoding.
-Public-key blobs are accepted only for Ed25519, ECDSA P-256, and RSA.
+Public-key blobs are accepted only for `ssh-mldsa87-p384`,
+`ssh-mldsa44-ed25519`, Ed25519, ECDSA P-384, ECDSA P-256, and RSA.
 
 The production key policy is:
 
+- Composite `ssh-mldsa87-p384` and `ssh-mldsa44-ed25519` keys must validate
+  both ML-DSA and classical (P-384 or Ed25519) public and private components,
+  and composite signature verification requires both component signatures to
+  succeed over the `draft-ietf-sshm-composite-sigs-00` SHA-512 pre-hash `M'`.
 - Ed25519 keys must have their fixed standard encoded size.
-- ECDSA keys must be valid points on P-256.
+- ECDSA keys must be valid uncompressed SEC1 points on P-384 or P-256.
 - RSA moduli must be 2048 through 4096 bits and exponents must be valid,
   odd values of at least 3. New deployments should use 3072-bit or larger RSA
   only when Ed25519 or P-256 cannot be used.

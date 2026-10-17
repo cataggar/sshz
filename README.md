@@ -8,6 +8,7 @@ ordered byte stream.
 
 - Client and server APIs with no internal transport I/O
 - Client keyboard-interactive plus client/server public-key, password, and none authentication
+- Post-quantum composite ML-DSA (`ssh-mldsa87-p384`, `ssh-mldsa44-ed25519`), Ed25519, ECDSA (`nistp384`, `nistp256`), and RSA SHA-2 host keys and user-authentication signatures, with per-algorithm compile-time `-D` build flags
 - Multiple channels, sessions, port forwarding, and agent forwarding
 - Rekeying, delayed compression, resource limits, and deadline enforcement
 - Explicit acknowledged keepalives with owned request tokens and transport-flush accounting

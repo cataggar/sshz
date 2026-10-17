@@ -923,6 +923,7 @@ pub const Session = struct {
 
                 const private_key = if (self.private_key) |*key| key else return IoError.UnexpectedResponse;
                 const sig_alg = private_key.defaultSignatureAlgorithm();
+                if (!sig_alg.isEnabled()) return Key.KeyError.UnsupportedKeyAlgorithm;
 
                 var pubkey_blob: Key.Blob = .{};
                 const typed_pubkey = try private_key.publicBlob(&pubkey_blob);
@@ -934,7 +935,7 @@ pub const Session = struct {
                 try pkt.writeU32LenString(sig_alg.name());
                 try pkt.writeU32LenString(typed_pubkey);
 
-                var backing_sigbuffer_buf: [1024]u8 = undefined;
+                var backing_sigbuffer_buf: [4096]u8 = undefined;
                 defer std.crypto.secureZero(u8, &backing_sigbuffer_buf);
                 var sigbuffer = BufferWriter.init(&backing_sigbuffer_buf, 0);
                 try sigbuffer.writeU32LenString(&self.session_id);

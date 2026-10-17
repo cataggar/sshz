@@ -1731,6 +1731,10 @@ pub const Session = struct {
                             self.denyAuthentication();
                             return;
                         };
+                        if (!auth_alg.isEnabled()) {
+                            self.denyAuthentication();
+                            return;
+                        }
                         const pubkey = parsePublicKeyBlobExact(typed_pubkey) catch {
                             self.denyAuthentication();
                             return;
@@ -1761,7 +1765,7 @@ pub const Session = struct {
                                 return;
                             }
 
-                            var backing_sigbuffer_buf: [1024]u8 = undefined;
+                            var backing_sigbuffer_buf: [4096]u8 = undefined;
                             defer std.crypto.secureZero(u8, &backing_sigbuffer_buf);
                             var sigbuffer = BufferWriter.init(&backing_sigbuffer_buf, 0);
                             try sigbuffer.writeU32LenString(&self.session_id);
@@ -2163,7 +2167,9 @@ fn signatureAlgorithmExact(blob: []const u8) ?Key.SignatureAlgorithm {
     const name = reader.readU32LenString() catch return null;
     _ = reader.readU32LenString() catch return null;
     if (reader.off != reader.payload.len) return null;
-    return Key.SignatureAlgorithm.fromName(name);
+    const alg = Key.SignatureAlgorithm.fromName(name) orelse return null;
+    if (!alg.isEnabled()) return null;
+    return alg;
 }
 
 fn buildUnencryptedPacket(buf: []u8, payload: []const u8) usize {

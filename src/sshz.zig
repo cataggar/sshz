@@ -22,6 +22,8 @@ pub const library_version = util.version;
 pub const known_hosts = @import("known_hosts.zig");
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
 const Key = @import("key.zig");
+pub const KeyAlgorithm = Key.KeyAlgorithm;
+pub const SignatureAlgorithm = Key.SignatureAlgorithm;
 const Protocol = @import("protocol.zig");
 const Hasher = @import("hasher.zig").Hasher;
 const Channel = @import("channel.zig");
@@ -4650,4 +4652,207 @@ test "public key auth supports Ed25519 ECDSA and RSA SHA2 keys" {
     try driveHandshakeForKeys(privkey.testkey_valid, privkey.testkey_valid, "ssh-ed25519");
     try driveHandshakeForKeys(privkey.testkey_valid, privkey.testkey_ecdsa_p256, "ecdsa-sha2-nistp256");
     try driveHandshakeForKeys(privkey.testkey_valid, privkey.testkey_rsa_2048, "rsa-sha2-512");
+}
+
+fn driveCompositeHandshakeRekeyAndKnownHosts(
+    host_key: *const Key.PrivateKey,
+    client_key: *const Key.PrivateKey,
+    expected_alg_name: []const u8,
+) !void {
+    const privkey = @import("privkey.zig");
+    var host_pem_buf: [16384]u8 = undefined;
+    const host_pem = try privkey.encodeTestOpenSshPrivateKeyPem(host_key, null, &host_pem_buf);
+    var client_pem_buf: [16384]u8 = undefined;
+    const client_pem = try privkey.encodeTestOpenSshPrivateKeyPem(client_key, null, &client_pem_buf);
+
+    var host_pub_blob: Key.Blob = .{};
+    const expected_host_pub = try host_key.publicBlob(&host_pub_blob);
+    var kh_buf: [known_hosts.max_line_length]u8 = undefined;
+    const kh_contents = try known_hosts.encodeEntry(&kh_buf, "Composite.EXAMPLE", expected_host_pub);
+
+    var cprng = std.Random.DefaultPrng.init(3000);
+    var sprng = std.Random.DefaultPrng.init(4000);
+    const limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_encrypted_packets = 6,
+    } };
+
+    var client = try SshzClient.initWithLimits(cprng.random(), "testuser", std.testing.allocator, limits);
+    defer client.deinit();
+    var server = try SshzServer.initWithLimits(sprng.random(), host_pem, std.testing.allocator, limits);
+    defer server.deinit();
+
+    var c2s_buf: [65536]u8 = undefined;
+    var s2c_buf: [65536]u8 = undefined;
+    var c2s_len: usize = 0;
+    var s2c_len: usize = 0;
+    var connected_client = false;
+    var connected_server = false;
+    var saw_expected_pubkey = false;
+    var checked_host_key = false;
+    var server_packets_sent: usize = 0;
+    var client_packets_received: usize = 0;
+
+    const Endpoint = enum { client_ep, server_ep };
+    const endpoints = [_]Endpoint{ .client_ep, .server_ep };
+
+    var steps: usize = 0;
+    while (steps < 3000) : (steps += 1) {
+        if (connected_client and saw_expected_pubkey and checked_host_key and
+            client.keyLifetimeStatus().inbound.epoch >= 2 and
+            server.keyLifetimeStatus().outbound.epoch >= 2 and
+            !client.session.is_rekeying and !server.session.is_rekeying and
+            client_packets_received >= 6)
+        {
+            break;
+        }
+
+        for (endpoints) |ep| {
+            if (ep == .client_ep) {
+                const cev = client.getNextEvent() catch continue;
+                switch (cev) {
+                    .ReadyToProduce => {
+                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
+                        c2s_len += data.len;
+                        client.consumed(data.len) catch {};
+                    },
+                    .ReadyToConsume => |n| {
+                        if (s2c_len > 0) {
+                            const feed = @min(n, s2c_len);
+                            client.write(s2c_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &s2c_buf, s2c_buf[feed..s2c_len]);
+                            s2c_len -= feed;
+                        }
+                    },
+                    .ReadyToConsumeAndProduce => |s| {
+                        const data = client.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(c2s_buf[c2s_len .. c2s_len + data.len], data);
+                        c2s_len += data.len;
+                        client.consumed(data.len) catch {};
+                        if (s2c_len > 0) {
+                            const feed = @min(s.consume, s2c_len);
+                            client.write(s2c_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &s2c_buf, s2c_buf[feed..s2c_len]);
+                            s2c_len -= feed;
+                        }
+                    },
+                    .Event => |code| switch (code) {
+                        .CheckHostKey => |info| {
+                            const raw_key = info.raw_key orelse return error.UnexpectedNullHostKey;
+                            try std.testing.expectEqualStrings(expected_alg_name, try known_hosts.keyType(raw_key));
+                            const match = try known_hosts.checkContents(kh_contents, "composite.example", raw_key);
+                            try std.testing.expectEqual(known_hosts.Match.match, match);
+                            checked_host_key = true;
+                            try client.acceptHostKey();
+                        },
+                        .GetPrivateKey => {
+                            try client.setPrivateKey(client_pem);
+                            try client.clearEvent(.GetPrivateKey);
+                        },
+                        .Connected => {
+                            connected_client = true;
+                            try client.clearEvent(.Connected);
+                        },
+                        .RxData => |channel_data| {
+                            try std.testing.expectEqualStrings("composite-payload", channel_data.data);
+                            client_packets_received += 1;
+                            try client.clearEvent(.{ .RxData = channel_data });
+                        },
+                        .EndSession => break,
+                        else => {
+                            client.clearEvent(code) catch {};
+                        },
+                    },
+                }
+            } else {
+                const sev = server.getNextEvent() catch continue;
+                switch (sev) {
+                    .ReadyToProduce => {
+                        const data = server.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(s2c_buf[s2c_len .. s2c_len + data.len], data);
+                        s2c_len += data.len;
+                        server.consumed(data.len) catch {};
+                    },
+                    .ReadyToConsume => |n| {
+                        if (c2s_len > 0) {
+                            const feed = @min(n, c2s_len);
+                            server.write(c2s_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
+                            c2s_len -= feed;
+                        }
+                    },
+                    .ReadyToConsumeAndProduce => |s| {
+                        const data = server.peek(Protocol.MaxSSHPacket) catch continue;
+                        @memcpy(s2c_buf[s2c_len .. s2c_len + data.len], data);
+                        s2c_len += data.len;
+                        server.consumed(data.len) catch {};
+                        if (c2s_len > 0) {
+                            const feed = @min(s.consume, c2s_len);
+                            server.write(c2s_buf[0..feed]) catch {};
+                            std.mem.copyForwards(u8, &c2s_buf, c2s_buf[feed..c2s_len]);
+                            c2s_len -= feed;
+                        }
+                    },
+                    .Event => |code| switch (code) {
+                        .UserAuth => |credentials| {
+                            if (credentials.auth) |auth| switch (auth) {
+                                .Pubkey => |pubkey| {
+                                    try std.testing.expectEqualStrings(expected_alg_name, pubkey.algorithm);
+                                    try std.testing.expect(pubkey.blob.len > 0);
+                                    saw_expected_pubkey = true;
+                                },
+                                else => {},
+                            };
+                            try server.grantAccess(true);
+                            try server.clearEvent(.{ .UserAuth = .{ .username = "", .auth = null } });
+                        },
+                        .ChannelOpenRequest => |request| {
+                            try server.acceptChannelOpen(request.channel);
+                        },
+                        .Connected => {
+                            connected_server = true;
+                            try server.clearEvent(.{ .Connected = 0 });
+                        },
+                        .ChannelRequest => try server.clearEvent(.{ .ChannelRequest = .{ .channel = 0, .request = .Shell } }),
+                        else => {
+                            server.clearEvent(code) catch {};
+                        },
+                    },
+                }
+
+                if (connected_server and server_packets_sent < 6 and server.iostate_wr == .Idle and s2c_len == 0) {
+                    const buf = server.getChannelWriteBuffer(0) catch continue;
+                    const msg = "composite-payload";
+                    if (buf.len >= msg.len) {
+                        @memcpy(buf[0..msg.len], msg);
+                        server.channelWriteComplete(0, msg.len) catch continue;
+                        server_packets_sent += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    try std.testing.expect(connected_client);
+    try std.testing.expect(saw_expected_pubkey);
+    try std.testing.expect(checked_host_key);
+    try std.testing.expect(client.keyLifetimeStatus().inbound.epoch >= 2);
+    try std.testing.expect(server.keyLifetimeStatus().outbound.epoch >= 2);
+    try std.testing.expectEqual(@as(usize, 6), client_packets_received);
+}
+
+test "full handshake, known_hosts, rekey, and publickey userauth for ssh-mldsa87-p384, ssh-mldsa44-ed25519, and ecdsa-sha2-nistp384" {
+    const privkey = @import("privkey.zig");
+
+    var mldsa87 = privkey.testKeyMldsa87P384();
+    defer mldsa87.clear();
+    try driveCompositeHandshakeRekeyAndKnownHosts(&mldsa87, &mldsa87, "ssh-mldsa87-p384");
+
+    var mldsa44 = privkey.testKeyMldsa44Ed25519();
+    defer mldsa44.clear();
+    try driveCompositeHandshakeRekeyAndKnownHosts(&mldsa44, &mldsa44, "ssh-mldsa44-ed25519");
+
+    var p384 = privkey.testKeyEcdsaP384();
+    defer p384.clear();
+    try driveCompositeHandshakeRekeyAndKnownHosts(&p384, &p384, "ecdsa-sha2-nistp384");
 }
