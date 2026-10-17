@@ -57,6 +57,7 @@ pub const IoError = error{
     KeyLifetimeExceeded,
     SessionTerminated,
     InvalidKeepaliveToken,
+    InvalidEcdhKey,
 };
 
 pub const ResourceLimitConfigError = error{
@@ -304,6 +305,9 @@ pub const TransportLimits = struct {
     pub const ecdh_public_key_len = Protocol.kex_algo.public_length;
 };
 
+pub const KexAlgorithm = Protocol.KexAlgorithm;
+pub const CipherAlgorithm = Protocol.CipherAlgorithm;
+pub const MacAlgorithm = Protocol.MacAlgorithm;
 pub const CompressionAlgorithm = Protocol.CompressionAlgorithm;
 pub const CompressionState = Protocol.CompressionState;
 
@@ -434,6 +438,16 @@ pub fn verifyPacketMac(calculated: [Protocol.mac_algo.key_length]u8, received: [
     if (received.len != mac_length) return error.InvalidMac;
     if (!std.crypto.timing_safe.eql([mac_length]u8, calculated, received[0..mac_length].*)) {
         return error.InvalidMac;
+    }
+}
+
+pub fn verifyPacketMacSlice(calculated: []const u8, received: []const u8) MacInputError!void {
+    if (received.len != calculated.len) return error.InvalidMac;
+    switch (calculated.len) {
+        16 => if (!std.crypto.timing_safe.eql([16]u8, calculated[0..16].*, received[0..16].*)) return error.InvalidMac,
+        32 => if (!std.crypto.timing_safe.eql([32]u8, calculated[0..32].*, received[0..32].*)) return error.InvalidMac,
+        64 => if (!std.crypto.timing_safe.eql([64]u8, calculated[0..64].*, received[0..64].*)) return error.InvalidMac,
+        else => return error.InvalidMac,
     }
 }
 
@@ -1620,17 +1634,14 @@ pub fn SshzImpl(role: Role) type {
         }
 
         pub fn getRecvBuffer(self: *Self, iobuf: []u8, inkeys: *Protocol.KeyDataUni) SshzError!BufferReader {
-            const frame = try inspectPacketWithLimits(
-                iobuf,
-                self.session.inbound_encrypted,
-                self.limits.max_packet_size,
-                self.limits.max_payload_size,
-            );
-            const payload_len = frame.payload_len;
-            const pkt_len = frame.packet_len;
-            const payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + payload_len];
-
             if (!self.session.inbound_encrypted) {
+                const frame = try inspectPacketWithLimits(
+                    iobuf,
+                    false,
+                    self.limits.max_packet_size,
+                    self.limits.max_payload_size,
+                );
+                const payload = iobuf[Protocol.sizeof_PktHdr .. Protocol.sizeof_PktHdr + frame.payload_len];
                 const decompressed = try inkeys.compression.decompressPayload(
                     payload,
                     self.iobuf_decompressed[0..self.limits.max_decompressed_payload_size],
@@ -1638,39 +1649,139 @@ pub fn SshzImpl(role: Role) type {
                 return BufferReader.init(decompressed);
             } else {
                 UNSAFE_TRACEDUMP(.Debug, "all buf", .{}, iobuf);
-                if (pkt_len > Protocol.AesCtrT.block_size) { // if there's more to be decrypted after first block
-                    const remaining_pkt_bytes = pkt_len - Protocol.AesCtrT.block_size;
-                    var dec: [Protocol.MaxSSHPacket]u8 = undefined;
-                    defer std.crypto.secureZero(u8, &dec);
-                    inkeys.aesctr.encrypt(
-                        iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
-                        dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
-                    ) catch return IoError.KeyLifetimeExceeded;
+                const tag_len = inkeys.tagLength();
+                if (iobuf.len < Protocol.sizeof_PktHdr + tag_len or iobuf.len > self.limits.max_packet_size) {
+                    return IoError.InvalidPacketSize;
+                }
+                const pkt_len = iobuf.len - tag_len;
+                const rx_tag = iobuf[pkt_len..iobuf.len];
+                const seq_num = inkeys.seq - 1;
 
-                    UNSAFE_TRACEDUMP(.Debug, "dec", .{}, dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes]);
-                    // copy decrypted back into writebuf
-                    @memcpy(iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes], dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes]);
-                    UNSAFE_TRACEDUMP(.Debug, "writebuf", .{}, iobuf[0..pkt_len]);
+                switch (inkeys.cipher) {
+                    .aes256_gcm, .aes128_gcm => {
+                        const packet_length = std.mem.readInt(u32, iobuf[0..4], .big);
+                        if (packet_length < 16 or packet_length % 16 != 0 or 4 + @as(usize, packet_length) != pkt_len) {
+                            return IoError.InvalidPacketSize;
+                        }
+                        if (packet_length > Protocol.AesCtrT.max_bytes_per_key - inkeys.gcm_bytecount) {
+                            return IoError.KeyLifetimeExceeded;
+                        }
+                        var dec: [Protocol.MaxSSHPacket]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &dec);
+                        const nonce = inkeys.iv[0..12].*;
+                        const next_ctr = std.mem.readInt(u64, inkeys.iv[4..12], .big) +% 1;
+                        std.mem.writeInt(u64, inkeys.iv[4..12], next_ctr, .big);
+                        inkeys.gcm_bytecount += packet_length;
+
+                        if (inkeys.cipher == .aes256_gcm) {
+                            std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(
+                                dec[4..pkt_len],
+                                iobuf[4..pkt_len],
+                                rx_tag[0..16].*,
+                                iobuf[0..4],
+                                nonce,
+                                inkeys.key[0..32].*,
+                            ) catch return IoError.InvalidMac;
+                        } else {
+                            std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(
+                                dec[4..pkt_len],
+                                iobuf[4..pkt_len],
+                                rx_tag[0..16].*,
+                                iobuf[0..4],
+                                nonce,
+                                inkeys.key[0..16].*,
+                            ) catch return IoError.InvalidMac;
+                        }
+                        @memcpy(iobuf[4..pkt_len], dec[4..pkt_len]);
+                    },
+                    .chacha20_poly1305 => {
+                        if (pkt_len < 12 or (pkt_len - 4) % 8 != 0) {
+                            return IoError.InvalidPacketSize;
+                        }
+                        if (pkt_len > Protocol.AesCtrT.max_bytes_per_key - inkeys.gcm_bytecount) {
+                            return IoError.KeyLifetimeExceeded;
+                        }
+                        const ChaCha = std.crypto.stream.chacha.ChaCha20With64BitNonce;
+                        const Poly1305 = std.crypto.onetimeauth.Poly1305;
+                        var nonce: [8]u8 = undefined;
+                        std.mem.writeInt(u64, &nonce, @as(u64, seq_num), .big);
+                        const k_2 = inkeys.key[0..32].*;
+                        const k_1 = inkeys.key[32..64].*;
+
+                        var poly_key: [32]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &poly_key);
+                        const zeros: [32]u8 = @splat(0);
+                        ChaCha.xor(&poly_key, &zeros, 0, k_2, nonce);
+
+                        var calc_tag: [16]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &calc_tag);
+                        Poly1305.create(&calc_tag, iobuf[0..pkt_len], &poly_key);
+                        try verifyPacketMacSlice(&calc_tag, rx_tag);
+
+                        var dec: [Protocol.MaxSSHPacket]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &dec);
+                        ChaCha.xor(dec[0..4], iobuf[0..4], 0, k_1, nonce);
+                        const packet_length = std.mem.readInt(u32, dec[0..4], .big);
+                        if (4 + @as(usize, packet_length) != pkt_len) {
+                            return IoError.InvalidPacketSize;
+                        }
+                        ChaCha.xor(dec[4..pkt_len], iobuf[4..pkt_len], 1, k_2, nonce);
+                        inkeys.gcm_bytecount += pkt_len;
+                        @memcpy(iobuf[0..pkt_len], dec[0..pkt_len]);
+                    },
+                    .aes256_ctr, .aes192_ctr, .aes128_ctr => {
+                        const mac_alg = inkeys.mac orelse return IoError.UnexpectedResponse;
+                        var calcmac_buf: [64]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &calcmac_buf);
+
+                        if (mac_alg.isEtm()) {
+                            const packet_length = std.mem.readInt(u32, iobuf[0..4], .big);
+                            if (packet_length < 16 or packet_length % 16 != 0 or 4 + @as(usize, packet_length) != pkt_len) {
+                                return IoError.InvalidPacketSize;
+                            }
+                            const calcmac = inkeys.computeMac(seq_num, iobuf[0..pkt_len], &calcmac_buf);
+                            try verifyPacketMacSlice(calcmac, rx_tag);
+
+                            var dec: [Protocol.MaxSSHPacket]u8 = undefined;
+                            defer std.crypto.secureZero(u8, &dec);
+                            inkeys.encryptCtr(iobuf[4..pkt_len], dec[4..pkt_len]) catch
+                                return IoError.KeyLifetimeExceeded;
+                            @memcpy(iobuf[4..pkt_len], dec[4..pkt_len]);
+                        } else {
+                            if (pkt_len < 16 or pkt_len % 16 != 0) {
+                                return IoError.InvalidPacketSize;
+                            }
+                            if (pkt_len > Protocol.AesCtrT.block_size) {
+                                const remaining_pkt_bytes = pkt_len - Protocol.AesCtrT.block_size;
+                                var dec: [Protocol.MaxSSHPacket]u8 = undefined;
+                                defer std.crypto.secureZero(u8, &dec);
+                                inkeys.encryptCtr(
+                                    iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
+                                    dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
+                                ) catch return IoError.KeyLifetimeExceeded;
+                                @memcpy(
+                                    iobuf[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
+                                    dec[Protocol.AesCtrT.block_size .. Protocol.AesCtrT.block_size + remaining_pkt_bytes],
+                                );
+                            }
+                            const calcmac = inkeys.computeMac(seq_num, iobuf[0..pkt_len], &calcmac_buf);
+                            try verifyPacketMacSlice(calcmac, rx_tag);
+                        }
+                    },
                 }
 
-                // verify mac
-                const rxmac = iobuf[frame.mac_offset.?..iobuf.len];
-                var calcmac: [Protocol.mac_algo.key_length]u8 = undefined;
-                defer std.crypto.secureZero(u8, &calcmac);
-                var m = Protocol.mac_algo.init(inkeys.mackey[0..Protocol.mac_algo.key_length]);
-                defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
-                const seq = std.mem.nativeTo(u32, inkeys.seq - 1, .big); // seq has already been incremented
-                m.update(std.mem.asBytes(&seq));
-                m.update(iobuf[0..pkt_len]); // plaintext
-                m.final(&calcmac);
+                const hdr = Protocol.readPktHdr(iobuf[0..Protocol.sizeof_PktHdr]);
+                if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
+                    return IoError.InvalidPacketSize;
+                }
+                if (4 + @as(usize, hdr.packet_length) != pkt_len) {
+                    return IoError.InvalidPacketSize;
+                }
+                const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
+                if (payload_len > self.limits.max_payload_size) {
+                    return IoError.InvalidPacketSize;
+                }
 
-                UNSAFE_TRACEDUMP(.Debug, "rxmac", .{}, rxmac);
-                UNSAFE_TRACEDUMP(.Debug, "mackey", .{}, inkeys.mackey[0..Protocol.mac_algo.key_length]);
-                UNSAFE_TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
-                UNSAFE_TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..pkt_len]);
-                UNSAFE_TRACEDUMP(.Debug, "calcmac", .{}, std.mem.asBytes(&calcmac));
-
-                try verifyPacketMac(calcmac, rxmac);
                 try inkeys.accountEncryptedPacket(pkt_len);
 
                 // remove mac and return buffer containing just plaintext payload
@@ -1750,7 +1861,8 @@ pub fn SshzImpl(role: Role) type {
                 .ReadPktHdr => {
                     _ = try self.session.dispatchDeferredChannelWrite(self);
                     if (self.session.inbound_encrypted) {
-                        self.requestRead(0, Protocol.AesCtrT.block_size, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.AesCtrT.block_size] });
+                        const hdr_bytes: usize = if (inkeys.usesCleartextOrAeadLengthPrefix()) 4 else Protocol.AesCtrT.block_size;
+                        self.requestRead(0, hdr_bytes, .{ .ReadPktBody = self.iobuf_rd[0..hdr_bytes] });
                     } else {
                         self.requestRead(0, Protocol.sizeof_PktHdr, .{ .ReadPktBody = self.iobuf_rd[0..Protocol.sizeof_PktHdr] });
                     }
@@ -1758,37 +1870,69 @@ pub fn SshzImpl(role: Role) type {
                 .ReadPktBody => |buf| {
                     if (inkeys.seq == std.math.maxInt(u32)) return IoError.KeyLifetimeExceeded;
                     if (self.session.inbound_encrypted) {
-                        // https://datatracker.ietf.org/doc/html/rfc4253#section-6
-                        // grab first encrypted block from writebuf
-                        var firstblock_encbuf: [Protocol.AesCtrT.block_size]u8 = undefined;
-                        defer std.crypto.secureZero(u8, &firstblock_encbuf);
-                        @memcpy(&firstblock_encbuf, buf);
+                        const tag_len = inkeys.tagLength();
+                        if (inkeys.usesCleartextOrAeadLengthPrefix()) {
+                            var plain_len_bytes: [4]u8 = buf[0..4].*;
+                            if (inkeys.cipher == .chacha20_poly1305) {
+                                var nonce: [8]u8 = undefined;
+                                std.mem.writeInt(u64, &nonce, @as(u64, inkeys.seq), .big);
+                                std.crypto.stream.chacha.ChaCha20With64BitNonce.xor(
+                                    &plain_len_bytes,
+                                    buf[0..4],
+                                    0,
+                                    inkeys.key[32..64].*,
+                                    nonce,
+                                );
+                            }
+                            const packet_length = std.mem.readInt(u32, &plain_len_bytes, .big);
+                            const block_size = inkeys.cipher.blockSize();
+                            if (packet_length < block_size or packet_length % block_size != 0) {
+                                return IoError.InvalidPacketSize;
+                            }
+                            const pkt_len: usize = 4 + @as(usize, packet_length);
+                            if (pkt_len + tag_len > self.limits.max_packet_size) {
+                                return IoError.InvalidPacketSize;
+                            }
+                            const remaining_bytes = @as(usize, packet_length) + tag_len;
+                            self.requestRead(buf.len, remaining_bytes, .{
+                                .ReadPktCompletion = self.iobuf_rd[0 .. pkt_len + tag_len],
+                            });
+                            inkeys.seq += 1;
+                        } else {
+                            // https://datatracker.ietf.org/doc/html/rfc4253#section-6
+                            // grab first encrypted block from writebuf
+                            var firstblock_encbuf: [Protocol.AesCtrT.block_size]u8 = undefined;
+                            defer std.crypto.secureZero(u8, &firstblock_encbuf);
+                            @memcpy(&firstblock_encbuf, buf);
 
-                        // decrypt directly into iobuf_rd
-                        inkeys.aesctr.encrypt(
-                            &firstblock_encbuf,
-                            self.iobuf_rd[0..Protocol.AesCtrT.block_size],
-                        ) catch return IoError.KeyLifetimeExceeded;
-                        UNSAFE_TRACEDUMP(.Debug, "firstblock_dec(in payload)", .{}, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
+                            // decrypt directly into iobuf_rd
+                            inkeys.encryptCtr(
+                                &firstblock_encbuf,
+                                self.iobuf_rd[0..Protocol.AesCtrT.block_size],
+                            ) catch return IoError.KeyLifetimeExceeded;
+                            UNSAFE_TRACEDUMP(.Debug, "firstblock_dec(in payload)", .{}, self.iobuf_rd[0..Protocol.AesCtrT.block_size]);
 
-                        const frame = try inspectPacketHeaderWithLimits(
-                            buf,
-                            true,
-                            self.limits.max_packet_size,
-                            self.limits.max_payload_size,
-                        );
-                        const pkt_len = frame.packet_len;
+                            const hdr = Protocol.readPktHdr(self.iobuf_rd[0..Protocol.sizeof_PktHdr]);
+                            if (hdr.padding_length < 4 or hdr.packet_length < @as(u32, hdr.padding_length) + 1) {
+                                return IoError.InvalidPacketSize;
+                            }
+                            const payload_len: usize = @intCast(hdr.packet_length - @as(u32, hdr.padding_length) - 1);
+                            if (payload_len > self.limits.max_payload_size) return IoError.InvalidPacketSize;
+                            const pkt_len: usize = 4 + @as(usize, hdr.packet_length);
+                            if (pkt_len % Protocol.AesCtrT.block_size != 0 or pkt_len + tag_len > self.limits.max_packet_size) {
+                                return IoError.InvalidPacketSize;
+                            }
 
-                        // calc number of remaining bytes + mac, read from network
-                        var remaining_pkt_bytes: usize = 0;
-                        if (pkt_len > Protocol.AesCtrT.block_size) {
-                            remaining_pkt_bytes = pkt_len - Protocol.AesCtrT.block_size;
+                            // calc number of remaining bytes + mac, read from network
+                            var remaining_pkt_bytes: usize = 0;
+                            if (pkt_len > Protocol.AesCtrT.block_size) {
+                                remaining_pkt_bytes = pkt_len - Protocol.AesCtrT.block_size;
+                            }
+                            TRACE(.Debug, "About to read {d}\n", .{remaining_pkt_bytes + tag_len});
+                            self.requestRead(buf.len, (remaining_pkt_bytes + tag_len), .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + remaining_pkt_bytes + tag_len] }); // on completion, how much we have
+
+                            inkeys.seq += 1;
                         }
-                        TRACE(.Debug, "About to read {d}\n", .{remaining_pkt_bytes + Protocol.mac_algo.key_length});
-                        //
-                        self.requestRead(buf.len, (remaining_pkt_bytes + Protocol.mac_algo.key_length), .{ .ReadPktCompletion = self.iobuf_rd[0 .. buf.len + remaining_pkt_bytes + Protocol.mac_algo.key_length] }); // on completion, how much we have
-
-                        inkeys.seq += 1;
                     } else {
                         const frame = try inspectPacketHeaderWithLimits(
                             buf,
@@ -4210,7 +4354,8 @@ test "full handshake handles large compressed channel packets and keepalive queu
     var server_packets_sent: u8 = 0;
     var client_packets_received: u8 = 0;
     var receive_epochs: [12]u64 = @splat(0);
-    var initial_session_id: ?[Protocol.hash_algo.digest_length]u8 = null;
+    var initial_session_id: ?[48]u8 = null;
+    var initial_session_id_len: u8 = 0;
     var accepted_host_fingerprint: ?[Protocol.hash_algo.digest_length]u8 = null;
     var keepalive_token: ?KeepaliveToken = null;
     var keepalive_acknowledged = false;
@@ -4267,6 +4412,7 @@ test "full handshake handles large compressed channel packets and keepalive queu
                         .Connected => {
                             connected_client = true;
                             initial_session_id = client.session.session_id;
+                            initial_session_id_len = client.session.session_id_len;
                             var fingerprint: [Protocol.hash_algo.digest_length]u8 = undefined;
                             Protocol.hash_algo.hash(client.session.hostkey_ks.?, &fingerprint, .{});
                             accepted_host_fingerprint = fingerprint;
@@ -4363,7 +4509,11 @@ test "full handshake handles large compressed channel packets and keepalive queu
     try std.testing.expect(receive_epochs[packet_lengths.len - 1] > receive_epochs[0]);
     try std.testing.expect(client.keyLifetimeStatus().inbound.epoch >= 2);
     try std.testing.expect(server.keyLifetimeStatus().outbound.epoch >= 2);
-    try std.testing.expectEqualSlices(u8, &initial_session_id.?, &client.session.session_id);
+    try std.testing.expectEqualSlices(
+        u8,
+        initial_session_id.?[0..initial_session_id_len],
+        client.session.sessionIdSlice(),
+    );
     var final_host_fingerprint: [Protocol.hash_algo.digest_length]u8 = undefined;
     Protocol.hash_algo.hash(client.session.hostkey_ks.?, &final_host_fingerprint, .{});
     try std.testing.expectEqualSlices(

@@ -3,6 +3,106 @@ const crypto = std.crypto;
 const aes = std.crypto.core.aes;
 const ctr_mode = crypto.core.modes.ctr;
 
+pub const Aes192 = struct {
+    pub const key_bits: usize = 192;
+    pub const rounds: usize = 12;
+
+    pub const EncryptCtx = struct {
+        pub const block = aes.Block;
+        pub const block_length = aes.Block.block_length;
+        round_keys: [rounds + 1]aes.Block,
+
+        fn subWord(w: u32) u32 {
+            var in_bytes: [16]u8 = undefined;
+            inline for (0..4) |col| {
+                std.mem.writeInt(u32, in_bytes[col * 4 ..][0..4], w, .big);
+            }
+            const zero_block = aes.Block.fromBytes(&@as([16]u8, @splat(0)));
+            const sub_bytes = aes.Block.fromBytes(&in_bytes).encryptLast(zero_block).toBytes();
+            return std.mem.readInt(u32, sub_bytes[0..4], .big);
+        }
+
+        pub fn init(key: [key_bits / 8]u8) EncryptCtx {
+            const words_in_key = (key_bits / 8) / 4;
+            const total_words = (rounds + 1) * 4;
+            const rcon = [_]u8{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+
+            var words: [total_words]u32 = undefined;
+            defer std.crypto.secureZero(u32, &words);
+            inline for (0..words_in_key) |i| {
+                words[i] = std.mem.readInt(u32, key[4 * i ..][0..4], .big);
+            }
+            inline for (words_in_key..total_words) |i| {
+                var t = words[i - 1];
+                if (i % words_in_key == 0) {
+                    t = subWord(std.math.rotl(u32, t, 8)) ^ (@as(u32, rcon[i / words_in_key - 1]) << 24);
+                }
+                words[i] = words[i - words_in_key] ^ t;
+            }
+
+            var round_keys: [rounds + 1]block = undefined;
+            inline for (0..rounds + 1) |r| {
+                var rk_bytes: [16]u8 = undefined;
+                inline for (0..4) |c| {
+                    std.mem.writeInt(u32, rk_bytes[c * 4 ..][0..4], words[r * 4 + c], .big);
+                }
+                round_keys[r] = block.fromBytes(&rk_bytes);
+            }
+            return .{ .round_keys = round_keys };
+        }
+
+        pub fn encrypt(ctx: EncryptCtx, dst: *[16]u8, src: *const [16]u8) void {
+            var t = block.fromBytes(src).xorBlocks(ctx.round_keys[0]);
+            inline for (1..rounds) |i| {
+                t = t.encrypt(ctx.round_keys[i]);
+            }
+            t = t.encryptLast(ctx.round_keys[rounds]);
+            dst.* = t.toBytes();
+        }
+
+        pub fn xor(ctx: EncryptCtx, dst: *[16]u8, src: *const [16]u8, counter: [16]u8) void {
+            var t = block.fromBytes(&counter).xorBlocks(ctx.round_keys[0]);
+            inline for (1..rounds) |i| {
+                t = t.encrypt(ctx.round_keys[i]);
+            }
+            t = t.encryptLast(ctx.round_keys[rounds]);
+            dst.* = t.xorBytes(src);
+        }
+
+        pub fn encryptWide(ctx: EncryptCtx, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8) void {
+            var ts: [count]block = undefined;
+            inline for (0..count) |j| {
+                ts[j] = block.fromBytes(src[j * 16 ..][0..16]).xorBlocks(ctx.round_keys[0]);
+            }
+            inline for (1..rounds) |i| {
+                ts = block.parallel.encryptWide(count, ts, ctx.round_keys[i]);
+            }
+            ts = block.parallel.encryptLastWide(count, ts, ctx.round_keys[rounds]);
+            inline for (0..count) |j| {
+                dst[16 * j ..][0..16].* = ts[j].toBytes();
+            }
+        }
+
+        pub fn xorWide(ctx: EncryptCtx, comptime count: usize, dst: *[16 * count]u8, src: *const [16 * count]u8, counters: [16 * count]u8) void {
+            var ts: [count]block = undefined;
+            inline for (0..count) |j| {
+                ts[j] = block.fromBytes(counters[j * 16 ..][0..16]).xorBlocks(ctx.round_keys[0]);
+            }
+            inline for (1..rounds) |i| {
+                ts = block.parallel.encryptWide(count, ts, ctx.round_keys[i]);
+            }
+            ts = block.parallel.encryptLastWide(count, ts, ctx.round_keys[rounds]);
+            inline for (0..count) |j| {
+                dst[16 * j ..][0..16].* = ts[j].xorBytes(src[j * 16 ..][0..16]);
+            }
+        }
+    };
+
+    pub fn initEnc(key: [key_bits / 8]u8) EncryptCtx {
+        return EncryptCtx.init(key);
+    }
+};
+
 // convenience wrapper, defining block_size, iv_size, key_size
 // ensures that the ctr mode counter matches the number of bytes sent
 pub fn AesCtr(enc_algo: anytype) type {
@@ -13,7 +113,8 @@ pub fn AesCtr(enc_algo: anytype) type {
         pub const key_size = enc_algo.key_bits / 8;
         pub const max_bytes_per_key: u64 = std.math.maxInt(u32);
         pub const Error = error{CounterExhausted};
-        ctx: aes.AesEncryptCtx(enc_algo),
+        const CtxType = @TypeOf(enc_algo.initEnc(@as([key_size]u8, undefined)));
+        ctx: CtxType,
         iv: [iv_size]u8,
         origiv: [iv_size]u8,
         bytecount: u64,
@@ -36,7 +137,7 @@ pub fn AesCtr(enc_algo: anytype) type {
             // again would corrupt the counter base on big-endian targets.
             const orig = std.mem.readInt(u128, &self.origiv, .big);
             std.mem.writeInt(u128, &self.iv, @as(u128, self.bytecount / iv_size) +% orig, .big);
-            ctr_mode(aes.AesEncryptCtx(enc_algo), self.ctx, out, in, self.iv, std.builtin.Endian.big);
+            ctr_mode(CtxType, self.ctx, out, in, self.iv, std.builtin.Endian.big);
             self.bytecount += in.len;
         }
 
@@ -50,7 +151,27 @@ const util = @import("util.zig");
 const TRACE = util.trace;
 const UNSAFE_TRACEDUMP = util.unsafeTracedump;
 
-const testalgos = .{ aes.Aes128, aes.Aes256 };
+const testalgos = .{ aes.Aes128, Aes192, aes.Aes256 };
+
+test "Aes192 FIPS-197 Appendix C.2 vector" {
+    const key = [_]u8{
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    };
+    const in = [_]u8{
+        0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+        0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
+    };
+    const expected = [_]u8{
+        0xdd, 0xa9, 0x7c, 0xa4, 0x86, 0x4c, 0xdf, 0xe0,
+        0x6e, 0xaf, 0x70, 0xa0, 0xec, 0x0d, 0x71, 0x91,
+    };
+    var out: [16]u8 = undefined;
+    const ctx = Aes192.initEnc(key);
+    ctx.encrypt(&out, &in);
+    try std.testing.expectEqualSlices(u8, &expected, &out);
+}
 
 test "aesctr clear wipes the expanded key and counter state" {
     inline for (testalgos) |algo| {

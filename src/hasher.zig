@@ -131,6 +131,71 @@ pub fn Hasher(hash_algo: anytype) type {
     };
 }
 
+pub const KexHasher = struct {
+    const Self = @This();
+    pub const max_digest_length = std.crypto.hash.sha2.Sha384.digest_length;
+
+    sha256: Hasher(std.crypto.hash.sha2.Sha256),
+    sha384: Hasher(std.crypto.hash.sha2.Sha384),
+    active: bool = true,
+
+    pub fn init() Self {
+        return .{
+            .sha256 = Hasher(std.crypto.hash.sha2.Sha256).init(),
+            .sha384 = Hasher(std.crypto.hash.sha2.Sha384).init(),
+            .active = true,
+        };
+    }
+
+    pub fn writeBytes(self: *Self, b: []const u8) void {
+        self.sha256.writeBytes(b);
+        self.sha384.writeBytes(b);
+    }
+
+    pub fn writeU32LenString(self: *Self, s: []const u8) void {
+        self.sha256.writeU32LenString(s);
+        self.sha384.writeU32LenString(s);
+    }
+
+    pub fn writeMpint(self: *Self, b: []const u8) void {
+        self.sha256.writeMpint(b);
+        self.sha384.writeMpint(b);
+    }
+
+    pub fn finalSha256(self: *Self, out: *[32]u8) void {
+        self.sha256.final(out, null);
+        self.sha384.clear();
+        self.active = false;
+    }
+
+    pub fn finalSha384(self: *Self, out: *[48]u8) void {
+        self.sha384.final(out, null);
+        self.sha256.clear();
+        self.active = false;
+    }
+
+    pub fn final(self: *Self, out: *[32]u8, extra: ?[]u8) void {
+        self.sha256.final(out, extra);
+        self.sha384.clear();
+        self.active = false;
+    }
+
+    pub fn finalForAlgorithm(self: *Self, alg: anytype, out: *[48]u8) []const u8 {
+        if (alg.usesSha384()) {
+            self.finalSha384(out);
+            return out[0..48];
+        }
+        self.finalSha256(out[0..32]);
+        return out[0..32];
+    }
+
+    pub fn clear(self: *Self) void {
+        self.sha256.clear();
+        self.sha384.clear();
+        self.active = false;
+    }
+};
+
 test "hasher" {
     // Generated with sha256 -s <input>
     var hasher = Hasher(std.crypto.hash.sha2.Sha256).init();

@@ -13,6 +13,7 @@ const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
 const Hasher = @import("hasher.zig").Hasher;
+const KexHasher = @import("hasher.zig").KexHasher;
 const AesCtr = @import("aesctr.zig").AesCtr;
 const decodeOpenSshPrivateKey = @import("privkey.zig").decodeOpenSshPrivateKey;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
@@ -108,15 +109,24 @@ pub const Session = struct {
     sessionState: SessionState,
 
     // Owned only while an ECDH exchange is in progress.
-    ecdh_ephem_keypair: Protocol.kex_algo.KeyPair = std.mem.zeroes(Protocol.kex_algo.KeyPair),
+    ecdh_ephem_keypair: Protocol.EphemeralKexMaterial = .{},
     ecdh_ephem_keypair_active: bool,
     // In form U32LenString("ssh-ed25519"), U32LenString(secret)
     hostkey_ks: ?[]u8 = null, // K_S, allocated
     shared_secret_k: [Protocol.kex_algo.shared_length]u8 = @splat(0), // K
-    kex_hasher: Hasher(Protocol.hash_algo) = undefined, // for building H
+    shared_secret_k_ext: [16]u8 = @splat(0),
+    shared_secret_k_len: u8 = Protocol.kex_algo.shared_length,
+    kex_hasher: KexHasher = undefined, // for building H
     kex_hash_order: Protocol.KexHashOrder = .Init,
+    selected_kex_algorithm: Protocol.KexAlgorithm = .curve25519_sha256,
     selected_hostkey_algorithm: ?Key.SignatureAlgorithm,
-    session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0),
+    selected_encryption_c2s: Protocol.CipherAlgorithm = .aes256_ctr,
+    selected_encryption_s2c: Protocol.CipherAlgorithm = .aes256_ctr,
+    selected_mac_c2s: ?Protocol.MacAlgorithm = .hmac_sha2_256,
+    selected_mac_s2c: ?Protocol.MacAlgorithm = .hmac_sha2_256,
+    algorithm_offers_override: ?Protocol.AlgorithmOffers = null,
+    session_id: [48]u8 = @splat(0),
+    session_id_len: u8 = Protocol.hash_algo.digest_length,
     session_id_established: bool = false,
     user_authenticated: bool = false,
     keydata: Protocol.KeyDataBi,
@@ -198,7 +208,7 @@ pub const Session = struct {
             .encrypted = false,
             .inbound_encrypted = false,
             .keydata = Protocol.KeyDataBi.init(),
-            .kex_hasher = Hasher(Protocol.hash_algo).init(), // for hashing H
+            .kex_hasher = KexHasher.init(), // for hashing H
             .selected_hostkey_algorithm = null,
             .ecdh_ephem_keypair_active = false,
             .privkey_ascii = null,
@@ -274,10 +284,37 @@ pub const Session = struct {
         self.keydata.clear();
         self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
+        self.session_id_len = Protocol.hash_algo.digest_length;
         self.session_id_established = false;
         self.user_authenticated = false;
         self.encrypted = false;
         self.inbound_encrypted = false;
+    }
+
+    pub fn sessionIdSlice(self: *const Self) []const u8 {
+        return self.session_id[0..self.session_id_len];
+    }
+
+    pub fn effectiveAlgorithmOffers(self: *const Self) Protocol.AlgorithmOffers {
+        return self.algorithm_offers_override orelse Protocol.localAlgorithmOffers(Key.client_hostkey_algorithms);
+    }
+
+    fn setSharedSecret(self: *Self, slice: []const u8) void {
+        std.crypto.secureZero(u8, &self.shared_secret_k);
+        std.crypto.secureZero(u8, &self.shared_secret_k_ext);
+        const low_len = @min(slice.len, self.shared_secret_k.len);
+        @memcpy(self.shared_secret_k[0..low_len], slice[0..low_len]);
+        if (slice.len > self.shared_secret_k.len) {
+            const ext_len = slice.len - self.shared_secret_k.len;
+            @memcpy(self.shared_secret_k_ext[0..ext_len], slice[self.shared_secret_k.len..]);
+        }
+        self.shared_secret_k_len = @intCast(slice.len);
+    }
+
+    fn copySharedSecret(self: *const Self, out: *[48]u8) []const u8 {
+        @memcpy(out[0..32], &self.shared_secret_k);
+        @memcpy(out[32..48], &self.shared_secret_k_ext);
+        return out[0..self.shared_secret_k_len];
     }
 
     pub fn isActive(self: *const Self) bool {
@@ -317,6 +354,7 @@ pub const Session = struct {
         }
         self.clearKexState();
         std.crypto.secureZero(u8, &self.session_id);
+        self.session_id_len = Protocol.hash_algo.digest_length;
         self.session_id_established = false;
         self.user_authenticated = false;
         if (self.private_key) |*key| {
@@ -437,13 +475,15 @@ pub const Session = struct {
     }
 
     fn clearEphemeralKeyPair(self: *Self) void {
-        std.crypto.secureZero(u8, std.mem.asBytes(&self.ecdh_ephem_keypair));
+        self.ecdh_ephem_keypair.clear();
         self.ecdh_ephem_keypair_active = false;
     }
 
     fn clearKexState(self: *Self) void {
         self.clearEphemeralKeyPair();
         std.crypto.secureZero(u8, &self.shared_secret_k);
+        std.crypto.secureZero(u8, &self.shared_secret_k_ext);
+        self.shared_secret_k_len = Protocol.kex_algo.shared_length;
         self.kex_hasher.clear();
     }
 
@@ -536,7 +576,7 @@ pub const Session = struct {
 
     fn resetKexHasherForRekey(self: *Self) void {
         self.clearKexState();
-        self.kex_hasher = Hasher(Protocol.hash_algo).init();
+        self.kex_hasher = KexHasher.init();
         self.kex_hash_order = .Init;
         self.kex_hash_order = self.kex_hash_order.check(.V_C);
         self.kex_hasher.writeU32LenString(self.client_version.?);
@@ -603,9 +643,19 @@ pub const Session = struct {
     }
 
     fn installExchangeKeys(self: *Self, kexhash: [Protocol.hash_algo.digest_length]u8) SshzError!void {
-        defer std.crypto.secureZero(u8, &self.shared_secret_k);
+        return self.installExchangeKeysSlice(&kexhash);
+    }
+
+    fn installExchangeKeysSlice(self: *Self, kexhash: []const u8) SshzError!void {
+        defer {
+            std.crypto.secureZero(u8, &self.shared_secret_k);
+            std.crypto.secureZero(u8, &self.shared_secret_k_ext);
+            self.shared_secret_k_len = Protocol.kex_algo.shared_length;
+        }
         if (!self.is_rekeying) {
-            @memcpy(&self.session_id, &kexhash);
+            std.crypto.secureZero(u8, &self.session_id);
+            @memcpy(self.session_id[0..kexhash.len], kexhash);
+            self.session_id_len = @intCast(kexhash.len);
             self.session_id_established = true;
         } else if (!self.session_id_established) {
             // A re-key can never be the first exchange. Refuse rather than derive
@@ -615,7 +665,19 @@ pub const Session = struct {
         self.clearPendingKeys();
         var pending = Protocol.KeyDataBi.init();
         defer pending.clear();
-        try pending.genKeys(kexhash, self.shared_secret_k, self.session_id);
+        var k_buf: [48]u8 = undefined;
+        defer std.crypto.secureZero(u8, &k_buf);
+        const k_slice = self.copySharedSecret(&k_buf);
+        try pending.genKeysForAlgorithms(
+            kexhash,
+            k_slice,
+            self.sessionIdSlice(),
+            self.selected_kex_algorithm,
+            self.selected_encryption_c2s,
+            self.selected_encryption_s2c,
+            self.selected_mac_c2s,
+            self.selected_mac_s2c,
+        );
         pending.c2s.compression.queueAlgorithm(self.negotiated_compression_c2s);
         pending.s2c.compression.queueAlgorithm(self.negotiated_compression_s2c);
         self.pending_c2s_keys = pending.c2s;
@@ -744,7 +806,7 @@ pub const Session = struct {
                 self.rand.bytes(&cookie);
                 try pkt.writeBytes(&cookie);
 
-                const offers = Protocol.localAlgorithmOffers(Key.client_hostkey_algorithms);
+                const offers = self.effectiveAlgorithmOffers();
                 try pkt.writeU32LenString(offers.kex);
                 try pkt.writeU32LenString(offers.host_key);
                 try pkt.writeU32LenString(offers.encryption_c2s);
@@ -781,14 +843,10 @@ pub const Session = struct {
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_INIT));
 
-                var seed: [Protocol.kex_algo.seed_length]u8 = undefined;
-                defer std.crypto.secureZero(u8, &seed);
-                self.rand.bytes(&seed);
                 self.clearEphemeralKeyPair();
-                self.ecdh_ephem_keypair = Protocol.kex_algo.KeyPair.generateDeterministic(seed);
+                const q_c = try self.ecdh_ephem_keypair.initClient(self.selected_kex_algorithm, &self.rand);
                 self.ecdh_ephem_keypair_active = true;
-                var q_c = self.ecdh_ephem_keypair.public_key;
-                try pkt.writeU32LenString(&q_c);
+                try pkt.writeU32LenString(q_c);
 
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
                 self.setSessionState(.EcdhReply);
@@ -938,7 +996,7 @@ pub const Session = struct {
                 var backing_sigbuffer_buf: [4096]u8 = undefined;
                 defer std.crypto.secureZero(u8, &backing_sigbuffer_buf);
                 var sigbuffer = BufferWriter.init(&backing_sigbuffer_buf, 0);
-                try sigbuffer.writeU32LenString(&self.session_id);
+                try sigbuffer.writeU32LenString(self.sessionIdSlice());
                 try sigbuffer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST));
                 try sigbuffer.writeU32LenString(self.username);
                 try sigbuffer.writeU32LenString("ssh-connection");
@@ -2526,13 +2584,18 @@ pub const Session = struct {
 
                 // RFC 4253 §7.1: every selection follows the client's order.
                 const peer_kexinit = try Protocol.readKexInit(&rdr);
-                const negotiated = try Protocol.negotiateAlgorithms(
+                const negotiated = try Protocol.negotiateAlgorithmsWithLocalOffers(
                     peer_kexinit,
                     .Client,
-                    Key.client_hostkey_algorithms,
+                    self.effectiveAlgorithmOffers(),
                 );
+                self.selected_kex_algorithm = negotiated.kex;
                 self.selected_hostkey_algorithm = Key.SignatureAlgorithm.fromName(negotiated.host_key) orelse
                     return IoError.AlgorithmNegotiationFailed;
+                self.selected_encryption_c2s = negotiated.encryption_c2s;
+                self.selected_encryption_s2c = negotiated.encryption_s2c;
+                self.selected_mac_c2s = negotiated.mac_c2s;
+                self.selected_mac_s2c = negotiated.mac_s2c;
                 self.negotiated_compression_c2s = negotiated.compression_c2s;
                 self.negotiated_compression_s2c = negotiated.compression_s2c;
                 self.ignore_next_kex_packet = negotiated.ignore_next_peer_packet;
@@ -2557,7 +2620,7 @@ pub const Session = struct {
 
                     const srv_pub_ephem = try rdr.readU32LenString();
                     UNSAFE_TRACEDUMP(.Debug, "srv_pub_ephem: (len={d})", .{srv_pub_ephem.len}, srv_pub_ephem);
-                    if (srv_pub_ephem.len != Protocol.kex_algo.public_length) {
+                    if (srv_pub_ephem.len != self.selected_kex_algorithm.serverReplyLen()) {
                         return IoError.UnexpectedResponse;
                     }
 
@@ -2571,42 +2634,47 @@ pub const Session = struct {
                     self.kex_hasher.writeU32LenString(server_hostkey);
 
                     self.kex_hash_order = self.kex_hash_order.check(.Q_C);
-                    self.kex_hasher.writeU32LenString(&self.ecdh_ephem_keypair.public_key);
+                    self.kex_hasher.writeU32LenString(self.ecdh_ephem_keypair.clientInitSlice());
 
                     self.kex_hash_order = self.kex_hash_order.check(.Q_S);
                     self.kex_hasher.writeU32LenString(srv_pub_ephem);
 
                     // generate shared secret
-                    var shared_secret = try Protocol.kex_algo.scalarmult(
-                        self.ecdh_ephem_keypair.secret_key,
-                        srv_pub_ephem[0..Protocol.kex_algo.public_length].*,
-                    );
-                    defer std.crypto.secureZero(u8, &shared_secret);
-                    @memcpy(&self.shared_secret_k, &shared_secret);
+                    var shared_secret_buf: [48]u8 = undefined;
+                    defer std.crypto.secureZero(u8, &shared_secret_buf);
+                    const shared_secret = self.ecdh_ephem_keypair.finishClient(
+                        srv_pub_ephem,
+                        &shared_secret_buf,
+                    ) catch return IoError.InvalidEcdhKey;
+                    self.setSharedSecret(shared_secret);
                     self.clearEphemeralKeyPair();
 
-                    UNSAFE_TRACEDUMP(.Debug, "shared secret len={d}", .{self.shared_secret_k.len}, &self.shared_secret_k);
+                    UNSAFE_TRACEDUMP(.Debug, "shared secret len={d}", .{shared_secret.len}, shared_secret);
 
                     self.kex_hash_order = self.kex_hash_order.check(.K);
-                    self.kex_hasher.writeMpint(&self.shared_secret_k);
+                    if (self.selected_kex_algorithm.encodesSharedSecretAsString()) {
+                        self.kex_hasher.writeU32LenString(shared_secret);
+                    } else {
+                        self.kex_hasher.writeMpint(shared_secret);
+                    }
 
                     // Produce H/session_id/key exchange hash
                     // Both sides now have this
-                    var kexhash: [Protocol.hash_algo.digest_length]u8 = undefined; // session_id, H
-                    defer std.crypto.secureZero(u8, &kexhash);
-                    self.kex_hasher.final(&kexhash, null);
-                    UNSAFE_TRACEDUMP(.Debug, "kexhash: (len={d})", .{kexhash.len}, &kexhash);
+                    var kexhash_buf: [48]u8 = undefined; // session_id, H
+                    defer std.crypto.secureZero(u8, &kexhash_buf);
+                    const kexhash = self.kex_hasher.finalForAlgorithm(self.selected_kex_algorithm, &kexhash_buf);
+                    UNSAFE_TRACEDUMP(.Debug, "kexhash: (len={d})", .{kexhash.len}, kexhash);
 
                     const selected_sig_alg = self.selected_hostkey_algorithm orelse return IoError.UnexpectedResponse;
                     const sig_alg = try Key.signatureAlgorithm(sig_exch_hash);
                     if (sig_alg != selected_sig_alg) return IoError.AlgorithmNegotiationFailed;
                     const pubkey = try Key.parsePublicKeyBlob(server_hostkey);
                     if (pubkey.algorithm() != selected_sig_alg.keyAlgorithm()) return IoError.AlgorithmNegotiationFailed;
-                    try Key.verifySignature(pubkey, sig_exch_hash, &kexhash);
+                    try Key.verifySignature(pubkey, sig_exch_hash, kexhash);
 
                     // Only a signature-verified key reaches initial trust policy or rekey binding.
                     try self.bindVerifiedHostKey(server_hostkey);
-                    try self.installExchangeKeys(kexhash);
+                    try self.installExchangeKeysSlice(kexhash);
                     self.clearKexState();
                     std.crypto.secureZero(u8, &sshz.iobuf_rd);
                     std.crypto.secureZero(u8, &sshz.iobuf_decompressed);
@@ -3024,7 +3092,7 @@ test "client ignores exactly one packet after an incorrect KEX guess" {
     var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
     defer m.deinit();
 
-    var kexinit_backing: [512]u8 = undefined;
+    var kexinit_backing: [1024]u8 = undefined;
     var kexinit = BufferWriter.init(&kexinit_backing, 0);
     try writeKexInitPayloadWithGuess(
         &kexinit,
@@ -4615,7 +4683,7 @@ test "server initiated client rekey sends and hashes client KEXINIT before serve
     defer m.deinit();
     try m.session.setPeerProtocolVersion("SSH-2.0-test_server");
 
-    var server_payload_buf: [512]u8 = undefined;
+    var server_payload_buf: [1024]u8 = undefined;
     var server_payload = BufferWriter.init(&server_payload_buf, 0);
     try writeKexInitPayload(&server_payload);
     const server_packet_len = buildUnencryptedPacket(&m.iobuf_rd, server_payload.active());
@@ -4675,14 +4743,14 @@ test "simultaneous client local and server rekey uses one exact KEXINIT pair" {
     try m.session.advanceSession(&m);
     const local_packet = try m.peek(Protocol.MaxSSHPacket);
     const local_payload = unencryptedPayload(local_packet);
-    var local_payload_copy: [512]u8 = undefined;
+    var local_payload_copy: [1024]u8 = undefined;
     @memcpy(local_payload_copy[0..local_payload.len], local_payload);
     const local_payload_len = local_payload.len;
     try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT), local_payload[0]);
     try std.testing.expectEqual(SessionState.KexInitRead, m.session.sessionState);
     try m.consumed(local_packet.len);
 
-    var peer_payload_buf: [512]u8 = undefined;
+    var peer_payload_buf: [1024]u8 = undefined;
     var peer_payload = BufferWriter.init(&peer_payload_buf, 0);
     try writeKexInitPayload(&peer_payload);
     const peer_packet_len = buildUnencryptedPacket(&m.iobuf_rd, peer_payload.active());
@@ -4724,7 +4792,7 @@ test "client rekey gates deferred channel traffic until NEWKEYS completes" {
     try m.channelWriteComplete(channel_a.local_id, 2000);
     try m.sendChannelEof(channel_b.local_id);
 
-    var server_payload_buf: [512]u8 = undefined;
+    var server_payload_buf: [1024]u8 = undefined;
     var server_payload = BufferWriter.init(&server_payload_buf, 0);
     try writeKexInitPayload(&server_payload);
     const server_packet_len = buildUnencryptedPacket(&m.iobuf_rd, server_payload.active());
@@ -4791,7 +4859,8 @@ test "client rekey preserves initial session id for key derivation" {
     const original_session_id: [Protocol.hash_algo.digest_length]u8 = @splat(0x11);
     const rekey_hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x33);
     const rekey_secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x22);
-    session.session_id = original_session_id;
+    @memcpy(session.session_id[0..original_session_id.len], &original_session_id);
+    session.session_id_len = original_session_id.len;
     session.shared_secret_k = rekey_secret;
     session.is_rekeying = true;
     session.session_id_established = true;
@@ -4807,7 +4876,7 @@ test "client rekey preserves initial session id for key derivation" {
 
     const pending_c2s = &session.pending_c2s_keys.?;
     const pending_s2c = &session.pending_s2c_keys.?;
-    try std.testing.expectEqualSlices(u8, &original_session_id, &session.session_id);
+    try std.testing.expectEqualSlices(u8, &original_session_id, session.sessionIdSlice());
     try std.testing.expectEqualSlices(u8, &expected.c2s.iv, &pending_c2s.iv);
     try std.testing.expectEqualSlices(u8, &expected.c2s.key, &pending_c2s.key);
     try std.testing.expectEqualSlices(u8, &expected.c2s.mackey, &pending_c2s.mackey);
@@ -4827,7 +4896,8 @@ test "client rekey activates inbound and outbound keys at NEWKEYS boundaries" {
     const old_secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x30);
     const new_hash: [Protocol.hash_algo.digest_length]u8 = @splat(0x40);
     const new_secret: [Protocol.kex_algo.shared_length]u8 = @splat(0x50);
-    m.session.session_id = session_id;
+    @memcpy(m.session.session_id[0..session_id.len], &session_id);
+    m.session.session_id_len = session_id.len;
     try m.session.keydata.genKeys(old_hash, old_secret, session_id);
     m.session.keydata.c2s.epoch = 3;
     m.session.keydata.c2s.encrypted_bytes = 700;
@@ -5832,7 +5902,7 @@ test "handlePacket: peer rekey is rejected before the initial key exchange compl
     defer m.deinit();
     try m.session.setPeerProtocolVersion("SSH-2.0-test_server");
 
-    var server_payload_buf: [512]u8 = undefined;
+    var server_payload_buf: [1024]u8 = undefined;
     var server_payload = BufferWriter.init(&server_payload_buf, 0);
     try writeKexInitPayload(&server_payload);
     const server_packet_len = buildUnencryptedPacket(&m.iobuf_rd, server_payload.active());

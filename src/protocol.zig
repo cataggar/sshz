@@ -9,9 +9,12 @@ const BufferWriter = @import("buffer.zig").BufferWriter;
 const BufferError = @import("buffer.zig").BufferError;
 const BufferReader = @import("buffer.zig").BufferReader;
 const AesCtr = @import("aesctr.zig").AesCtr;
+const Aes192 = @import("aesctr.zig").Aes192;
 const decodePrivKey = @import("privkey.zig").decodePrivKey;
 const PrivKeyError = @import("privkey.zig").PrivKeyError;
 const Key = @import("key.zig");
+const KexHasher = @import("hasher.zig").KexHasher;
+const build_options = @import("sshz_build_options");
 const zlib = @import("zlib-c");
 
 pub const CommDir = enum {
@@ -172,19 +175,670 @@ pub const hash_algo_name = "hmac-sha2-256";
 
 pub const kex_algo = std.crypto.dh.X25519;
 pub const kex_algo_name = "curve25519-sha256";
-pub const kex_algorithms = kex_algo_name;
 
 pub const srv_hostkey_algo = std.crypto.sign.Ed25519;
 pub const srv_hostkey_algo_name = "ssh-ed25519";
 
 pub const mac_algo = std.crypto.auth.hmac.sha2.HmacSha256;
 pub const mac_algo_name = "hmac-sha2-256";
-pub const mac_algorithms = mac_algo_name;
 
 pub const enc_algo = std.crypto.core.aes.Aes256;
 pub const enc_algo_name = "aes256-ctr";
-pub const encryption_algorithms = enc_algo_name;
 pub const AesCtrT = AesCtr(enc_algo);
+pub const Aes192CtrT = AesCtr(Aes192);
+pub const Aes128CtrT = AesCtr(std.crypto.core.aes.Aes128);
+
+pub const KexAlgorithm = enum {
+    mlkem1024nistp384_sha384,
+    mlkem768nistp256_sha256,
+    mlkem768x25519_sha256,
+    curve25519_sha256,
+    curve25519_sha256_libssh,
+    ecdh_sha2_nistp384,
+    ecdh_sha2_nistp256,
+
+    pub const max_client_init_len: usize = 1568 + 97;
+    pub const max_server_reply_len: usize = 1568 + 97;
+    pub const max_shared_secret_len: usize = 48;
+    pub const max_digest_len: usize = 48;
+
+    pub fn name(self: KexAlgorithm) []const u8 {
+        return switch (self) {
+            .mlkem1024nistp384_sha384 => "mlkem1024nistp384-sha384",
+            .mlkem768nistp256_sha256 => "mlkem768nistp256-sha256",
+            .mlkem768x25519_sha256 => "mlkem768x25519-sha256",
+            .curve25519_sha256 => "curve25519-sha256",
+            .curve25519_sha256_libssh => "curve25519-sha256@libssh.org",
+            .ecdh_sha2_nistp384 => "ecdh-sha2-nistp384",
+            .ecdh_sha2_nistp256 => "ecdh-sha2-nistp256",
+        };
+    }
+
+    pub fn isEnabled(self: KexAlgorithm) bool {
+        return switch (self) {
+            .mlkem1024nistp384_sha384 => if (@hasDecl(build_options, "kex_mlkem1024nistp384_sha384")) build_options.kex_mlkem1024nistp384_sha384 else true,
+            .mlkem768nistp256_sha256 => if (@hasDecl(build_options, "kex_mlkem768nistp256_sha256")) build_options.kex_mlkem768nistp256_sha256 else true,
+            .mlkem768x25519_sha256 => if (@hasDecl(build_options, "kex_mlkem768x25519_sha256")) build_options.kex_mlkem768x25519_sha256 else true,
+            .curve25519_sha256, .curve25519_sha256_libssh => if (@hasDecl(build_options, "kex_curve25519_sha256")) build_options.kex_curve25519_sha256 else true,
+            .ecdh_sha2_nistp384 => if (@hasDecl(build_options, "kex_ecdh_sha2_nistp384")) build_options.kex_ecdh_sha2_nistp384 else true,
+            .ecdh_sha2_nistp256 => if (@hasDecl(build_options, "kex_ecdh_sha2_nistp256")) build_options.kex_ecdh_sha2_nistp256 else true,
+        };
+    }
+
+    pub fn fromName(alg_name: []const u8) ?KexAlgorithm {
+        inline for (std.meta.tags(KexAlgorithm)) |alg| {
+            if (alg.isEnabled() and std.mem.eql(u8, alg.name(), alg_name)) return alg;
+        }
+        return null;
+    }
+
+    pub fn clientInitLen(self: KexAlgorithm) usize {
+        return switch (self) {
+            .curve25519_sha256, .curve25519_sha256_libssh => 32,
+            .ecdh_sha2_nistp256 => 65,
+            .ecdh_sha2_nistp384 => 97,
+            .mlkem768x25519_sha256 => 1184 + 32,
+            .mlkem768nistp256_sha256 => 1184 + 65,
+            .mlkem1024nistp384_sha384 => 1568 + 97,
+        };
+    }
+
+    pub fn serverReplyLen(self: KexAlgorithm) usize {
+        return switch (self) {
+            .curve25519_sha256, .curve25519_sha256_libssh => 32,
+            .ecdh_sha2_nistp256 => 65,
+            .ecdh_sha2_nistp384 => 97,
+            .mlkem768x25519_sha256 => 1088 + 32,
+            .mlkem768nistp256_sha256 => 1088 + 65,
+            .mlkem1024nistp384_sha384 => 1568 + 97,
+        };
+    }
+
+    pub fn digestLength(self: KexAlgorithm) usize {
+        return switch (self) {
+            .mlkem1024nistp384_sha384, .ecdh_sha2_nistp384 => 48,
+            else => 32,
+        };
+    }
+
+    pub fn sharedSecretLength(self: KexAlgorithm) usize {
+        return switch (self) {
+            .mlkem1024nistp384_sha384, .ecdh_sha2_nistp384 => 48,
+            else => 32,
+        };
+    }
+
+    pub fn usesSha384(self: KexAlgorithm) bool {
+        return switch (self) {
+            .mlkem1024nistp384_sha384, .ecdh_sha2_nistp384 => true,
+            else => false,
+        };
+    }
+
+    pub fn encodesSharedSecretAsString(self: KexAlgorithm) bool {
+        return switch (self) {
+            .mlkem1024nistp384_sha384,
+            .mlkem768nistp256_sha256,
+            .mlkem768x25519_sha256,
+            => true,
+            else => false,
+        };
+    }
+};
+
+pub const MaxKexClientInitBytes: usize = 1568 + 97;
+pub const MaxKexServerReplyBytes: usize = 1568 + 97;
+
+pub const CipherAlgorithm = enum {
+    aes256_gcm,
+    chacha20_poly1305,
+    aes128_gcm,
+    aes256_ctr,
+    aes192_ctr,
+    aes128_ctr,
+
+    pub fn name(self: CipherAlgorithm) []const u8 {
+        return switch (self) {
+            .aes256_gcm => "aes256-gcm@openssh.com",
+            .chacha20_poly1305 => "chacha20-poly1305@openssh.com",
+            .aes128_gcm => "aes128-gcm@openssh.com",
+            .aes256_ctr => "aes256-ctr",
+            .aes192_ctr => "aes192-ctr",
+            .aes128_ctr => "aes128-ctr",
+        };
+    }
+
+    pub fn isEnabled(self: CipherAlgorithm) bool {
+        return switch (self) {
+            .aes256_gcm => if (@hasDecl(build_options, "cipher_aes256_gcm")) build_options.cipher_aes256_gcm else true,
+            .chacha20_poly1305 => if (@hasDecl(build_options, "cipher_chacha20_poly1305")) build_options.cipher_chacha20_poly1305 else true,
+            .aes128_gcm => if (@hasDecl(build_options, "cipher_aes128_gcm")) build_options.cipher_aes128_gcm else true,
+            .aes256_ctr => if (@hasDecl(build_options, "cipher_aes256_ctr")) build_options.cipher_aes256_ctr else true,
+            .aes192_ctr => if (@hasDecl(build_options, "cipher_aes192_ctr")) build_options.cipher_aes192_ctr else true,
+            .aes128_ctr => if (@hasDecl(build_options, "cipher_aes128_ctr")) build_options.cipher_aes128_ctr else true,
+        };
+    }
+
+    pub fn fromName(alg_name: []const u8) ?CipherAlgorithm {
+        inline for (std.meta.tags(CipherAlgorithm)) |alg| {
+            if (alg.isEnabled() and std.mem.eql(u8, alg.name(), alg_name)) return alg;
+        }
+        return null;
+    }
+
+    pub fn isAead(self: CipherAlgorithm) bool {
+        return switch (self) {
+            .aes256_gcm, .chacha20_poly1305, .aes128_gcm => true,
+            .aes256_ctr, .aes192_ctr, .aes128_ctr => false,
+        };
+    }
+
+    pub fn keyLength(self: CipherAlgorithm) usize {
+        return switch (self) {
+            .chacha20_poly1305 => 64,
+            .aes256_gcm, .aes256_ctr => 32,
+            .aes192_ctr => 24,
+            .aes128_gcm, .aes128_ctr => 16,
+        };
+    }
+
+    pub fn ivLength(self: CipherAlgorithm) usize {
+        return switch (self) {
+            .chacha20_poly1305 => 0,
+            .aes256_gcm, .aes128_gcm => 12,
+            .aes256_ctr, .aes192_ctr, .aes128_ctr => 16,
+        };
+    }
+
+    pub fn blockSize(self: CipherAlgorithm) usize {
+        return switch (self) {
+            .chacha20_poly1305 => 8,
+            else => 16,
+        };
+    }
+
+    pub fn aeadTagLength(self: CipherAlgorithm) usize {
+        return switch (self) {
+            .aes256_gcm, .chacha20_poly1305, .aes128_gcm => 16,
+            else => 0,
+        };
+    }
+};
+
+pub const MacAlgorithm = enum {
+    hmac_sha2_512_etm,
+    hmac_sha2_256_etm,
+    hmac_sha2_512,
+    hmac_sha2_256,
+
+    pub fn name(self: MacAlgorithm) []const u8 {
+        return switch (self) {
+            .hmac_sha2_512_etm => "hmac-sha2-512-etm@openssh.com",
+            .hmac_sha2_256_etm => "hmac-sha2-256-etm@openssh.com",
+            .hmac_sha2_512 => "hmac-sha2-512",
+            .hmac_sha2_256 => "hmac-sha2-256",
+        };
+    }
+
+    pub fn isEnabled(self: MacAlgorithm) bool {
+        return switch (self) {
+            .hmac_sha2_512_etm => if (@hasDecl(build_options, "mac_hmac_sha2_512_etm")) build_options.mac_hmac_sha2_512_etm else true,
+            .hmac_sha2_256_etm => if (@hasDecl(build_options, "mac_hmac_sha2_256_etm")) build_options.mac_hmac_sha2_256_etm else true,
+            .hmac_sha2_512 => if (@hasDecl(build_options, "mac_hmac_sha2_512")) build_options.mac_hmac_sha2_512 else true,
+            .hmac_sha2_256 => if (@hasDecl(build_options, "mac_hmac_sha2_256")) build_options.mac_hmac_sha2_256 else true,
+        };
+    }
+
+    pub fn fromName(alg_name: []const u8) ?MacAlgorithm {
+        inline for (std.meta.tags(MacAlgorithm)) |alg| {
+            if (alg.isEnabled() and std.mem.eql(u8, alg.name(), alg_name)) return alg;
+        }
+        return null;
+    }
+
+    pub fn keyLength(self: MacAlgorithm) usize {
+        return switch (self) {
+            .hmac_sha2_512_etm, .hmac_sha2_512 => 64,
+            .hmac_sha2_256_etm, .hmac_sha2_256 => 32,
+        };
+    }
+
+    pub fn tagLength(self: MacAlgorithm) usize {
+        return switch (self) {
+            .hmac_sha2_512_etm, .hmac_sha2_512 => 64,
+            .hmac_sha2_256_etm, .hmac_sha2_256 => 32,
+        };
+    }
+
+    pub fn isEtm(self: MacAlgorithm) bool {
+        return switch (self) {
+            .hmac_sha2_512_etm, .hmac_sha2_256_etm => true,
+            .hmac_sha2_512, .hmac_sha2_256 => false,
+        };
+    }
+};
+
+comptime {
+    var any_kex = false;
+    for (std.meta.tags(KexAlgorithm)) |alg| {
+        if (alg.isEnabled()) any_kex = true;
+    }
+    if (!any_kex) @compileError("sshz: at least one KexAlgorithm must be enabled");
+
+    var any_cipher = false;
+    var any_aead = false;
+    for (std.meta.tags(CipherAlgorithm)) |alg| {
+        if (alg.isEnabled()) {
+            any_cipher = true;
+            if (alg.isAead()) any_aead = true;
+        }
+    }
+    if (!any_cipher) @compileError("sshz: at least one CipherAlgorithm must be enabled");
+
+    var any_mac = false;
+    for (std.meta.tags(MacAlgorithm)) |alg| {
+        if (alg.isEnabled()) any_mac = true;
+    }
+    if (!any_mac and !any_aead) {
+        @compileError("sshz: at least one MacAlgorithm must be enabled when no AEAD CipherAlgorithm is enabled");
+    }
+}
+
+fn buildEnabledAlgorithmNameList(comptime AlgEnum: type) []const u8 {
+    comptime {
+        var result: []const u8 = "";
+        for (std.meta.tags(AlgEnum)) |alg| {
+            if (alg.isEnabled()) {
+                if (result.len > 0) result = result ++ ",";
+                result = result ++ alg.name();
+            }
+        }
+        return result;
+    }
+}
+
+pub const kex_algorithms = buildEnabledAlgorithmNameList(KexAlgorithm);
+pub const encryption_algorithms = buildEnabledAlgorithmNameList(CipherAlgorithm);
+pub const mac_algorithms = blk: {
+    const list = buildEnabledAlgorithmNameList(MacAlgorithm);
+    break :blk if (list.len > 0) list else "none";
+};
+
+pub fn isAllZero(bytes: []const u8) bool {
+    var acc: u8 = 0;
+    for (bytes) |b| acc |= b;
+    return acc == 0;
+}
+
+pub const EphemeralKexMaterial = struct {
+    const Self = @This();
+    const MLKem768 = std.crypto.kem.ml_kem.MLKem768;
+    const MLKem1024 = std.crypto.kem.ml_kem.MLKem1024;
+    const X25519 = std.crypto.dh.X25519;
+    const P256 = std.crypto.ecc.P256;
+    const P384 = std.crypto.ecc.P384;
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const Sha384 = std.crypto.hash.sha2.Sha384;
+
+    alg: KexAlgorithm = .curve25519_sha256,
+    active: bool = false,
+    x25519_secret: [32]u8 = @splat(0),
+    p256_secret: [32]u8 = @splat(0),
+    p384_secret: [48]u8 = @splat(0),
+    mlkem768_secret: MLKem768.SecretKey = undefined,
+    mlkem1024_secret: MLKem1024.SecretKey = undefined,
+    client_init_buf: [KexAlgorithm.max_client_init_len]u8 = @splat(0),
+    client_init_len: usize = 0,
+
+    fn generateP256KeyPair(rand: *std.Random, out_secret: *[32]u8, out_pub: *[65]u8) SshzError!void {
+        while (true) {
+            var raw: [48]u8 = undefined;
+            defer std.crypto.secureZero(u8, &raw);
+            rand.bytes(&raw);
+            const s = P256.scalar.Scalar.fromBytes48(raw, .little);
+            if (s.isZero()) continue;
+            out_secret.* = s.toBytes(.big);
+            const pt = P256.basePoint.mul(out_secret.*, .big) catch continue;
+            out_pub.* = pt.toUncompressedSec1();
+            return;
+        }
+    }
+
+    fn generateP384KeyPair(rand: *std.Random, out_secret: *[48]u8, out_pub: *[97]u8) SshzError!void {
+        while (true) {
+            var raw: [64]u8 = undefined;
+            defer std.crypto.secureZero(u8, &raw);
+            rand.bytes(&raw);
+            const s = P384.scalar.Scalar.fromBytes64(raw, .little);
+            if (s.isZero()) continue;
+            out_secret.* = s.toBytes(.big);
+            const pt = P384.basePoint.mul(out_secret.*, .big) catch continue;
+            out_pub.* = pt.toUncompressedSec1();
+            return;
+        }
+    }
+
+    fn computeP256Shared(secret: [32]u8, peer_bytes: []const u8, out: *[32]u8) SshzError!void {
+        if (peer_bytes.len != 65 or peer_bytes[0] != 0x04) return IoError.InvalidEcdhKey;
+        const peer_pt = P256.fromSec1(peer_bytes) catch return IoError.InvalidEcdhKey;
+        const shared_pt = peer_pt.mul(secret, .big) catch return IoError.InvalidEcdhKey;
+        out.* = shared_pt.affineCoordinates().x.toBytes(.big);
+        if (isAllZero(out)) return IoError.InvalidEcdhKey;
+    }
+
+    fn computeP384Shared(secret: [48]u8, peer_bytes: []const u8, out: *[48]u8) SshzError!void {
+        if (peer_bytes.len != 97 or peer_bytes[0] != 0x04) return IoError.InvalidEcdhKey;
+        const peer_pt = P384.fromSec1(peer_bytes) catch return IoError.InvalidEcdhKey;
+        const shared_pt = peer_pt.mul(secret, .big) catch return IoError.InvalidEcdhKey;
+        out.* = shared_pt.affineCoordinates().x.toBytes(.big);
+        if (isAllZero(out)) return IoError.InvalidEcdhKey;
+    }
+
+    pub fn initClient(self: *Self, alg: KexAlgorithm, rand: *std.Random) SshzError![]const u8 {
+        self.clear();
+        self.alg = alg;
+        switch (alg) {
+            .curve25519_sha256, .curve25519_sha256_libssh => {
+                var seed: [X25519.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &seed);
+                rand.bytes(&seed);
+                const kp = X25519.KeyPair.generateDeterministic(seed);
+                self.x25519_secret = kp.secret_key;
+                @memcpy(self.client_init_buf[0..32], &kp.public_key);
+                self.client_init_len = 32;
+            },
+            .ecdh_sha2_nistp256 => {
+                var pub_bytes: [65]u8 = undefined;
+                try generateP256KeyPair(rand, &self.p256_secret, &pub_bytes);
+                @memcpy(self.client_init_buf[0..65], &pub_bytes);
+                self.client_init_len = 65;
+            },
+            .ecdh_sha2_nistp384 => {
+                var pub_bytes: [97]u8 = undefined;
+                try generateP384KeyPair(rand, &self.p384_secret, &pub_bytes);
+                @memcpy(self.client_init_buf[0..97], &pub_bytes);
+                self.client_init_len = 97;
+            },
+            .mlkem768x25519_sha256 => {
+                var kem_seed: [MLKem768.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &kem_seed);
+                rand.bytes(&kem_seed);
+                const kem_kp = MLKem768.KeyPair.generateDeterministic(kem_seed) catch return IoError.InvalidEcdhKey;
+                self.mlkem768_secret = kem_kp.secret_key;
+                const kem_pub = kem_kp.public_key.toBytes();
+                @memcpy(self.client_init_buf[0..1184], &kem_pub);
+
+                var x_seed: [X25519.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &x_seed);
+                rand.bytes(&x_seed);
+                const x_kp = X25519.KeyPair.generateDeterministic(x_seed);
+                self.x25519_secret = x_kp.secret_key;
+                @memcpy(self.client_init_buf[1184 .. 1184 + 32], &x_kp.public_key);
+                self.client_init_len = 1184 + 32;
+            },
+            .mlkem768nistp256_sha256 => {
+                var kem_seed: [MLKem768.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &kem_seed);
+                rand.bytes(&kem_seed);
+                const kem_kp = MLKem768.KeyPair.generateDeterministic(kem_seed) catch return IoError.InvalidEcdhKey;
+                self.mlkem768_secret = kem_kp.secret_key;
+                const kem_pub = kem_kp.public_key.toBytes();
+                @memcpy(self.client_init_buf[0..1184], &kem_pub);
+
+                var p256_pub: [65]u8 = undefined;
+                try generateP256KeyPair(rand, &self.p256_secret, &p256_pub);
+                @memcpy(self.client_init_buf[1184 .. 1184 + 65], &p256_pub);
+                self.client_init_len = 1184 + 65;
+            },
+            .mlkem1024nistp384_sha384 => {
+                var kem_seed: [MLKem1024.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &kem_seed);
+                rand.bytes(&kem_seed);
+                const kem_kp = MLKem1024.KeyPair.generateDeterministic(kem_seed) catch return IoError.InvalidEcdhKey;
+                self.mlkem1024_secret = kem_kp.secret_key;
+                const kem_pub = kem_kp.public_key.toBytes();
+                @memcpy(self.client_init_buf[0..1568], &kem_pub);
+
+                var p384_pub: [97]u8 = undefined;
+                try generateP384KeyPair(rand, &self.p384_secret, &p384_pub);
+                @memcpy(self.client_init_buf[1568 .. 1568 + 97], &p384_pub);
+                self.client_init_len = 1568 + 97;
+            },
+        }
+        self.active = true;
+        return self.client_init_buf[0..self.client_init_len];
+    }
+
+    pub fn clientInitSlice(self: *const Self) []const u8 {
+        return self.client_init_buf[0..self.client_init_len];
+    }
+
+    pub fn finishClient(
+        self: *Self,
+        s_reply: []const u8,
+        out_shared: *[KexAlgorithm.max_shared_secret_len]u8,
+    ) SshzError![]const u8 {
+        defer self.clear();
+        if (s_reply.len != self.alg.serverReplyLen()) return IoError.UnexpectedResponse;
+
+        switch (self.alg) {
+            .curve25519_sha256, .curve25519_sha256_libssh => {
+                var dh = X25519.scalarmult(self.x25519_secret, s_reply[0..32].*) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &dh);
+                if (isAllZero(&dh)) return IoError.InvalidEcdhKey;
+                @memcpy(out_shared[0..32], &dh);
+                return out_shared[0..32];
+            },
+            .ecdh_sha2_nistp256 => {
+                try computeP256Shared(self.p256_secret, s_reply, out_shared[0..32]);
+                return out_shared[0..32];
+            },
+            .ecdh_sha2_nistp384 => {
+                try computeP384Shared(self.p384_secret, s_reply, out_shared[0..48]);
+                return out_shared[0..48];
+            },
+            .mlkem768x25519_sha256 => {
+                const s_ct2 = s_reply[0..1088];
+                const s_pk1 = s_reply[1088..1120];
+                var k_pq = self.mlkem768_secret.decaps(s_ct2) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &k_pq);
+                var k_cl = X25519.scalarmult(self.x25519_secret, s_pk1.*) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &k_cl);
+                if (isAllZero(&k_cl)) return IoError.InvalidEcdhKey;
+
+                var h = Sha256.init(.{});
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+                h.update(&k_pq);
+                h.update(&k_cl);
+                h.final(out_shared[0..32]);
+                return out_shared[0..32];
+            },
+            .mlkem768nistp256_sha256 => {
+                const s_ct2 = s_reply[0..1088];
+                const s_pk1 = s_reply[1088..1153];
+                var k_pq = self.mlkem768_secret.decaps(s_ct2) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &k_pq);
+                var k_cl: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &k_cl);
+                try computeP256Shared(self.p256_secret, s_pk1, &k_cl);
+
+                var h = Sha256.init(.{});
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+                h.update(&k_pq);
+                h.update(&k_cl);
+                h.final(out_shared[0..32]);
+                return out_shared[0..32];
+            },
+            .mlkem1024nistp384_sha384 => {
+                const s_ct2 = s_reply[0..1568];
+                const s_pk1 = s_reply[1568..1665];
+                var k_pq = self.mlkem1024_secret.decaps(s_ct2) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &k_pq);
+                var k_cl: [48]u8 = undefined;
+                defer std.crypto.secureZero(u8, &k_cl);
+                try computeP384Shared(self.p384_secret, s_pk1, &k_cl);
+
+                var h = Sha384.init(.{});
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+                h.update(&k_pq);
+                h.update(&k_cl);
+                h.final(out_shared[0..48]);
+                return out_shared[0..48];
+            },
+        }
+    }
+
+    pub fn respondServer(
+        alg: KexAlgorithm,
+        rand: *std.Random,
+        c_init: []const u8,
+        out_s_reply: *[KexAlgorithm.max_server_reply_len]u8,
+        out_shared: *[KexAlgorithm.max_shared_secret_len]u8,
+    ) SshzError!struct { s_reply: []const u8, shared_secret: []const u8 } {
+        if (c_init.len != alg.clientInitLen()) return IoError.UnexpectedResponse;
+
+        switch (alg) {
+            .curve25519_sha256, .curve25519_sha256_libssh => {
+                var seed: [X25519.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &seed);
+                rand.bytes(&seed);
+                var kp = X25519.KeyPair.generateDeterministic(seed);
+                defer std.crypto.secureZero(u8, &kp.secret_key);
+                var dh = X25519.scalarmult(kp.secret_key, c_init[0..32].*) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &dh);
+                if (isAllZero(&dh)) return IoError.InvalidEcdhKey;
+                @memcpy(out_s_reply[0..32], &kp.public_key);
+                @memcpy(out_shared[0..32], &dh);
+                return .{ .s_reply = out_s_reply[0..32], .shared_secret = out_shared[0..32] };
+            },
+            .ecdh_sha2_nistp256 => {
+                var s_secret: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &s_secret);
+                var s_pub: [65]u8 = undefined;
+                try generateP256KeyPair(rand, &s_secret, &s_pub);
+                try computeP256Shared(s_secret, c_init, out_shared[0..32]);
+                @memcpy(out_s_reply[0..65], &s_pub);
+                return .{ .s_reply = out_s_reply[0..65], .shared_secret = out_shared[0..32] };
+            },
+            .ecdh_sha2_nistp384 => {
+                var s_secret: [48]u8 = undefined;
+                defer std.crypto.secureZero(u8, &s_secret);
+                var s_pub: [97]u8 = undefined;
+                try generateP384KeyPair(rand, &s_secret, &s_pub);
+                try computeP384Shared(s_secret, c_init, out_shared[0..48]);
+                @memcpy(out_s_reply[0..97], &s_pub);
+                return .{ .s_reply = out_s_reply[0..97], .shared_secret = out_shared[0..48] };
+            },
+            .mlkem768x25519_sha256 => {
+                const c_pk2 = c_init[0..1184];
+                const c_pk1 = c_init[1184..1216];
+                const kem_pk = MLKem768.PublicKey.fromBytes(c_pk2) catch return IoError.InvalidEcdhKey;
+                var enc_seed: [MLKem768.encaps_seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &enc_seed);
+                rand.bytes(&enc_seed);
+                var enc = kem_pk.encapsDeterministic(&enc_seed);
+                defer std.crypto.secureZero(u8, &enc.shared_secret);
+
+                var x_seed: [X25519.seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &x_seed);
+                rand.bytes(&x_seed);
+                var x_kp = X25519.KeyPair.generateDeterministic(x_seed);
+                defer std.crypto.secureZero(u8, &x_kp.secret_key);
+                var k_cl = X25519.scalarmult(x_kp.secret_key, c_pk1.*) catch return IoError.InvalidEcdhKey;
+                defer std.crypto.secureZero(u8, &k_cl);
+                if (isAllZero(&k_cl)) return IoError.InvalidEcdhKey;
+
+                @memcpy(out_s_reply[0..1088], &enc.ciphertext);
+                @memcpy(out_s_reply[1088..1120], &x_kp.public_key);
+
+                var h = Sha256.init(.{});
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+                h.update(&enc.shared_secret);
+                h.update(&k_cl);
+                h.final(out_shared[0..32]);
+                return .{ .s_reply = out_s_reply[0..1120], .shared_secret = out_shared[0..32] };
+            },
+            .mlkem768nistp256_sha256 => {
+                const c_pk2 = c_init[0..1184];
+                const c_pk1 = c_init[1184..1249];
+                const kem_pk = MLKem768.PublicKey.fromBytes(c_pk2) catch return IoError.InvalidEcdhKey;
+                var enc_seed: [MLKem768.encaps_seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &enc_seed);
+                rand.bytes(&enc_seed);
+                var enc = kem_pk.encapsDeterministic(&enc_seed);
+                defer std.crypto.secureZero(u8, &enc.shared_secret);
+
+                var s_secret: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &s_secret);
+                var s_pub: [65]u8 = undefined;
+                try generateP256KeyPair(rand, &s_secret, &s_pub);
+                var k_cl: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &k_cl);
+                try computeP256Shared(s_secret, c_pk1, &k_cl);
+
+                @memcpy(out_s_reply[0..1088], &enc.ciphertext);
+                @memcpy(out_s_reply[1088..1153], &s_pub);
+
+                var h = Sha256.init(.{});
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+                h.update(&enc.shared_secret);
+                h.update(&k_cl);
+                h.final(out_shared[0..32]);
+                return .{ .s_reply = out_s_reply[0..1153], .shared_secret = out_shared[0..32] };
+            },
+            .mlkem1024nistp384_sha384 => {
+                const c_pk2 = c_init[0..1568];
+                const c_pk1 = c_init[1568..1665];
+                const kem_pk = MLKem1024.PublicKey.fromBytes(c_pk2) catch return IoError.InvalidEcdhKey;
+                var enc_seed: [MLKem1024.encaps_seed_length]u8 = undefined;
+                defer std.crypto.secureZero(u8, &enc_seed);
+                rand.bytes(&enc_seed);
+                var enc = kem_pk.encapsDeterministic(&enc_seed);
+                defer std.crypto.secureZero(u8, &enc.shared_secret);
+
+                var s_secret: [48]u8 = undefined;
+                defer std.crypto.secureZero(u8, &s_secret);
+                var s_pub: [97]u8 = undefined;
+                try generateP384KeyPair(rand, &s_secret, &s_pub);
+                var k_cl: [48]u8 = undefined;
+                defer std.crypto.secureZero(u8, &k_cl);
+                try computeP384Shared(s_secret, c_pk1, &k_cl);
+
+                @memcpy(out_s_reply[0..1568], &enc.ciphertext);
+                @memcpy(out_s_reply[1568..1665], &s_pub);
+
+                var h = Sha384.init(.{});
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&h));
+                h.update(&enc.shared_secret);
+                h.update(&k_cl);
+                h.final(out_shared[0..48]);
+                return .{ .s_reply = out_s_reply[0..1665], .shared_secret = out_shared[0..48] };
+            },
+        }
+    }
+
+    pub fn writeSharedSecretToKexHasher(alg: KexAlgorithm, kex_hasher: *KexHasher, shared_secret: []const u8) void {
+        if (alg.encodesSharedSecretAsString()) {
+            kex_hasher.writeU32LenString(shared_secret);
+        } else {
+            kex_hasher.writeMpint(shared_secret);
+        }
+    }
+
+    pub fn finalizeKexHasher(alg: KexAlgorithm, kex_hasher: *KexHasher, out_hash: *[KexAlgorithm.max_digest_len]u8) []const u8 {
+        if (alg.usesSha384()) {
+            kex_hasher.finalSha384(out_hash[0..48]);
+            return out_hash[0..48];
+        } else {
+            kex_hasher.finalSha256(out_hash[0..32]);
+            return out_hash[0..32];
+        }
+    }
+
+    pub fn clear(self: *Self) void {
+        std.crypto.secureZero(u8, std.mem.asBytes(self));
+    }
+};
 
 pub const compression_none = "none";
 pub const compression_zlib_openssh = "zlib@openssh.com";
@@ -227,7 +881,12 @@ pub const KexInit = struct {
 };
 
 pub const NegotiatedAlgorithms = struct {
+    kex: KexAlgorithm,
     host_key: []const u8,
+    encryption_c2s: CipherAlgorithm,
+    encryption_s2c: CipherAlgorithm,
+    mac_c2s: ?MacAlgorithm,
+    mac_s2c: ?MacAlgorithm,
     compression_c2s: CompressionAlgorithm,
     compression_s2c: CompressionAlgorithm,
     ignore_next_peer_packet: bool,
@@ -315,8 +974,21 @@ pub fn negotiateAlgorithms(
     role: AlgorithmRole,
     local_host_key_algorithms: []const u8,
 ) SshzError!NegotiatedAlgorithms {
+    if (!isValidNameList(local_host_key_algorithms, true)) {
+        return IoError.AlgorithmNegotiationFailed;
+    }
+    return negotiateAlgorithmsWithLocalOffers(peer, role, localAlgorithmOffers(local_host_key_algorithms));
+}
+
+pub fn negotiateAlgorithmsWithLocalOffers(
+    peer: KexInit,
+    role: AlgorithmRole,
+    local: AlgorithmOffers,
+) SshzError!NegotiatedAlgorithms {
     inline for (@typeInfo(AlgorithmOffers).@"struct".field_names) |name| {
-        if (!isValidNameList(@field(peer.offers, name), true)) {
+        if (!isValidNameList(@field(peer.offers, name), true) or
+            !isValidNameList(@field(local, name), true))
+        {
             return IoError.AlgorithmNegotiationFailed;
         }
     }
@@ -325,15 +997,13 @@ pub fn negotiateAlgorithms(
     {
         return IoError.AlgorithmNegotiationFailed;
     }
-    if (!isValidNameList(local_host_key_algorithms, true)) {
-        return IoError.AlgorithmNegotiationFailed;
-    }
 
-    const local = localAlgorithmOffers(local_host_key_algorithms);
     const client = if (role == .Client) local else peer.offers;
     const server = if (role == .Client) peer.offers else local;
 
-    const selected_kex = selectClientPreferred(client.kex, server.kex) orelse
+    const selected_kex_name = selectClientPreferred(client.kex, server.kex) orelse
+        return IoError.AlgorithmNegotiationFailed;
+    const selected_kex = KexAlgorithm.fromName(selected_kex_name) orelse
         return IoError.AlgorithmNegotiationFailed;
     const selected_host_key = selectClientPreferred(client.host_key, server.host_key) orelse
         return IoError.AlgorithmNegotiationFailed;
@@ -342,25 +1012,49 @@ pub fn negotiateAlgorithms(
     if (!selected_host_key_alg.isEnabled()) {
         return IoError.AlgorithmNegotiationFailed;
     }
-    _ = selectClientPreferred(client.encryption_c2s, server.encryption_c2s) orelse
+    const selected_enc_c2s_name = selectClientPreferred(client.encryption_c2s, server.encryption_c2s) orelse
         return IoError.AlgorithmNegotiationFailed;
-    _ = selectClientPreferred(client.encryption_s2c, server.encryption_s2c) orelse
+    const selected_enc_c2s = CipherAlgorithm.fromName(selected_enc_c2s_name) orelse
         return IoError.AlgorithmNegotiationFailed;
-    _ = selectClientPreferred(client.mac_c2s, server.mac_c2s) orelse
+    const selected_enc_s2c_name = selectClientPreferred(client.encryption_s2c, server.encryption_s2c) orelse
         return IoError.AlgorithmNegotiationFailed;
-    _ = selectClientPreferred(client.mac_s2c, server.mac_s2c) orelse
+    const selected_enc_s2c = CipherAlgorithm.fromName(selected_enc_s2c_name) orelse
         return IoError.AlgorithmNegotiationFailed;
+
+    const selected_mac_c2s: ?MacAlgorithm = if (selected_enc_c2s.isAead())
+        null
+    else blk: {
+        const mac_name = selectClientPreferred(client.mac_c2s, server.mac_c2s) orelse
+            return IoError.AlgorithmNegotiationFailed;
+        break :blk MacAlgorithm.fromName(mac_name) orelse
+            return IoError.AlgorithmNegotiationFailed;
+    };
+
+    const selected_mac_s2c: ?MacAlgorithm = if (selected_enc_s2c.isAead())
+        null
+    else blk: {
+        const mac_name = selectClientPreferred(client.mac_s2c, server.mac_s2c) orelse
+            return IoError.AlgorithmNegotiationFailed;
+        break :blk MacAlgorithm.fromName(mac_name) orelse
+            return IoError.AlgorithmNegotiationFailed;
+    };
+
     const selected_compression_c2s = selectClientPreferred(client.compression_c2s, server.compression_c2s) orelse
         return IoError.AlgorithmNegotiationFailed;
     const selected_compression_s2c = selectClientPreferred(client.compression_s2c, server.compression_s2c) orelse
         return IoError.AlgorithmNegotiationFailed;
 
     const peer_guessed_correctly =
-        std.mem.eql(u8, firstName(peer.offers.kex), selected_kex) and
+        std.mem.eql(u8, firstName(peer.offers.kex), selected_kex_name) and
         std.mem.eql(u8, firstName(peer.offers.host_key), selected_host_key);
 
     return .{
+        .kex = selected_kex,
         .host_key = selected_host_key,
+        .encryption_c2s = selected_enc_c2s,
+        .encryption_s2c = selected_enc_s2c,
+        .mac_c2s = selected_mac_c2s,
+        .mac_s2c = selected_mac_s2c,
         .compression_c2s = CompressionAlgorithm.fromName(selected_compression_c2s) orelse unreachable,
         .compression_s2c = CompressionAlgorithm.fromName(selected_compression_s2c) orelse unreachable,
         .ignore_next_peer_packet = peer.first_kex_packet_follows and !peer_guessed_correctly,
@@ -567,16 +1261,75 @@ pub const CompressionState = struct {
 };
 
 pub const KeyDataUni = struct {
-    iv: [MaxIVLen]u8 = undefined,
-    key: [MaxKeyLen]u8 = undefined,
-    mackey: [MaxKeyLen]u8 = undefined,
+    iv: [MaxIVLen]u8 = @splat(0),
+    key: [MaxKeyLen]u8 = @splat(0),
+    mackey: [MaxKeyLen]u8 = @splat(0),
     seq: u32,
     epoch: u64 = 0,
     encrypted_bytes: u64 = 0,
     encrypted_packets: u64 = 0,
     activated_at_monotonic_tick: ?u64 = null,
+    cipher: CipherAlgorithm = .aes256_ctr,
+    mac: ?MacAlgorithm = .hmac_sha2_256,
+    gcm_bytecount: u64 = 0,
     aesctr: AesCtrT = undefined,
+    aes192ctr: Aes192CtrT = undefined,
+    aes128ctr: Aes128CtrT = undefined,
     compression: CompressionState = .{},
+
+    pub fn initCipher(self: *KeyDataUni) void {
+        self.gcm_bytecount = 0;
+        switch (self.cipher) {
+            .aes256_ctr => self.aesctr = AesCtrT.init(self.iv[0..AesCtrT.iv_size].*, self.key[0..AesCtrT.key_size].*),
+            .aes192_ctr => self.aes192ctr = Aes192CtrT.init(self.iv[0..Aes192CtrT.iv_size].*, self.key[0..Aes192CtrT.key_size].*),
+            .aes128_ctr => self.aes128ctr = Aes128CtrT.init(self.iv[0..Aes128CtrT.iv_size].*, self.key[0..Aes128CtrT.key_size].*),
+            .aes256_gcm, .aes128_gcm, .chacha20_poly1305 => {},
+        }
+    }
+
+    pub fn encryptCtr(self: *KeyDataUni, in: []const u8, out: []u8) AesCtrT.Error!void {
+        switch (self.cipher) {
+            .aes256_ctr => return self.aesctr.encrypt(in, out),
+            .aes192_ctr => return self.aes192ctr.encrypt(in, out),
+            .aes128_ctr => return self.aes128ctr.encrypt(in, out),
+            else => unreachable,
+        }
+    }
+
+    pub fn tagLength(self: *const KeyDataUni) usize {
+        if (self.cipher.isAead()) return self.cipher.aeadTagLength();
+        return if (self.mac) |m| m.tagLength() else 0;
+    }
+
+    pub fn usesCleartextOrAeadLengthPrefix(self: *const KeyDataUni) bool {
+        if (self.cipher.isAead()) return true;
+        return if (self.mac) |m| m.isEtm() else false;
+    }
+
+    pub fn computeMac(self: *const KeyDataUni, seq_num: u32, data: []const u8, out_tag: *[64]u8) []const u8 {
+        const mac_alg = self.mac.?;
+        const seq_be = std.mem.nativeTo(u32, seq_num, .big);
+        switch (mac_alg) {
+            .hmac_sha2_256, .hmac_sha2_256_etm => {
+                const Hmac256 = std.crypto.auth.hmac.sha2.HmacSha256;
+                var m = Hmac256.init(self.mackey[0..32]);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
+                m.update(std.mem.asBytes(&seq_be));
+                m.update(data);
+                m.final(out_tag[0..32]);
+                return out_tag[0..32];
+            },
+            .hmac_sha2_512, .hmac_sha2_512_etm => {
+                const Hmac512 = std.crypto.auth.hmac.sha2.HmacSha512;
+                var m = Hmac512.init(self.mackey[0..64]);
+                defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
+                m.update(std.mem.asBytes(&seq_be));
+                m.update(data);
+                m.final(out_tag[0..64]);
+                return out_tag[0..64];
+            },
+        }
+    }
 
     pub fn activateEpoch(self: *KeyDataUni, previous_epoch: u64, activated_at: ?u64) SshzError!void {
         if (previous_epoch == std.math.maxInt(u64)) return IoError.KeyLifetimeExceeded;
@@ -599,6 +1352,9 @@ pub const KeyDataUni = struct {
         std.crypto.secureZero(u8, &self.key);
         std.crypto.secureZero(u8, &self.mackey);
         self.aesctr.clear();
+        self.aes192ctr.clear();
+        self.aes128ctr.clear();
+        self.gcm_bytecount = 0;
         self.seq = 0;
         self.epoch = 0;
         self.encrypted_bytes = 0;
@@ -607,10 +1363,10 @@ pub const KeyDataUni = struct {
     }
 };
 
-fn deriveKeyMaterial(out: []u8, data_kh: []const u8, discriminator: u8, session_id: []const u8) void {
-    var hasher = hash_algo.init(.{});
+fn deriveKeyMaterialWithHash(comptime HashAlgo: type, out: []u8, data_kh: []const u8, discriminator: u8, session_id: []const u8) void {
+    var hasher = HashAlgo.init(.{});
     defer std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
-    var digest: [hash_algo.digest_length]u8 = undefined;
+    var digest: [HashAlgo.digest_length]u8 = undefined;
     defer std.crypto.secureZero(u8, &digest);
 
     hasher.update(data_kh);
@@ -622,13 +1378,21 @@ fn deriveKeyMaterial(out: []u8, data_kh: []const u8, discriminator: u8, session_
     @memcpy(out[0..written], digest[0..written]);
     while (written < out.len) {
         std.crypto.secureZero(u8, std.mem.asBytes(&hasher));
-        hasher = hash_algo.init(.{});
+        hasher = HashAlgo.init(.{});
         hasher.update(data_kh);
         hasher.update(out[0..written]);
         hasher.final(&digest);
         const take: usize = @min(out.len - written, digest.len);
         @memcpy(out[written .. written + take], digest[0..take]);
         written += take;
+    }
+}
+
+fn deriveKeyMaterialForKex(kex: KexAlgorithm, out: []u8, data_kh: []const u8, discriminator: u8, session_id: []const u8) void {
+    if (kex.usesSha384()) {
+        deriveKeyMaterialWithHash(std.crypto.hash.sha2.Sha384, out, data_kh, discriminator, session_id);
+    } else {
+        deriveKeyMaterialWithHash(std.crypto.hash.sha2.Sha256, out, data_kh, discriminator, session_id);
     }
 }
 
@@ -650,48 +1414,72 @@ pub const KeyDataBi = struct {
         self.s2c.clear();
     }
 
-    // generate session keys from shared secret
+    // generate session keys from shared secret (default curve25519-sha256 + aes256-ctr + hmac-sha2-256)
     pub fn genKeys(self: *Self, H: [hash_algo.digest_length]u8, shared_secret_k: [kex_algo.shared_length]u8, session_id: [hash_algo.digest_length]u8) !void {
+        return self.genKeysForAlgorithms(
+            &H,
+            &shared_secret_k,
+            &session_id,
+            .curve25519_sha256,
+            .aes256_ctr,
+            .aes256_ctr,
+            .hmac_sha2_256,
+            .hmac_sha2_256,
+        );
+    }
+
+    pub fn genKeysForAlgorithms(
+        self: *Self,
+        H: []const u8,
+        shared_secret_k: []const u8,
+        session_id: []const u8,
+        kex: KexAlgorithm,
+        cipher_c2s: CipherAlgorithm,
+        cipher_s2c: CipherAlgorithm,
+        mac_c2s: ?MacAlgorithm,
+        mac_s2c: ?MacAlgorithm,
+    ) !void {
         // https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
         // The inputs are borrowed from session-owned state; only the encoded
         // K || H scratch and derived state created here are owned here.
         errdefer self.clear();
 
-        // prepare contact(K,H) = K:mpint concat H:raw
-        var backing: [4 + kex_algo.shared_length + 1 + hash_algo.digest_length]u8 = undefined; // 4 for len, 1 for possible padding
+        var backing: [4 + KexAlgorithm.max_shared_secret_len + 1 + KexAlgorithm.max_digest_len]u8 = undefined;
         defer std.crypto.secureZero(u8, &backing);
         var khbuf = BufferWriter.init(&backing, 0);
-        try khbuf.writeMpint(&shared_secret_k); // K
-        try khbuf.writeBytes(&H); // H
+        if (kex.encodesSharedSecretAsString()) {
+            try khbuf.writeU32LenString(shared_secret_k); // RFC 10042 §3: string
+        } else {
+            try khbuf.writeMpint(shared_secret_k); // RFC 4253 / 5656 / 8731: mpint
+        }
+        try khbuf.writeBytes(H);
         const data_kh = khbuf.payload;
 
-        // c2s.iv
-        deriveKeyMaterial(&self.c2s.iv, data_kh, 'A', &session_id);
+        deriveKeyMaterialForKex(kex, &self.c2s.iv, data_kh, 'A', session_id);
         UNSAFE_TRACEDUMP(.Debug, "c2s.iv", .{}, &self.c2s.iv);
 
-        // s2c.iv
-        deriveKeyMaterial(&self.s2c.iv, data_kh, 'B', &session_id);
+        deriveKeyMaterialForKex(kex, &self.s2c.iv, data_kh, 'B', session_id);
         UNSAFE_TRACEDUMP(.Debug, "s2c.iv", .{}, &self.s2c.iv);
 
-        // c2s.key
-        deriveKeyMaterial(&self.c2s.key, data_kh, 'C', &session_id);
+        deriveKeyMaterialForKex(kex, &self.c2s.key, data_kh, 'C', session_id);
         UNSAFE_TRACEDUMP(.Debug, "c2s.key", .{}, &self.c2s.key);
 
-        // s2c.key
-        deriveKeyMaterial(&self.s2c.key, data_kh, 'D', &session_id);
+        deriveKeyMaterialForKex(kex, &self.s2c.key, data_kh, 'D', session_id);
         UNSAFE_TRACEDUMP(.Debug, "s2c.key", .{}, &self.s2c.key);
 
-        // c2s.mackey
-        deriveKeyMaterial(&self.c2s.mackey, data_kh, 'E', &session_id);
+        deriveKeyMaterialForKex(kex, &self.c2s.mackey, data_kh, 'E', session_id);
         UNSAFE_TRACEDUMP(.Debug, "c2s.mackey", .{}, &self.c2s.mackey);
 
-        // s2c.mackey
-        deriveKeyMaterial(&self.s2c.mackey, data_kh, 'F', &session_id);
+        deriveKeyMaterialForKex(kex, &self.s2c.mackey, data_kh, 'F', session_id);
         UNSAFE_TRACEDUMP(.Debug, "s2c.mackey", .{}, &self.s2c.mackey);
 
-        // setup aesctrs
-        self.c2s.aesctr = AesCtrT.init(self.c2s.iv[0..AesCtrT.iv_size].*, self.c2s.key[0..AesCtrT.key_size].*);
-        self.s2c.aesctr = AesCtrT.init(self.s2c.iv[0..AesCtrT.iv_size].*, self.s2c.key[0..AesCtrT.key_size].*);
+        self.c2s.cipher = cipher_c2s;
+        self.s2c.cipher = cipher_s2c;
+        self.c2s.mac = if (cipher_c2s.isAead()) null else mac_c2s;
+        self.s2c.mac = if (cipher_s2c.isAead()) null else mac_s2c;
+
+        self.c2s.initCipher();
+        self.s2c.initCipher();
     }
 };
 
@@ -709,16 +1497,22 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
     const packet_payload = try keysuni.compression.compressPayload(payload, &compressed_payload_buf);
     if (packet_payload.len > MaxPayload) return IoError.tooBig;
 
-    // pad such that whole packet (payload + hdr) is multiple of block_size
     const buffer_len = packet_payload.len;
-    var padding_length: u8 = @intCast(AesCtrT.block_size - (buffer_len + sizeof_PktHdr) % AesCtrT.block_size);
+    const block_size: usize = if (encrypted) keysuni.cipher.blockSize() else AesCtrT.block_size;
+    const tag_len: usize = if (encrypted) keysuni.tagLength() else 0;
+    const align_without_len = encrypted and keysuni.usesCleartextOrAeadLengthPrefix();
+
+    var padding_length: u8 = if (align_without_len)
+        @intCast(block_size - (1 + buffer_len) % block_size)
+    else
+        @intCast(block_size - (sizeof_PktHdr + buffer_len) % block_size);
     if (padding_length < 4) {
-        padding_length += @intCast(AesCtrT.block_size);
+        padding_length += @intCast(block_size);
     }
 
     const packet_len = sizeof_PktHdr + buffer_len + padding_length;
     if (packet_len > MaxSSHPacket or packet_len > iobuf.len) return IoError.tooBig;
-    if (encrypted and packet_len + mac_algo.key_length > iobuf.len) return IoError.tooBig;
+    if (encrypted and (packet_len + tag_len > MaxSSHPacket or packet_len + tag_len > iobuf.len)) return IoError.tooBig;
 
     // construct header
     const hdr: PktHdr = .{
@@ -728,35 +1522,89 @@ pub fn wrapPayload(rand: *std.Random, encrypted: bool, keysuni: *KeyDataUni, pay
     writePktHdr(iobuf[0..sizeof_PktHdr], hdr);
     std.mem.copyForwards(u8, iobuf[sizeof_PktHdr .. sizeof_PktHdr + packet_payload.len], packet_payload);
 
-    var rndbuf: [255]u8 = undefined; // block_size would do
+    var rndbuf: [255]u8 = undefined;
     rand.bytes(rndbuf[0..padding_length]);
     @memcpy(iobuf[sizeof_PktHdr + packet_payload.len .. packet_len], rndbuf[0..padding_length]);
+
     if (encrypted) {
         var out: [MaxSSHPacket]u8 = undefined;
-
+        defer std.crypto.secureZero(u8, &out);
         UNSAFE_TRACEDUMP(.Debug, "sendbuffer enc:plaintext", .{}, iobuf[0..packet_len]);
-        keysuni.aesctr.encrypt(iobuf[0..packet_len], out[0..packet_len]) catch
-            return IoError.KeyLifetimeExceeded;
 
-        var mac: [mac_algo.key_length]u8 = undefined;
-        defer std.crypto.secureZero(u8, &mac);
-        var m = mac_algo.init(keysuni.mackey[0..mac_algo.key_length]);
-        defer std.crypto.secureZero(u8, std.mem.asBytes(&m));
-        const seq = std.mem.nativeTo(u32, keysuni.seq, .big);
-        m.update(std.mem.asBytes(&seq));
-        m.update(iobuf[0..packet_len]); // plaintext
-        m.final(&mac);
+        switch (keysuni.cipher) {
+            .aes256_gcm, .aes128_gcm => {
+                if (hdr.packet_length > AesCtrT.max_bytes_per_key - keysuni.gcm_bytecount)
+                    return IoError.KeyLifetimeExceeded;
+                @memcpy(out[0..4], iobuf[0..4]);
+                var tag: [16]u8 = undefined;
+                const nonce = keysuni.iv[0..12].*;
+                if (keysuni.cipher == .aes256_gcm) {
+                    std.crypto.aead.aes_gcm.Aes256Gcm.encrypt(
+                        out[4..packet_len],
+                        &tag,
+                        iobuf[4..packet_len],
+                        iobuf[0..4],
+                        nonce,
+                        keysuni.key[0..32].*,
+                    );
+                } else {
+                    std.crypto.aead.aes_gcm.Aes128Gcm.encrypt(
+                        out[4..packet_len],
+                        &tag,
+                        iobuf[4..packet_len],
+                        iobuf[0..4],
+                        nonce,
+                        keysuni.key[0..16].*,
+                    );
+                }
+                const next_ctr = std.mem.readInt(u64, keysuni.iv[4..12], .big) +% 1;
+                std.mem.writeInt(u64, keysuni.iv[4..12], next_ctr, .big);
+                keysuni.gcm_bytecount += hdr.packet_length;
+                @memcpy(out[packet_len .. packet_len + 16], &tag);
+            },
+            .chacha20_poly1305 => {
+                if (packet_len > AesCtrT.max_bytes_per_key - keysuni.gcm_bytecount)
+                    return IoError.KeyLifetimeExceeded;
+                const ChaCha = std.crypto.stream.chacha.ChaCha20With64BitNonce;
+                const Poly1305 = std.crypto.onetimeauth.Poly1305;
+                var nonce: [8]u8 = undefined;
+                std.mem.writeInt(u64, &nonce, @as(u64, keysuni.seq), .big);
+                const k_2 = keysuni.key[0..32].*;
+                const k_1 = keysuni.key[32..64].*;
 
-        UNSAFE_TRACEDUMP(.Debug, "mackey", .{}, keysuni.mackey[0..mac_algo.key_length]);
-        UNSAFE_TRACEDUMP(.Debug, "macseq", .{}, std.mem.asBytes(&seq));
-        UNSAFE_TRACEDUMP(.Debug, "macdata", .{}, iobuf[0..packet_len]);
+                ChaCha.xor(out[0..4], iobuf[0..4], 0, k_1, nonce);
+                var poly_key: [32]u8 = undefined;
+                defer std.crypto.secureZero(u8, &poly_key);
+                const zeros: [32]u8 = @splat(0);
+                ChaCha.xor(&poly_key, &zeros, 0, k_2, nonce);
+                ChaCha.xor(out[4..packet_len], iobuf[4..packet_len], 1, k_2, nonce);
 
-        @memcpy(out[packet_len .. packet_len + mac_algo.key_length], &mac);
-        const out_len = packet_len + mac_algo.key_length;
+                var tag: [16]u8 = undefined;
+                Poly1305.create(&tag, out[0..packet_len], &poly_key);
+                keysuni.gcm_bytecount += packet_len;
+                @memcpy(out[packet_len .. packet_len + 16], &tag);
+            },
+            .aes256_ctr, .aes192_ctr, .aes128_ctr => {
+                const mac_alg = keysuni.mac orelse return IoError.UnexpectedResponse;
+                var mac_buf: [64]u8 = undefined;
+                defer std.crypto.secureZero(u8, &mac_buf);
+                if (mac_alg.isEtm()) {
+                    @memcpy(out[0..4], iobuf[0..4]);
+                    keysuni.encryptCtr(iobuf[4..packet_len], out[4..packet_len]) catch
+                        return IoError.KeyLifetimeExceeded;
+                    const mac_slice = keysuni.computeMac(keysuni.seq, out[0..packet_len], &mac_buf);
+                    @memcpy(out[packet_len .. packet_len + tag_len], mac_slice);
+                } else {
+                    keysuni.encryptCtr(iobuf[0..packet_len], out[0..packet_len]) catch
+                        return IoError.KeyLifetimeExceeded;
+                    const mac_slice = keysuni.computeMac(keysuni.seq, iobuf[0..packet_len], &mac_buf);
+                    @memcpy(out[packet_len .. packet_len + tag_len], mac_slice);
+                }
+            },
+        }
 
-        // Copy encrypted packet plus MAC back to the caller's output buffer.
+        const out_len = packet_len + tag_len;
         @memcpy(iobuf[0..out_len], out[0..out_len]);
-
         UNSAFE_TRACEDUMP(.Debug, "enc send", .{}, iobuf[0..out_len]);
 
         keysuni.seq += 1;
@@ -920,6 +1768,10 @@ test "algorithm negotiation always follows client preference for both roles" {
 test "algorithm negotiation fails closed for every required category" {
     inline for (@typeInfo(AlgorithmOffers).@"struct".field_names) |name| {
         var peer = testKexInit();
+        if (std.mem.eql(u8, name, "mac_c2s") or std.mem.eql(u8, name, "mac_s2c")) {
+            peer.offers.encryption_c2s = "aes256-ctr";
+            peer.offers.encryption_s2c = "aes256-ctr";
+        }
         @field(peer.offers, name) = "unsupported-only";
         try std.testing.expectError(
             IoError.AlgorithmNegotiationFailed,
@@ -934,6 +1786,18 @@ test "algorithm negotiation fails closed for every required category" {
             ),
         );
     }
+
+    // When an AEAD cipher is negotiated, MAC lists are ignored and mac_c2s/mac_s2c are null
+    var aead_peer = testKexInit();
+    aead_peer.offers.encryption_c2s = "aes256-gcm@openssh.com";
+    aead_peer.offers.encryption_s2c = "chacha20-poly1305@openssh.com";
+    aead_peer.offers.mac_c2s = "unsupported-only";
+    aead_peer.offers.mac_s2c = "unsupported-only";
+    const aead_negotiated = try negotiateAlgorithms(aead_peer, .Server, srv_hostkey_algo_name);
+    try std.testing.expectEqual(CipherAlgorithm.aes256_gcm, aead_negotiated.encryption_c2s);
+    try std.testing.expectEqual(CipherAlgorithm.chacha20_poly1305, aead_negotiated.encryption_s2c);
+    try std.testing.expect(aead_negotiated.mac_c2s == null);
+    try std.testing.expect(aead_negotiated.mac_s2c == null);
 
     var duplicate = testKexInit();
     duplicate.offers.kex = "curve25519-sha256,curve25519-sha256";
@@ -955,7 +1819,7 @@ fn writeTestKexInitBody(writer: *BufferWriter, kexinit: KexInit) !void {
 }
 
 test "KEXINIT parser validates name-lists and exact framing" {
-    var backing: [512]u8 = undefined;
+    var backing: [1024]u8 = undefined;
     var writer = BufferWriter.init(&backing, 0);
     try writeTestKexInitBody(&writer, testKexInit());
     var reader = BufferReader.init(writer.active());
