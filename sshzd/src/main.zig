@@ -51,6 +51,150 @@ fn writeAllFd(fd: std.c.fd_t, data: []const u8) !void {
     }
 }
 
+fn sanitizeControlChars(input: []const u8, out: []u8, allow_newlines: bool) []const u8 {
+    const hex = "0123456789abcdef";
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const b = input[i];
+        if (allow_newlines and b == '\r' and i + 1 < input.len and input[i + 1] == '\n') {
+            continue;
+        }
+        if (allow_newlines and (b == '\n' or b == '\t')) {
+            if (pos + 1 > out.len) break;
+            out[pos] = b;
+            pos += 1;
+            continue;
+        }
+        if (b >= 0x20 and b <= 0x7e) {
+            if (pos + 1 > out.len) break;
+            out[pos] = b;
+            pos += 1;
+            continue;
+        }
+        const esc: ?[]const u8 = switch (b) {
+            '\r' => "\\r",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |seq| {
+            if (pos + seq.len > out.len) break;
+            @memcpy(out[pos .. pos + seq.len], seq);
+            pos += seq.len;
+        } else {
+            if (pos + 4 > out.len) break;
+            out[pos] = '\\';
+            out[pos + 1] = 'x';
+            out[pos + 2] = hex[b >> 4];
+            out[pos + 3] = hex[b & 0x0f];
+            pos += 4;
+        }
+    }
+    return out[0..pos];
+}
+
+fn printSanitizedStderr(input: []const u8, allow_newlines: bool) void {
+    const hex = "0123456789abcdef";
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (pos + 4 > buf.len) {
+            std.debug.print("{s}", .{buf[0..pos]});
+            pos = 0;
+        }
+        const b = input[i];
+        if (allow_newlines and b == '\r' and i + 1 < input.len and input[i + 1] == '\n') {
+            continue;
+        }
+        if (allow_newlines and (b == '\n' or b == '\t')) {
+            buf[pos] = b;
+            pos += 1;
+            continue;
+        }
+        if (b >= 0x20 and b <= 0x7e) {
+            buf[pos] = b;
+            pos += 1;
+            continue;
+        }
+        const esc: ?[]const u8 = switch (b) {
+            '\r' => "\\r",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |seq| {
+            @memcpy(buf[pos .. pos + seq.len], seq);
+            pos += seq.len;
+        } else {
+            buf[pos] = '\\';
+            buf[pos + 1] = 'x';
+            buf[pos + 2] = hex[b >> 4];
+            buf[pos + 3] = hex[b & 0x0f];
+            pos += 4;
+        }
+    }
+    if (pos > 0) {
+        std.debug.print("{s}", .{buf[0..pos]});
+    }
+}
+
+fn writeSanitizedFd(fd: std.c.fd_t, input: []const u8, allow_newlines: bool) !void {
+    const hex = "0123456789abcdef";
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (pos + 4 > buf.len) {
+            try writeAllFd(fd, buf[0..pos]);
+            pos = 0;
+        }
+        const b = input[i];
+        if (allow_newlines and b == '\r' and i + 1 < input.len and input[i + 1] == '\n') {
+            continue;
+        }
+        if (allow_newlines and (b == '\n' or b == '\t')) {
+            buf[pos] = b;
+            pos += 1;
+            continue;
+        }
+        if (b >= 0x20 and b <= 0x7e) {
+            buf[pos] = b;
+            pos += 1;
+            continue;
+        }
+        const esc: ?[]const u8 = switch (b) {
+            '\r' => "\\r",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |seq| {
+            @memcpy(buf[pos .. pos + seq.len], seq);
+            pos += seq.len;
+        } else {
+            buf[pos] = '\\';
+            buf[pos + 1] = 'x';
+            buf[pos + 2] = hex[b >> 4];
+            buf[pos + 3] = hex[b & 0x0f];
+            pos += 4;
+        }
+    }
+    if (pos > 0) {
+        try writeAllFd(fd, buf[0..pos]);
+    }
+}
+
+fn formatEchoResponse(payload: []const u8, out: []u8) []const u8 {
+    const prefix = "You said '";
+    const suffix = "'\r\n";
+    if (out.len < prefix.len + suffix.len) return out[0..0];
+    const max_payload = out.len - (prefix.len + suffix.len);
+    const slice = payload[0..@min(payload.len, max_payload)];
+    return std.fmt.bufPrint(out, "You said '{s}'\r\n", .{slice}) catch unreachable;
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
@@ -140,7 +284,10 @@ pub fn main(init: std.process.Init) !void {
     const hostkey_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, args[2], allocator, .limited(16384)) catch |err| {
         cliError(args[0], "cannot read host key file '{s}': {s}", .{ args[2], @errorName(err) });
     };
-    defer allocator.free(hostkey_ascii);
+    defer {
+        std.crypto.secureZero(u8, hostkey_ascii);
+        allocator.free(hostkey_ascii);
+    }
 
     const port = std.fmt.parseInt(u16, args[1], 10) catch |err| {
         cliError(args[0], "invalid port '{s}': {s}", .{ args[1], @errorName(err) });
@@ -168,174 +315,229 @@ pub fn main(init: std.process.Init) !void {
 
     std.debug.print("Server listening on port {d}\n", .{port});
 
-    nextclient: while (true) {
+    while (true) {
         var stream = try server.accept(init.io);
         defer stream.close(init.io);
 
-        // make a reasonable prng
-        var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
-        try init.io.randomSecure(&seed);
-        var prng = std.Random.DefaultCsprng.init(seed);
+        serveClient(init, allocator, &policy, hostkey_ascii, &stream) catch |err| {
+            std.debug.print("Client session ended with error: {s}\n", .{@errorName(err)});
+        };
+    }
+}
 
-        var sshz = try SshzServer.init(prng.random(), hostkey_ascii, allocator);
-        defer sshz.deinit();
+fn serveClient(
+    init: std.process.Init,
+    allocator: std.mem.Allocator,
+    policy: *const auth.Policy,
+    hostkey_ascii: []const u8,
+    stream: *std.Io.net.Stream,
+) !void {
+    // make a reasonable prng
+    var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
+    try init.io.randomSecure(&seed);
+    var prng = std.Random.DefaultCsprng.init(seed);
+    std.crypto.secureZero(u8, &seed);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&prng));
 
-        var iobuf: [8]u8 = undefined; // could be any size
-        var quit = false;
-        var pending_eof_channel: ?u32 = null;
-        var pending_close_channel: ?u32 = null;
-        var pipe: [2]std.c.fd_t = undefined;
-        if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
-        defer _ = std.c.close(pipe[0]);
-        defer _ = std.c.close(pipe[1]);
+    var sshz = try SshzServer.init(prng.random(), hostkey_ascii, allocator);
+    defer sshz.deinit();
 
-        ioloop: while (!quit) {
-            const ev = try sshz.getNextEvent();
-            switch (ev) {
-                .Event => |eventCode| {
-                    switch (eventCode) {
-                        .Connected => {
-                            std.debug.print("Connected!\n", .{});
-                            try sshz.clearEvent(eventCode);
-                        },
-                        .RxData => |rxdata| {
-                            try writeAllFd(std.c.STDOUT_FILENO, rxdata.data);
+    var iobuf: [8]u8 = undefined; // could be any size
+    defer std.crypto.secureZero(u8, &iobuf);
+    var quit = false;
+    var pending_eof_channel: ?u32 = null;
+    var pending_close_channel: ?u32 = null;
+    var pipe: [2]std.c.fd_t = undefined;
+    if (std.c.pipe(&pipe) != 0) return error.PipeFailed;
+    defer _ = std.c.close(pipe[0]);
+    defer _ = std.c.close(pipe[1]);
 
-                            var response_buf: [1024]u8 = undefined;
-                            const response = try std.fmt.bufPrint(&response_buf, "You said '{s}'\r\n", .{rxdata.data});
-                            try writeAllFd(pipe[1], response);
+    ioloop: while (!quit) {
+        const ev = try sshz.getNextEvent();
+        switch (ev) {
+            .Event => |eventCode| {
+                switch (eventCode) {
+                    .Connected => {
+                        std.debug.print("Connected!\n", .{});
+                        try sshz.clearEvent(eventCode);
+                    },
+                    .RxData => |rxdata| {
+                        try writeSanitizedFd(std.c.STDOUT_FILENO, rxdata.data, true);
 
-                            try sshz.clearEvent(eventCode);
-                            pending_eof_channel = rxdata.channel;
-                        },
-                        .EndSession => |reason| {
-                            std.debug.print("Session ended: {any}\n", .{reason});
-                            quit = true;
+                        var response_buf: [1024]u8 = undefined;
+                        defer std.crypto.secureZero(u8, &response_buf);
+                        const response = formatEchoResponse(rxdata.data, &response_buf);
+                        try writeAllFd(pipe[1], response);
+
+                        try sshz.clearEvent(eventCode);
+                        pending_eof_channel = rxdata.channel;
+                    },
+                    .EndSession => |reason| {
+                        switch (reason) {
+                            .ServerDisconnect => |disconnect| {
+                                std.debug.print("Session ended: ServerDisconnect (code={d}, description=\"", .{disconnect.code});
+                                printSanitizedStderr(disconnect.description, false);
+                                std.debug.print("\")\n", .{});
+                            },
+                            else => std.debug.print("Session ended: {any}\n", .{reason}),
+                        }
+                        quit = true;
+                        continue :ioloop;
+                    },
+                    .UserAuth => |credentials| {
+                        const attempt: auth.Attempt = if (credentials.auth) |method| switch (method) {
+                            .Password => |password| .{ .password = password },
+                            .Pubkey => |pubkey| .{ .public_key = .{
+                                .algorithm = pubkey.algorithm,
+                                .blob = pubkey.blob,
+                            } },
+                        } else .none;
+                        try sshz.decideUserAuth(
+                            if (policy.allows(credentials.username, attempt)) .Allow else .Deny,
+                        );
+                    },
+                    .GetPubkeyForUser => |username| {
+                        std.debug.print(".GetPubkeyForUser: ", .{});
+                        printSanitizedStderr(username, false);
+                        std.debug.print("\n", .{});
+                        return error.UnexpectedGetPubkeyEvent;
+                    },
+                    .ChannelRequest,
+                    .ChannelEof,
+                    .WindowChange,
+                    .Signal,
+                    .RxExtendedData,
+                    .ChannelOpened,
+                    .ChannelOpenFailure,
+                    .AgentChannelOpen,
+                    .AgentChannelClosed,
+                    => {
+                        try sshz.clearEvent(eventCode);
+                    },
+                    .PtyRequest => |request| {
+                        try sshz.rejectPtyRequest(request.channel);
+                    },
+                    .ChannelOpenRequest => |request| {
+                        switch (request.request) {
+                            .Session => try sshz.acceptChannelOpen(request.channel),
+                            else => try sshz.rejectChannelOpen(
+                                request.channel,
+                                SshOpenFailureReason.AdministrativelyProhibited,
+                                "unsupported channel open",
+                            ),
+                        }
+                    },
+                    .TcpipForward => {
+                        try sshz.rejectTcpipForward();
+                    },
+                    .CancelTcpipForward => {
+                        try sshz.rejectCancelTcpipForward();
+                    },
+                }
+            },
+            .ReadyToConsume, .ReadyToProduce, .ReadyToConsumeAndProduce => {
+                const consume_len: usize = switch (ev) {
+                    .ReadyToConsume => |n| n,
+                    .ReadyToConsumeAndProduce => |s| s.consume,
+                    else => 0,
+                };
+                const produce_len: usize = switch (ev) {
+                    .ReadyToProduce => |n| n,
+                    .ReadyToConsumeAndProduce => |s| s.produce,
+                    else => 0,
+                };
+                _ = produce_len;
+
+                var pollevts: i16 = 0;
+                if (consume_len > 0) pollevts |= std.posix.POLL.IN;
+                if (ev == .ReadyToProduce or ev == .ReadyToConsumeAndProduce) pollevts |= std.posix.POLL.OUT;
+
+                var fds = [_]std.posix.pollfd{
+                    .{
+                        .fd = stream.socket.handle,
+                        .events = pollevts,
+                        .revents = undefined,
+                    },
+                    .{
+                        .fd = pipe[0],
+                        .events = std.posix.POLL.IN,
+                        .revents = undefined,
+                    },
+                };
+
+                const ready = std.posix.poll(&fds, 1000) catch 0;
+                if (ready > 0) {
+                    if (fds[0].revents & std.posix.POLL.IN > 0 and consume_len > 0) { // socket is readable
+                        var bytes_to_read = consume_len;
+                        if (bytes_to_read > iobuf.len) {
+                            bytes_to_read = iobuf.len;
+                        }
+                        const nbytes = try readFd(stream.socket.handle, iobuf[0..bytes_to_read]);
+                        if (nbytes > 0) {
+                            try sshz.write(iobuf[0..nbytes]);
                             continue :ioloop;
-                        },
-                        .UserAuth => |credentials| {
-                            const attempt: auth.Attempt = if (credentials.auth) |method| switch (method) {
-                                .Password => |password| .{ .password = password },
-                                .Pubkey => |pubkey| .{ .public_key = .{
-                                    .algorithm = pubkey.algorithm,
-                                    .blob = pubkey.blob,
-                                } },
-                            } else .none;
-                            try sshz.decideUserAuth(
-                                if (policy.allows(credentials.username, attempt)) .Allow else .Deny,
-                            );
-                        },
-                        .GetPubkeyForUser => |username| {
-                            std.debug.print(".GetPubkeyForUser: {s}\n", .{username});
-                            std.debug.assert(false);
-                        },
-                        .ChannelRequest,
-                        .ChannelEof,
-                        .WindowChange,
-                        .Signal,
-                        .RxExtendedData,
-                        .ChannelOpened,
-                        .ChannelOpenFailure,
-                        .AgentChannelOpen,
-                        .AgentChannelClosed,
-                        => {
-                            try sshz.clearEvent(eventCode);
-                        },
-                        .PtyRequest => |request| {
-                            try sshz.rejectPtyRequest(request.channel);
-                        },
-                        .ChannelOpenRequest => |request| {
-                            switch (request.request) {
-                                .Session => try sshz.acceptChannelOpen(request.channel),
-                                else => try sshz.rejectChannelOpen(
-                                    request.channel,
-                                    SshOpenFailureReason.AdministrativelyProhibited,
-                                    "unsupported channel open",
-                                ),
-                            }
-                        },
-                        .TcpipForward => {
-                            try sshz.rejectTcpipForward();
-                        },
-                        .CancelTcpipForward => {
-                            try sshz.rejectCancelTcpipForward();
-                        },
+                        } else {
+                            return;
+                        }
                     }
-                },
-                .ReadyToConsume, .ReadyToProduce, .ReadyToConsumeAndProduce => {
-                    const consume_len: usize = switch (ev) {
-                        .ReadyToConsume => |n| n,
-                        .ReadyToConsumeAndProduce => |s| s.consume,
-                        else => 0,
-                    };
-                    const produce_len: usize = switch (ev) {
-                        .ReadyToProduce => |n| n,
-                        .ReadyToConsumeAndProduce => |s| s.produce,
-                        else => 0,
-                    };
-                    _ = produce_len;
-
-                    var pollevts: i16 = 0;
-                    if (consume_len > 0) pollevts |= std.posix.POLL.IN;
-                    if (ev == .ReadyToProduce or ev == .ReadyToConsumeAndProduce) pollevts |= std.posix.POLL.OUT;
-
-                    var fds = [_]std.posix.pollfd{
-                        .{
-                            .fd = stream.socket.handle,
-                            .events = pollevts,
-                            .revents = undefined,
-                        },
-                        .{
-                            .fd = pipe[0],
-                            .events = std.posix.POLL.IN,
-                            .revents = undefined,
-                        },
-                    };
-
-                    const ready = std.posix.poll(&fds, 1000) catch 0;
-                    if (ready > 0) {
-                        if (fds[0].revents & std.posix.POLL.IN > 0 and consume_len > 0) { // socket is readable
-                            var bytes_to_read = consume_len;
-                            if (bytes_to_read > iobuf.len) {
-                                bytes_to_read = iobuf.len;
+                    if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) > 0 and
+                        fds[0].revents & std.posix.POLL.IN == 0 and
+                        fds[0].revents & std.posix.POLL.OUT == 0)
+                    {
+                        return;
+                    }
+                    if (fds[0].revents & std.posix.POLL.OUT > 0) { // socket is writeable
+                        const towrite = try sshz.peek(4);
+                        const bytes_written = try writeFd(stream.socket.handle, towrite);
+                        try sshz.consumed(bytes_written);
+                        if (bytes_written == towrite.len) {
+                            if (pending_eof_channel) |channel| {
+                                pending_eof_channel = null;
+                                pending_close_channel = channel;
+                                try sshz.sendChannelEof(channel);
+                            } else if (pending_close_channel) |channel| {
+                                pending_close_channel = null;
+                                try sshz.sendChannelClose(channel);
                             }
-                            const nbytes = try readFd(stream.socket.handle, iobuf[0..bytes_to_read]);
-                            if (nbytes > 0) {
-                                try sshz.write(iobuf[0..nbytes]);
+                        }
+                        continue :ioloop;
+                    }
+                    if (fds[1].revents & std.posix.POLL.IN > 0) { // data to be sent (from pipe)
+                        const buf = try sshz.getChannelWriteBuffer(0);
+                        if (buf.len > 0) {
+                            const count = readFd(pipe[0], buf) catch 0;
+                            if (count > 0) {
+                                try sshz.channelWriteComplete(0, count);
                                 continue :ioloop;
-                            } else {
-                                continue :nextclient;
-                            }
-                        }
-                        if (fds[0].revents & std.posix.POLL.OUT > 0) { // socket is writeable
-                            const towrite = try sshz.peek(4);
-                            const bytes_written = try writeFd(stream.socket.handle, towrite);
-                            try sshz.consumed(bytes_written);
-                            if (bytes_written == towrite.len) {
-                                if (pending_eof_channel) |channel| {
-                                    pending_eof_channel = null;
-                                    pending_close_channel = channel;
-                                    try sshz.sendChannelEof(channel);
-                                } else if (pending_close_channel) |channel| {
-                                    pending_close_channel = null;
-                                    try sshz.sendChannelClose(channel);
-                                }
-                            }
-                            continue :ioloop;
-                        }
-                        if (fds[1].revents & std.posix.POLL.IN > 0) { // data to be sent (from pipe)
-                            const buf = try sshz.getChannelWriteBuffer(0);
-                            if (buf.len > 0) {
-                                const count = readFd(pipe[0], buf) catch 0;
-                                if (count > 0) {
-                                    try sshz.channelWriteComplete(0, count);
-                                    continue :ioloop;
-                                }
                             }
                         }
                     }
-                },
-            }
+                }
+            },
         }
     }
+}
+
+test "sanitizeControlChars neutralizes terminal escapes in peer data" {
+    var out: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "cmd\n\\x1b[2J\\rspoof",
+        sanitizeControlChars("cmd\r\n\x1b[2J\rspoof", &out, true),
+    );
+    try std.testing.expectEqualStrings(
+        "user\\x1b]0;root\\x07\\n",
+        sanitizeControlChars("user\x1b]0;root\x07\n", &out, false),
+    );
+}
+
+test "formatEchoResponse bounds oversized payloads without failing" {
+    var buf: [32]u8 = undefined;
+    const short = formatEchoResponse("hello", &buf);
+    try std.testing.expectEqualStrings("You said 'hello'\r\n", short);
+
+    const oversized = "0123456789abcdefghijklmnopqrstuvwxyz";
+    const bounded = formatEchoResponse(oversized, &buf);
+    try std.testing.expectEqual(@as(usize, 32), bounded.len);
+    try std.testing.expect(std.mem.startsWith(u8, bounded, "You said '0123456789"));
+    try std.testing.expect(std.mem.endsWith(u8, bounded, "'\r\n"));
 }

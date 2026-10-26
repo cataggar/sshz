@@ -77,21 +77,110 @@ fn printHostKeyUnknown(
 
 // Turn off echo and read a password
 fn readPassphrase(password_buf: []u8) ![]u8 {
+    errdefer std.crypto.secureZero(u8, password_buf);
     const stdin_fd = std.c.STDIN_FILENO;
 
     if (std.c.isatty(stdin_fd) != 0) {
-        // disable terminal echo
-        var termios = try std.posix.tcgetattr(stdin_fd);
+        const saved_termios = try std.posix.tcgetattr(stdin_fd);
+        var termios = saved_termios;
         termios.lflag.ECHO = false;
         try std.posix.tcsetattr(stdin_fd, .FLUSH, termios);
-        const password = try readLine(stdin_fd, password_buf);
-        // re-enable echo
-        termios.lflag.ECHO = true;
-        try std.posix.tcsetattr(stdin_fd, .FLUSH, termios);
-        try writeAllFd(std.c.STDOUT_FILENO, "\n");
-        return password;
+        defer {
+            std.posix.tcsetattr(stdin_fd, .FLUSH, saved_termios) catch {};
+            writeAllFd(std.c.STDOUT_FILENO, "\n") catch {};
+        }
+        return try readLine(stdin_fd, password_buf);
     } else {
         return try readLine(stdin_fd, password_buf);
+    }
+}
+
+fn sanitizeControlChars(input: []const u8, out: []u8, allow_newlines: bool) []const u8 {
+    const hex = "0123456789abcdef";
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const b = input[i];
+        if (allow_newlines and b == '\r' and i + 1 < input.len and input[i + 1] == '\n') {
+            continue;
+        }
+        if (allow_newlines and (b == '\n' or b == '\t')) {
+            if (pos + 1 > out.len) break;
+            out[pos] = b;
+            pos += 1;
+            continue;
+        }
+        if (b >= 0x20 and b <= 0x7e) {
+            if (pos + 1 > out.len) break;
+            out[pos] = b;
+            pos += 1;
+            continue;
+        }
+        const esc: ?[]const u8 = switch (b) {
+            '\r' => "\\r",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |seq| {
+            if (pos + seq.len > out.len) break;
+            @memcpy(out[pos .. pos + seq.len], seq);
+            pos += seq.len;
+        } else {
+            if (pos + 4 > out.len) break;
+            out[pos] = '\\';
+            out[pos + 1] = 'x';
+            out[pos + 2] = hex[b >> 4];
+            out[pos + 3] = hex[b & 0x0f];
+            pos += 4;
+        }
+    }
+    return out[0..pos];
+}
+
+fn printSanitizedStderr(input: []const u8, allow_newlines: bool) void {
+    const hex = "0123456789abcdef";
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        if (pos + 4 > buf.len) {
+            std.debug.print("{s}", .{buf[0..pos]});
+            pos = 0;
+        }
+        const b = input[i];
+        if (allow_newlines and b == '\r' and i + 1 < input.len and input[i + 1] == '\n') {
+            continue;
+        }
+        if (allow_newlines and (b == '\n' or b == '\t')) {
+            buf[pos] = b;
+            pos += 1;
+            continue;
+        }
+        if (b >= 0x20 and b <= 0x7e) {
+            buf[pos] = b;
+            pos += 1;
+            continue;
+        }
+        const esc: ?[]const u8 = switch (b) {
+            '\r' => "\\r",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |seq| {
+            @memcpy(buf[pos .. pos + seq.len], seq);
+            pos += seq.len;
+        } else {
+            buf[pos] = '\\';
+            buf[pos + 1] = 'x';
+            buf[pos + 2] = hex[b >> 4];
+            buf[pos + 3] = hex[b & 0x0f];
+            pos += 4;
+        }
+    }
+    if (pos > 0) {
+        std.debug.print("{s}", .{buf[0..pos]});
     }
 }
 
@@ -100,7 +189,7 @@ fn envOrReadPassphrase(init: std.process.Init, name: []const u8, prompt: []const
         return value;
     }
 
-    std.debug.print("{s}", .{prompt});
+    printSanitizedStderr(prompt, false);
     return try readPassphrase(password_buf);
 }
 
@@ -140,19 +229,30 @@ pub fn raw_mode_start() !void {
 pub fn raw_mode_stop() void {
     if (original_termios) |termios| {
         std.posix.tcsetattr(std.c.STDIN_FILENO, .FLUSH, termios) catch {};
+        original_termios = null;
     }
     writeAllFd(std.c.STDOUT_FILENO, "\n") catch {};
 }
 
+fn validateAgentSocketPath(path: []const u8) !void {
+    const addr: std.c.sockaddr.un = undefined;
+    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) {
+        return error.InvalidAgentSocketPath;
+    }
+    if (path.len >= addr.path.len) return error.NameTooLong;
+}
+
 fn connectAgentSocket(path: []const u8) !std.c.fd_t {
-    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    try validateAgentSocketPath(path);
+    const sock_flags: c_int = std.c.SOCK.STREAM |
+        if (@hasDecl(std.c.SOCK, "CLOEXEC")) std.c.SOCK.CLOEXEC else 0;
+    const fd = std.c.socket(std.c.AF.UNIX, sock_flags, 0);
     if (fd < 0) return error.SocketFailed;
     errdefer _ = std.c.close(fd);
 
     var addr: std.c.sockaddr.un = undefined;
     addr.family = std.c.AF.UNIX;
     @memset(&addr.path, 0);
-    if (path.len >= addr.path.len) return error.NameTooLong;
     @memcpy(addr.path[0..path.len], path);
 
     const addr_len: std.c.socklen_t = @intCast(@offsetOf(std.c.sockaddr.un, "path") + path.len + 1);
@@ -194,11 +294,15 @@ fn readFd(fd: std.c.fd_t, buf: []u8) !usize {
 }
 
 fn readLine(fd: std.c.fd_t, buf: []u8) ![]u8 {
+    errdefer std.crypto.secureZero(u8, buf);
     var n: usize = 0;
     while (n < buf.len) {
         const count = try readFd(fd, buf[n .. n + 1]);
         if (count == 0) break;
-        if (buf[n] == '\n') break;
+        if (buf[n] == '\n') {
+            buf[n] = 0;
+            break;
+        }
         n += 1;
     }
     return buf[0..n];
@@ -221,6 +325,7 @@ fn writeAllFd(fd: std.c.fd_t, data: []const u8) !void {
 }
 
 fn addAgentSocket(sockets: *[MaxAgentSockets]?AgentSocket, channel: u32, path: []const u8) !void {
+    closeAgentSocket(sockets, channel);
     var free_slot: ?*?AgentSocket = null;
     for (sockets) |*slot| {
         if (slot.* == null) {
@@ -247,7 +352,6 @@ fn closeAgentSocket(sockets: *[MaxAgentSockets]?AgentSocket, channel: u32) void 
             if (agent.channel == channel) {
                 _ = std.c.close(agent.fd);
                 slot.* = null;
-                return;
             }
         }
     }
@@ -441,6 +545,7 @@ pub fn main(init: std.process.Init) !void {
         null;
 
     {
+        var exit_code: u8 = 0;
         {
             var stream = connectTcp(init.io, host, port) catch |err| {
                 switch (err) {
@@ -455,6 +560,8 @@ pub fn main(init: std.process.Init) !void {
             var seed: [std.Random.DefaultCsprng.secret_seed_length]u8 = undefined;
             try init.io.randomSecure(&seed);
             var prng = std.Random.DefaultCsprng.init(seed);
+            std.crypto.secureZero(u8, &seed);
+            defer std.crypto.secureZero(u8, std.mem.asBytes(&prng));
 
             var sshz = try SshzClient.init(prng.random(), user, allocator);
             defer sshz.deinit();
@@ -465,11 +572,12 @@ pub fn main(init: std.process.Init) !void {
             defer raw_mode_stop();
 
             var iobuf: [8]u8 = undefined; // could be any size
+            defer std.crypto.secureZero(u8, &iobuf);
             var agent_sockets: [MaxAgentSockets]?AgentSocket = @splat(null);
             defer closeAllAgentSockets(&agent_sockets);
             var quit = false;
             var connected = false;
-            var exit_code: u8 = 0;
+            var stdin_open = true;
             const stdin_fd = std.c.STDIN_FILENO;
 
             outer: while (!quit) {
@@ -505,7 +613,8 @@ pub fn main(init: std.process.Init) !void {
                                 try sshz.clearEvent(eventCode);
                             },
                             .Banner => |banner| {
-                                std.debug.print("{s}\n", .{banner});
+                                printSanitizedStderr(banner, true);
+                                std.debug.print("\n", .{});
                                 try sshz.clearEvent(eventCode);
                             },
                             .EndSession => |reason| {
@@ -524,7 +633,14 @@ pub fn main(init: std.process.Init) !void {
                                         std.debug.print("Host key rejected; authentication was not attempted.\n", .{});
                                         exit_code = 1;
                                     },
-                                    else => std.debug.print("Session ended: {any}\n", .{reason}),
+                                    .ServerDisconnect => |disconnect| {
+                                        std.debug.print("Session ended: ServerDisconnect (code={d}, description=\"", .{disconnect.code});
+                                        printSanitizedStderr(disconnect.description, false);
+                                        std.debug.print("\")\n", .{});
+                                    },
+                                    .Disconnect => {
+                                        std.debug.print("Session ended: Disconnect\n", .{});
+                                    },
                                 }
                                 quit = true;
                                 continue :outer;
@@ -627,32 +743,73 @@ pub fn main(init: std.process.Init) !void {
                                 if (idfile) |path| {
                                     const keydata_ascii = std.Io.Dir.cwd().readFileAlloc(init.io, path, allocator, .limited(16384)) catch {
                                         std.debug.print("Failed to open idfile {s}\n", .{path});
-                                        std.process.exit(1);
+                                        exit_code = 1;
+                                        quit = true;
+                                        try sshz.clearEvent(eventCode);
+                                        continue :outer;
                                     };
+                                    defer {
+                                        std.crypto.secureZero(u8, keydata_ascii);
+                                        allocator.free(keydata_ascii);
+                                    }
                                     try sshz.setPrivateKey(keydata_ascii);
-                                    allocator.free(keydata_ascii);
                                 }
                                 try sshz.clearEvent(eventCode);
                             },
                             .GetKeyPassphrase => {
-                                var password_buf: [128]u8 = undefined;
+                                var password_buf: [128]u8 = @splat(0);
+                                defer std.crypto.secureZero(u8, &password_buf);
                                 try sshz.setPrivateKeyPassphrase(try envOrReadPassphrase(init, "SSHZ_KEY_PASSPHRASE", "Password for private key decrypt: ", &password_buf));
                                 try sshz.clearEvent(eventCode);
                             },
                             .GetAuthPassphrase => {
-                                var password_buf: [128]u8 = undefined;
+                                var password_buf: [128]u8 = @splat(0);
+                                defer std.crypto.secureZero(u8, &password_buf);
                                 try sshz.setAuthPassphrase(try envOrReadPassphrase(init, "SSHZ_AUTH_PASSWORD", "Password for auth: ", &password_buf));
                                 try sshz.clearEvent(eventCode);
                             },
                             .KeyboardInteractive => |prompt| {
-                                var password_buf: [128]u8 = undefined;
+                                var password_buf: [128]u8 = @splat(0);
+                                defer std.crypto.secureZero(u8, &password_buf);
+                                if (init.environ_map.get("SSHZ_AUTH_PASSWORD") == null) {
+                                    if (prompt.name.len > 0) {
+                                        printSanitizedStderr(prompt.name, false);
+                                        std.debug.print("\n", .{});
+                                    }
+                                    if (prompt.instruction.len > 0) {
+                                        printSanitizedStderr(prompt.instruction, true);
+                                        std.debug.print("\n", .{});
+                                    }
+                                }
                                 try sshz.session.setKeyboardInteractiveResponse(try envOrReadPassphrase(init, "SSHZ_AUTH_PASSWORD", prompt.prompt, &password_buf));
                                 try sshz.clearEvent(eventCode);
                             },
+                            .ChannelOpenFailure => |failure| {
+                                std.debug.print("Channel {d} open failed (code={d}, description=\"", .{ failure.channel, failure.reason_code });
+                                printSanitizedStderr(failure.description, false);
+                                std.debug.print("\")\n", .{});
+                                try sshz.clearEvent(eventCode);
+                            },
+                            .ChannelClosed => |channel_id| {
+                                if (sshz.channelExitResult(channel_id)) |exit_res| {
+                                    switch (exit_res) {
+                                        .Signal => |sig| {
+                                            std.debug.print("Channel {d} exited on signal ", .{channel_id});
+                                            printSanitizedStderr(sig.signal_name, false);
+                                            if (sig.error_message.len > 0) {
+                                                std.debug.print(" (", .{});
+                                                printSanitizedStderr(sig.error_message, false);
+                                                std.debug.print(")", .{});
+                                            }
+                                            std.debug.print("\n", .{});
+                                        },
+                                        .Status, .NoResult => {},
+                                    }
+                                }
+                                try sshz.clearEvent(eventCode);
+                            },
                             .ChannelOpened,
-                            .ChannelOpenFailure,
                             .ChannelEof,
-                            .ChannelClosed,
                             .TcpipForwardSuccess,
                             .TcpipForwardFailure,
                             .CancelTcpipForwardSuccess,
@@ -711,16 +868,20 @@ pub fn main(init: std.process.Init) !void {
                         if (consume_len > 0) pollevts |= std.posix.POLL.IN;
                         if (ev == .ReadyToProduce or ev == .ReadyToConsumeAndProduce) pollevts |= std.posix.POLL.OUT;
 
+                        const can_read_stdin = connected and stdin_open and
+                            (ev == .ReadyToConsume) and
+                            if (sshz.getChannelWriteBuffer(0)) |buf| buf.len > 0 else |_| false;
+
                         var fds: [2 + MaxAgentSockets]std.posix.pollfd = undefined;
                         fds[0] = .{
                             .fd = stream.socket.handle,
                             .events = pollevts,
-                            .revents = undefined,
+                            .revents = 0,
                         };
                         fds[1] = .{
-                            .fd = stdin_fd,
-                            .events = if (connected) std.posix.POLL.IN else 0,
-                            .revents = undefined,
+                            .fd = if (can_read_stdin) stdin_fd else -1,
+                            .events = if (can_read_stdin) std.posix.POLL.IN else 0,
+                            .revents = 0,
                         };
                         var fd_count: usize = 2;
                         for (agent_sockets) |agent_opt| {
@@ -736,7 +897,7 @@ pub fn main(init: std.process.Init) !void {
 
                         const ready = std.posix.poll(fds[0..fd_count], 1000) catch 0;
                         if (ready > 0) {
-                            if (fds[0].revents & std.posix.POLL.IN > 0) { // socket is readable
+                            if (fds[0].revents & std.posix.POLL.IN > 0 and consume_len > 0) { // socket is readable
                                 var bytes_to_read = consume_len;
                                 if (bytes_to_read > iobuf.len) {
                                     bytes_to_read = iobuf.len;
@@ -745,7 +906,19 @@ pub fn main(init: std.process.Init) !void {
                                 if (nbytes > 0) {
                                     try sshz.write(iobuf[0..nbytes]);
                                     continue :outer;
+                                } else {
+                                    if (!connected) exit_code = 1;
+                                    quit = true;
+                                    continue :outer;
                                 }
+                            }
+                            if (fds[0].revents & (std.posix.POLL.ERR | std.posix.POLL.HUP) > 0 and
+                                fds[0].revents & std.posix.POLL.IN == 0 and
+                                fds[0].revents & std.posix.POLL.OUT == 0)
+                            {
+                                if (!connected) exit_code = 1;
+                                quit = true;
+                                continue :outer;
                             }
                             if (fds[0].revents & std.posix.POLL.OUT > 0) { // socket is writeable
                                 const towrite = try sshz.peek(4);
@@ -753,13 +926,15 @@ pub fn main(init: std.process.Init) !void {
                                 try sshz.consumed(bytes_written);
                                 continue :outer;
                             }
-                            if (fds[1].revents & std.posix.POLL.IN > 0) { // keyboard data in
+                            if (can_read_stdin and fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR) > 0) { // keyboard data in
                                 const buf = try sshz.getChannelWriteBuffer(0);
                                 if (buf.len > 0) {
                                     const count = readFd(stdin_fd, buf) catch 0;
                                     if (count > 0) {
                                         try sshz.channelWriteComplete(0, count);
                                         continue :outer;
+                                    } else {
+                                        stdin_open = false;
                                     }
                                 }
                             }
@@ -791,10 +966,30 @@ pub fn main(init: std.process.Init) !void {
                     },
                 }
             }
-
-            if (exit_code != 0) {
-                std.process.exit(exit_code);
-            }
+        }
+        if (exit_code != 0) {
+            std.process.exit(exit_code);
         }
     }
+}
+
+test "sanitizeControlChars neutralizes terminal escapes in banners and prompts" {
+    var out: [128]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Banner\nLine2\\rOverwrite\\x1b]52;c;dGVzdA==\\x07",
+        sanitizeControlChars("Banner\r\nLine2\rOverwrite\x1b]52;c;dGVzdA==\x07", &out, true),
+    );
+    try std.testing.expectEqualStrings(
+        "Password: \\x1b[8m\\rFake: \\n",
+        sanitizeControlChars("Password: \x1b[8m\rFake: \n", &out, false),
+    );
+}
+
+test "validateAgentSocketPath rejects empty, NUL-injected, and overlong paths" {
+    try std.testing.expectError(error.InvalidAgentSocketPath, validateAgentSocketPath(""));
+    try std.testing.expectError(error.InvalidAgentSocketPath, validateAgentSocketPath("\x00abstract"));
+    try std.testing.expectError(error.InvalidAgentSocketPath, validateAgentSocketPath("sock\x00trunc"));
+    const overlong: [256]u8 = @splat('a');
+    try std.testing.expectError(error.NameTooLong, validateAgentSocketPath(&overlong));
+    try validateAgentSocketPath("valid/agent.sock");
 }
