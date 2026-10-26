@@ -14,11 +14,13 @@ pub const Aes192 = struct {
 
         fn subWord(w: u32) u32 {
             var in_bytes: [16]u8 = undefined;
+            defer std.crypto.secureZero(u8, &in_bytes);
             inline for (0..4) |col| {
                 std.mem.writeInt(u32, in_bytes[col * 4 ..][0..4], w, .big);
             }
             const zero_block = aes.Block.fromBytes(&@as([16]u8, @splat(0)));
-            const sub_bytes = aes.Block.fromBytes(&in_bytes).encryptLast(zero_block).toBytes();
+            var sub_bytes = aes.Block.fromBytes(&in_bytes).encryptLast(zero_block).toBytes();
+            defer std.crypto.secureZero(u8, &sub_bytes);
             return std.mem.readInt(u32, sub_bytes[0..4], .big);
         }
 
@@ -41,8 +43,9 @@ pub const Aes192 = struct {
             }
 
             var round_keys: [rounds + 1]block = undefined;
+            var rk_bytes: [16]u8 = undefined;
+            defer std.crypto.secureZero(u8, &rk_bytes);
             inline for (0..rounds + 1) |r| {
-                var rk_bytes: [16]u8 = undefined;
                 inline for (0..4) |c| {
                     std.mem.writeInt(u32, rk_bytes[c * 4 ..][0..4], words[r * 4 + c], .big);
                 }
@@ -136,9 +139,32 @@ pub fn AesCtr(enc_algo: anytype) type {
             // readInt(.big) already yields a host-native integer; byte-swapping it
             // again would corrupt the counter base on big-endian targets.
             const orig = std.mem.readInt(u128, &self.origiv, .big);
+            var in_rest = in;
+            var out_rest = out;
+
+            const block_offset: usize = @intCast(self.bytecount % iv_size);
+            if (block_offset != 0 and in_rest.len > 0) {
+                const take = @min(in_rest.len, iv_size - block_offset);
+                var counter_bytes: [iv_size]u8 = undefined;
+                std.mem.writeInt(u128, &counter_bytes, @as(u128, self.bytecount / iv_size) +% orig, .big);
+                const zero_block: [iv_size]u8 = @splat(0);
+                var keystream_block: [iv_size]u8 = undefined;
+                defer crypto.secureZero(u8, &keystream_block);
+                ctr_mode(CtxType, self.ctx, &keystream_block, &zero_block, counter_bytes, std.builtin.Endian.big);
+                for (0..take) |i| {
+                    out_rest[i] = in_rest[i] ^ keystream_block[block_offset + i];
+                }
+                self.bytecount += take;
+                in_rest = in_rest[take..];
+                out_rest = out_rest[take..];
+            }
+
+            if (in_rest.len > 0) {
+                std.mem.writeInt(u128, &self.iv, @as(u128, self.bytecount / iv_size) +% orig, .big);
+                ctr_mode(CtxType, self.ctx, out_rest, in_rest, self.iv, std.builtin.Endian.big);
+                self.bytecount += in_rest.len;
+            }
             std.mem.writeInt(u128, &self.iv, @as(u128, self.bytecount / iv_size) +% orig, .big);
-            ctr_mode(CtxType, self.ctx, out, in, self.iv, std.builtin.Endian.big);
-            self.bytecount += in.len;
         }
 
         pub fn clear(self: *Self) void {
@@ -391,5 +417,36 @@ test "aesctr-singleblock-wrongiv" {
         try aesctx_dec.encrypt(&block_ciphertext, &block_recovered_plaintext);
 
         try std.testing.expect(!std.mem.eql(u8, &block_plaintext, &block_recovered_plaintext));
+    }
+}
+
+test "aesctr sub-block chunking matches single-shot keystream without counter reuse" {
+    inline for (testalgos) |algo| {
+        const AesCtrT = AesCtr(algo);
+        const iv: [AesCtrT.iv_size]u8 = @splat(0x3C);
+        const key: [AesCtrT.key_size]u8 = @splat(0x7E);
+
+        var plaintext: [48]u8 = undefined;
+        for (&plaintext, 0..) |*b, idx| b.* = @truncate(idx *% 37 +% 11);
+
+        var single_ctx = AesCtrT.init(iv, key);
+        defer single_ctx.clear();
+        var expected_ct: [plaintext.len]u8 = undefined;
+        try single_ctx.encrypt(&plaintext, &expected_ct);
+
+        var chunked_ctx = AesCtrT.init(iv, key);
+        defer chunked_ctx.clear();
+        var actual_ct: [plaintext.len]u8 = undefined;
+        const chunks = [_]usize{ 5, 11, 3, 19, 10 };
+        var offset: usize = 0;
+        for (chunks) |chunk_len| {
+            try chunked_ctx.encrypt(
+                plaintext[offset .. offset + chunk_len],
+                actual_ct[offset .. offset + chunk_len],
+            );
+            offset += chunk_len;
+        }
+        try std.testing.expectEqual(plaintext.len, offset);
+        try std.testing.expectEqualSlices(u8, &expected_ct, &actual_ct);
     }
 }

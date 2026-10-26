@@ -26,7 +26,7 @@ pub fn Hasher(hash_algo: anytype) type {
 
         // if digest is smaller than hash, truncate it
         // if digest if bigger than hash, extend https://datatracker.ietf.org/doc/html/rfc4253#section-7.2
-        pub fn final(self: *Self, digest: []u8, extension: ?[]u8) void {
+        pub fn final(self: *Self, digest: []u8, extension: ?[]const u8) void {
             std.debug.assert(self.active);
             defer self.clear();
             var tmpdigest: [hash_algo.digest_length]u8 = undefined;
@@ -104,6 +104,7 @@ pub fn Hasher(hash_algo: anytype) type {
         }
 
         pub fn writeMpint(self: *Self, v: []const u8) void {
+            std.debug.assert(self.active);
             var first_nonzero: usize = 0;
             while (first_nonzero < v.len and v[first_nonzero] == 0) : (first_nonzero += 1) {}
             const value = v[first_nonzero..];
@@ -148,33 +149,39 @@ pub const KexHasher = struct {
     }
 
     pub fn writeBytes(self: *Self, b: []const u8) void {
+        std.debug.assert(self.active);
         self.sha256.writeBytes(b);
         self.sha384.writeBytes(b);
     }
 
     pub fn writeU32LenString(self: *Self, s: []const u8) void {
+        std.debug.assert(self.active);
         self.sha256.writeU32LenString(s);
         self.sha384.writeU32LenString(s);
     }
 
     pub fn writeMpint(self: *Self, b: []const u8) void {
+        std.debug.assert(self.active);
         self.sha256.writeMpint(b);
         self.sha384.writeMpint(b);
     }
 
     pub fn finalSha256(self: *Self, out: *[32]u8) void {
+        std.debug.assert(self.active);
         self.sha256.final(out, null);
         self.sha384.clear();
         self.active = false;
     }
 
     pub fn finalSha384(self: *Self, out: *[48]u8) void {
+        std.debug.assert(self.active);
         self.sha384.final(out, null);
         self.sha256.clear();
         self.active = false;
     }
 
-    pub fn final(self: *Self, out: *[32]u8, extra: ?[]u8) void {
+    pub fn final(self: *Self, out: *[32]u8, extra: ?[]const u8) void {
+        std.debug.assert(self.active);
         self.sha256.final(out, extra);
         self.sha384.clear();
         self.active = false;
@@ -235,4 +242,40 @@ test "hasher encodes canonical positive mpints" {
     hasher.final(&actual, null);
 
     try std.testing.expectEqualSlices(u8, &expected, &actual);
+}
+
+test "hasher RFC 4253 multi-block extension and KexHasher clear" {
+    const Sha256 = std.crypto.hash.sha2.Sha256;
+    const ext = "K_and_H_prefix";
+    var hasher = Hasher(Sha256).init();
+    hasher.writeBytes(ext);
+    hasher.writeU8('C');
+    hasher.writeBytes("session_id");
+    var derived: [64]u8 = undefined;
+    hasher.final(&derived, ext);
+
+    var k1: [32]u8 = undefined;
+    var h1 = Sha256.init(.{});
+    h1.update(ext);
+    h1.update(&.{'C'});
+    h1.update("session_id");
+    h1.final(&k1);
+
+    var k2: [32]u8 = undefined;
+    var h2 = Sha256.init(.{});
+    h2.update(ext);
+    h2.update(&k1);
+    h2.final(&k2);
+
+    try std.testing.expectEqualSlices(u8, &k1, derived[0..32]);
+    try std.testing.expectEqualSlices(u8, &k2, derived[32..64]);
+
+    var kh = KexHasher.init();
+    kh.writeU32LenString("V_C");
+    kh.writeMpint(&.{0x01});
+    var out384: [48]u8 = undefined;
+    kh.finalSha384(&out384);
+    try std.testing.expect(!kh.active);
+    try std.testing.expect(!kh.sha256.active);
+    try std.testing.expect(!kh.sha384.active);
 }
