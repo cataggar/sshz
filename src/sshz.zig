@@ -1166,15 +1166,28 @@ pub fn SshzImpl(role: Role) type {
                 self.local_rekey_pending = true;
         }
 
+        fn hasUncommittedHeaderRead(self: *const Self) bool {
+            return switch (self.iostate_rd) {
+                .Idle => true,
+                .Active => |iotype| self.session.ioSessionState == .ReadPktHdr and
+                    self.rd_off == 0 and self.rd_nbytes == 0 and
+                    switch (iotype.next_state) {
+                        .ReadPktBody => true,
+                        else => false,
+                    },
+            };
+        }
+
         fn maybeStartLocalRekey(self: *Self) bool {
             if (!self.local_rekey_pending or self.session.is_rekeying or
                 !self.session.encrypted or !self.session.inbound_encrypted or
-                self.iostate_rd != .Idle or self.iostate_wr != .Idle)
+                !self.hasUncommittedHeaderRead() or self.iostate_wr != .Idle)
                 return false;
             switch (self.session.ioSessionState) {
                 .Idle, .ReadPktHdr => {},
                 else => return false,
             }
+            self.iostate_rd = .Idle;
             self.session.startLocalRekey();
             self.local_rekey_pending = false;
             return true;
@@ -5005,4 +5018,39 @@ test "full handshake, known_hosts, rekey, and publickey userauth for ssh-mldsa87
     var p384 = privkey.testKeyEcdsaP384();
     defer p384.clear();
     try driveCompositeHandshakeRekeyAndKnownHosts(&p384, &p384, "ecdsa-sha2-nistp384");
+}
+
+test "maybeStartLocalRekey disarms uncommitted header read when monotonic rekey becomes due" {
+    const rekey_limits = ResourceLimits{ .key_lifetime = .{
+        .rekey_after_monotonic_ticks = 10,
+    } };
+    var prng = std.Random.DefaultPrng.init(99);
+    var client = try SshzClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        rekey_limits,
+    );
+    defer client.deinit();
+    try client.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&client.session.keydata);
+    client.session.encrypted = true;
+    client.session.inbound_encrypted = true;
+    client.session.setSessionState(.ChannelActive);
+    client.session.setIoSessionState(.ReadPktHdr);
+    try client.initializeDeadlines(100);
+
+    // Arm the normal ReadPktHdr -> ReadPktBody read (0 bytes committed) via getNextEvent()
+    const before = try client.getNextEvent();
+    try std.testing.expect(before == .ReadyToConsume);
+    try std.testing.expect(client.iostate_rd == .Active);
+
+    // Tick past the monotonic rekey threshold while iostate_rd is armed with 0 bytes read
+    try std.testing.expect((try client.tick(110)) == null);
+    try std.testing.expect(client.session.is_rekeying);
+    try std.testing.expect(!client.local_rekey_pending);
+    try std.testing.expect(client.iostate_rd == .Idle);
+
+    const next_evt = try client.getNextEvent();
+    try std.testing.expect(next_evt == .ReadyToProduce);
 }

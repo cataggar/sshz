@@ -400,7 +400,11 @@ fn runClientCase(case: CorpusCase, case_index: usize) !void {
             31 => if (case.input.len > 1) client.session.setSessionState(.EcdhReply),
             // Userauth replies are gated on the authentication phase, so park the
             // session there to exercise the parser rather than the phase gate.
-            51, 52, 60 => client.session.setSessionState(.AuthMethodQueued),
+            51, 52 => client.session.setSessionState(.AuthMethodQueued),
+            60 => {
+                client.session.current_auth_method = .KeyboardInteractive;
+                client.session.setSessionState(.KeyboardInteractiveAuthReq);
+            },
             // Connection-protocol messages are gated on authentication, so put the
             // session past userauth to exercise the parser rather than the gate.
             80...127 => {

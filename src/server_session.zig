@@ -62,6 +62,19 @@ const PendingGlobalRequest = struct {
     bind_port: u32,
 };
 
+const PendingProtocolReply = union(enum) {
+    ChannelOpenFailure: struct {
+        recipient: u32,
+        reason_code: u32,
+        description: []const u8,
+    },
+    GlobalRequestReply: struct {
+        success: bool,
+        include_bound_port: bool = false,
+        bound_port: u32 = 0,
+    },
+};
+
 const ExitSubmission = struct {
     const capacity = 1 + 4 + 4 + Protocol.channel_request_exit_signal.len + 1 +
         4 + Sshz.ResourceCapacities.server_exit_signal_name + 1 +
@@ -129,6 +142,11 @@ pub const Session = struct {
     pre_identification_lines: usize,
     ignore_next_kex_packet: bool,
     pending_server_kexinit: ?[]u8,
+    strict_kex: bool = false,
+    saw_non_kex_in_initial_kex: bool = false,
+    pending_protocol_replies: [MaxChannels]PendingProtocolReply = undefined,
+    pending_protocol_replies_head: usize = 0,
+    pending_protocol_replies_len: usize = 0,
 
     auth_pubkey_attempted: Key.Blob,
     auth_pubkey_algorithm: ?Key.SignatureAlgorithm,
@@ -225,6 +243,10 @@ pub const Session = struct {
         self.clearHostPrivateKey();
         self.encrypted = false;
         self.inbound_encrypted = false;
+        self.strict_kex = false;
+        self.saw_non_kex_in_initial_kex = false;
+        self.pending_protocol_replies_head = 0;
+        self.pending_protocol_replies_len = 0;
     }
 
     pub fn sessionIdSlice(self: *const Self) []const u8 {
@@ -232,7 +254,12 @@ pub const Session = struct {
     }
 
     pub fn effectiveAlgorithmOffers(self: *const Self) Protocol.AlgorithmOffers {
-        return self.algorithm_offers_override orelse Protocol.localAlgorithmOffers(self.host_private_key.hostKeyAlgorithms());
+        if (self.algorithm_offers_override) |override| return override;
+        var offers = Protocol.localAlgorithmOffers(self.host_private_key.hostKeyAlgorithms());
+        if (!self.session_id_established) {
+            offers.kex = Protocol.kex_algorithms_server;
+        }
+        return offers;
     }
 
     fn setSharedSecret(self: *Self, slice: []const u8) void {
@@ -440,13 +467,13 @@ pub const Session = struct {
         var next = self.pending_c2s_keys orelse return IoError.UnexpectedResponse;
         self.pending_c2s_keys = null;
         errdefer next.clear();
-        next.seq = self.keydata.c2s.seq;
+        next.seq = if (self.strict_kex) 0 else self.keydata.c2s.seq;
         try next.activateEpoch(self.keydata.c2s.epoch, sshz.keyActivationTime());
         next.compression.applyPendingAlgorithm();
         self.keydata.c2s.clear();
         self.keydata.c2s = next;
         next.clear();
-        if (self.is_rekeying) try self.keydata.c2s.compression.activateInflate();
+        if (self.user_authenticated) try self.keydata.c2s.compression.activateInflate();
         self.inbound_encrypted = true;
     }
 
@@ -454,13 +481,13 @@ pub const Session = struct {
         var next = self.pending_s2c_keys orelse return IoError.UnexpectedResponse;
         self.pending_s2c_keys = null;
         errdefer next.clear();
-        next.seq = self.keydata.s2c.seq;
+        next.seq = if (self.strict_kex) 0 else self.keydata.s2c.seq;
         try next.activateEpoch(self.keydata.s2c.epoch, sshz.keyActivationTime());
         next.compression.applyPendingAlgorithm();
         self.keydata.s2c.clear();
         self.keydata.s2c = next;
         next.clear();
-        if (self.is_rekeying) try self.keydata.s2c.compression.activateDeflate();
+        if (self.user_authenticated) try self.keydata.s2c.compression.activateDeflate();
         self.encrypted = true;
     }
 
@@ -674,6 +701,10 @@ pub const Session = struct {
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
             },
             .Authenticated => {
+                if (try self.flushPendingProtocolReply(sshz)) {
+                    if (self.pending_protocol_replies_len == 0) self.setIoSessionState(.ReadPktHdr);
+                    return;
+                }
                 self.setIoSessionState(.ReadPktHdr);
             },
             .ChannelActive => {
@@ -683,6 +714,15 @@ pub const Session = struct {
     }
 
     fn advanceChannel(self: *Self, sshz: *SshzServer, outkeys: *Protocol.KeyDataUni) SshzError!void {
+        if (try self.flushPendingProtocolReply(sshz)) {
+            if (self.pending_protocol_replies_len == 0 and
+                self.active_channel_id == null and
+                self.channel_table.findNextRunnable() == null)
+            {
+                self.setIoSessionState(.ReadPktHdr);
+            }
+            return;
+        }
         const ch = if (self.active_channel_id) |id|
             self.channel_table.findByLocalId(id)
         else
@@ -1081,8 +1121,10 @@ pub const Session = struct {
     }
 
     pub fn dispatchDeferredChannelWrite(self: *Self, sshz: *SshzServer) SshzError!bool {
-        if (self.sessionState != .ChannelActive or self.is_rekeying or sshz.local_rekey_pending or
-            sshz.iostate_wr != .Idle) return false;
+        if ((self.sessionState != .ChannelActive and self.sessionState != .Authenticated) or
+            self.is_rekeying or sshz.local_rekey_pending or sshz.iostate_wr != .Idle) return false;
+        if (try self.flushPendingProtocolReply(sshz)) return true;
+        if (self.sessionState != .ChannelActive) return false;
         for (0..MaxChannels) |_| {
             const chan = self.channel_table.findNextDeferredWrite() orelse return false;
             if ((chan.close_received or chan.close_pending) and chan.tx_in_flight_len == 0) {
@@ -1342,6 +1384,49 @@ pub const Session = struct {
         return vers;
     }
 
+    fn queueProtocolReply(self: *Self, reply: PendingProtocolReply) SshzError!void {
+        if (self.pending_protocol_replies_len >= self.limits.max_channels)
+            return IoError.ResourceLimitExceeded;
+        const index = (self.pending_protocol_replies_head + self.pending_protocol_replies_len) % MaxChannels;
+        self.pending_protocol_replies[index] = reply;
+        self.pending_protocol_replies_len += 1;
+    }
+
+    fn flushPendingProtocolReply(self: *Self, sshz: *SshzServer) SshzError!bool {
+        if (self.pending_protocol_replies_len == 0 or self.is_rekeying or
+            sshz.local_rekey_pending or sshz.iostate_wr != .Idle)
+        {
+            return false;
+        }
+        const reply = self.pending_protocol_replies[self.pending_protocol_replies_head];
+        var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
+        switch (reply) {
+            .ChannelOpenFailure => |fail| {
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+                try pkt.writeU32(fail.recipient);
+                try pkt.writeU32(fail.reason_code);
+                try pkt.writeU32LenString(fail.description);
+                try pkt.writeU32LenString("");
+            },
+            .GlobalRequestReply => |req| {
+                try pkt.writeU8(@backingInt(if (req.success)
+                    Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS
+                else
+                    Protocol.MsgId.SSH_MSG_REQUEST_FAILURE));
+                if (req.success and req.include_bound_port) {
+                    try pkt.writeU32(req.bound_port);
+                }
+            },
+        }
+        try sshz.requestWrite(
+            try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.s2c, &pkt, &sshz.iobuf_wr),
+            .WriteCompletePreserveState,
+        );
+        self.pending_protocol_replies_head = (self.pending_protocol_replies_head + 1) % MaxChannels;
+        self.pending_protocol_replies_len -= 1;
+        return true;
+    }
+
     fn sendChannelOpenFailure(
         self: *Self,
         sshz: *SshzServer,
@@ -1349,6 +1434,15 @@ pub const Session = struct {
         reason_code: u32,
         description: []const u8,
     ) SshzError!void {
+        if (self.is_rekeying or sshz.local_rekey_pending or sshz.iostate_wr != .Idle) {
+            try self.queueProtocolReply(.{ .ChannelOpenFailure = .{
+                .recipient = recipient,
+                .reason_code = reason_code,
+                .description = description,
+            } });
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
         try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
         try pkt.writeU32(recipient);
@@ -1364,6 +1458,15 @@ pub const Session = struct {
         include_bound_port: bool,
         bound_port: u32,
     ) SshzError!void {
+        if (self.is_rekeying or sshz.local_rekey_pending) {
+            try self.queueProtocolReply(.{ .GlobalRequestReply = .{
+                .success = true,
+                .include_bound_port = include_bound_port,
+                .bound_port = bound_port,
+            } });
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
         if (sshz.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
 
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
@@ -1375,6 +1478,13 @@ pub const Session = struct {
     }
 
     fn sendGlobalRequestFailure(self: *Self, sshz: *SshzServer) SshzError!void {
+        if (self.is_rekeying or sshz.local_rekey_pending) {
+            try self.queueProtocolReply(.{ .GlobalRequestReply = .{
+                .success = false,
+            } });
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
         if (sshz.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
 
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
@@ -1385,6 +1495,8 @@ pub const Session = struct {
     pub fn acceptTcpipForward(self: *Self, sshz: *SshzServer, bound_port: u32) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
         if (pending.kind != .TcpipForward) return IoError.UnexpectedResponse;
+        if (pending.want_reply and sshz.iostate_wr != .Idle and !self.is_rekeying and !sshz.local_rekey_pending)
+            return IoError.cannotAcceptWrite;
         self.pending_global_request = null;
 
         if (!pending.want_reply) {
@@ -1397,6 +1509,8 @@ pub const Session = struct {
     pub fn rejectTcpipForward(self: *Self, sshz: *SshzServer) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
         if (pending.kind != .TcpipForward) return IoError.UnexpectedResponse;
+        if (pending.want_reply and sshz.iostate_wr != .Idle and !self.is_rekeying and !sshz.local_rekey_pending)
+            return IoError.cannotAcceptWrite;
         self.pending_global_request = null;
 
         if (!pending.want_reply) {
@@ -1409,6 +1523,8 @@ pub const Session = struct {
     pub fn acceptCancelTcpipForward(self: *Self, sshz: *SshzServer) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
         if (pending.kind != .CancelTcpipForward) return IoError.UnexpectedResponse;
+        if (pending.want_reply and sshz.iostate_wr != .Idle and !self.is_rekeying and !sshz.local_rekey_pending)
+            return IoError.cannotAcceptWrite;
         self.pending_global_request = null;
 
         if (!pending.want_reply) {
@@ -1421,6 +1537,8 @@ pub const Session = struct {
     pub fn rejectCancelTcpipForward(self: *Self, sshz: *SshzServer) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
         if (pending.kind != .CancelTcpipForward) return IoError.UnexpectedResponse;
+        if (pending.want_reply and sshz.iostate_wr != .Idle and !self.is_rekeying and !sshz.local_rekey_pending)
+            return IoError.cannotAcceptWrite;
         self.pending_global_request = null;
 
         if (!pending.want_reply) {
@@ -1476,7 +1594,10 @@ pub const Session = struct {
     }
 
     fn handleChannelOpenPacket(self: *Self, rdr: *BufferReader, sshz: *SshzServer) SshzError!void {
-        if (self.sessionState != .Authenticated and self.sessionState != .ChannelActive) {
+        const active_conn = self.sessionState == .Authenticated or self.sessionState == .ChannelActive or
+            (self.is_rekeying and self.sessionState == .KexInitRead and
+                (self.rekey_resume_state == .Authenticated or self.rekey_resume_state == .ChannelActive));
+        if (!active_conn) {
             return IoError.UnexpectedResponse;
         }
 
@@ -1629,6 +1750,18 @@ pub const Session = struct {
         }
     }
 
+    fn isPeerKexInProgress(self: *const Self) bool {
+        return switch (self.sessionState) {
+            .KexInitWrite => self.kex_hash_order == .I_C,
+            .EcdhInitRead,
+            .EcdhReplyWrite,
+            .NewKeysWrite,
+            .NewKeysRead,
+            => true,
+            else => false,
+        };
+    }
+
     /// RFC 4250 §4.1.2 reserves message numbers 80-127 for the connection
     /// protocol, which is only reachable after `ssh-userauth` succeeds. This is
     /// a latch rather than a `sessionState` test because RFC 4253 §9 allows
@@ -1655,7 +1788,7 @@ pub const Session = struct {
 
         if (msgid >= Protocol.connection_protocol_msgid_min and
             msgid <= Protocol.connection_protocol_msgid_max and
-            !self.isAuthenticatedForConnectionProtocol())
+            (!self.isAuthenticatedForConnectionProtocol() or self.isPeerKexInProgress()))
         {
             return IoError.UnexpectedResponse;
         }
@@ -1700,6 +1833,12 @@ pub const Session = struct {
                 self.negotiated_compression_c2s = negotiated.compression_c2s;
                 self.negotiated_compression_s2c = negotiated.compression_s2c;
                 self.ignore_next_kex_packet = negotiated.ignore_next_peer_packet;
+                if (initial_kex) {
+                    self.strict_kex = negotiated.strict_kex;
+                    if (self.strict_kex and self.saw_non_kex_in_initial_kex) {
+                        return IoError.UnexpectedResponse;
+                    }
+                }
 
                 if (local_or_simultaneous_rekey) {
                     const local_kexinit = self.pending_server_kexinit orelse
@@ -2118,10 +2257,18 @@ pub const Session = struct {
                 }
             },
             @backingInt(Protocol.MsgId.SSH_MSG_IGNORE) => {
+                if (!self.inbound_encrypted) {
+                    if (self.strict_kex) return IoError.UnexpectedResponse;
+                    if (!self.session_id_established) self.saw_non_kex_in_initial_kex = true;
+                }
                 // RFC 4253 §11.2 - must be silently ignored
                 self.setIoSessionState(.ReadPktHdr);
             },
             @backingInt(Protocol.MsgId.SSH_MSG_DEBUG) => {
+                if (!self.inbound_encrypted) {
+                    if (self.strict_kex) return IoError.UnexpectedResponse;
+                    if (!self.session_id_established) self.saw_non_kex_in_initial_kex = true;
+                }
                 // RFC 4253 §11.3 - may be logged, must not cause protocol failure
                 const always_display = try rdr.readBoolean();
                 const message = try rdr.readU32LenString();
@@ -4910,4 +5057,81 @@ test "server PTY observation never admits an agent channel as a session" {
     try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE), try response.readU8());
     try std.testing.expectEqual(@as(u32, 42), try response.readU32());
     try std.testing.expectEqual(response.payload.len, response.off);
+}
+
+test "server strict KEX rejects unencrypted IGNORE and resets sequence numbers on NEWKEYS" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    m.session.strict_kex = true;
+    m.session.inbound_encrypted = false;
+    var ignore_payload: [16]u8 = undefined;
+    var pw = BufferWriter.init(&ignore_payload, 0);
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE));
+    try pw.writeU32LenString("");
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+    try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+
+    var m2 = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m2.deinit();
+    m2.session.strict_kex = true;
+    m2.session.keydata.c2s.seq = 5;
+    m2.session.keydata.s2c.seq = 8;
+    m2.session.pending_c2s_keys = .{ .seq = 0 };
+    m2.session.pending_s2c_keys = .{ .seq = 0 };
+    try m2.session.activatePendingC2sKeys(&m2);
+    try m2.session.activatePendingS2cKeys(&m2);
+    try std.testing.expectEqual(@as(u32, 0), m2.session.keydata.c2s.seq);
+    try std.testing.expectEqual(@as(u32, 0), m2.session.keydata.s2c.seq);
+}
+
+test "server pre-auth rekey does not activate delayed zlib@openssh.com compression" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    m.session.is_rekeying = true;
+    m.session.user_authenticated = false;
+    m.session.pending_c2s_keys = .{ .seq = 0, .compression = .{ .pending_algorithm = .ZlibOpenSsh } };
+    m.session.pending_s2c_keys = .{ .seq = 0, .compression = .{ .pending_algorithm = .ZlibOpenSsh } };
+    try m.session.activatePendingC2sKeys(&m);
+    try m.session.activatePendingS2cKeys(&m);
+    try std.testing.expect(!m.session.keydata.c2s.compression.active);
+    try std.testing.expect(!m.session.keydata.s2c.compression.active);
+}
+
+test "server rejects connection messages after peer KEXINIT and defers global request reply during local KEXINIT" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    m.session.user_authenticated = true;
+    m.session.is_rekeying = true;
+    m.session.rekey_resume_state = .ChannelActive;
+
+    var req_backing: [64]u8 = undefined;
+    var pw = BufferWriter.init(&req_backing, 0);
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_GLOBAL_REQUEST));
+    try pw.writeU32LenString("unknown-req");
+    try pw.writeBoolean(true);
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+
+    // After peer KEXINIT (e.g. EcdhInitRead), connection messages violate RFC 4253 §7.1
+    m.session.setSessionState(.EcdhInitRead);
+    try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+
+    // Before peer KEXINIT (KexInitRead), in-flight global request reply is deferred until rekey finishes
+    m.session.setSessionState(.KexInitRead);
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+    try std.testing.expect(m.iostate_wr == .Idle);
+    try std.testing.expectEqual(@as(usize, 1), m.session.pending_protocol_replies_len);
+
+    m.session.is_rekeying = false;
+    m.session.rekey_resume_state = null;
+    m.session.setSessionState(.ChannelActive);
+    try std.testing.expect(try m.session.dispatchDeferredChannelWrite(&m));
+    const out = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(out));
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
 }

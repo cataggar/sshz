@@ -54,6 +54,8 @@ fn decodeAsciiToBinary(keydata_ascii: []const u8, keydata_bin_buf: []u8) PrivKey
 }
 
 /// Returns caller-owned key material that must be cleared after use.
+pub const MaxBcryptRounds: u32 = 1024;
+
 pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]const u8) PrivKeyError!Key.PrivateKey {
     // Input text and the optional passphrase are borrowed; this function owns and
     // scrubs all decoded, KDF, and decrypted scratch that it creates.
@@ -92,6 +94,9 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
 
     const enc_section_off = buffer.off + 4 + AuthMagic.len; // current position is before u32 length field, then data blob
     const enc_section = try buffer.readU32LenString();
+    if (buffer.off != buffer.payload.len) {
+        return PrivKeyError.BadPrivKey;
+    }
 
     if (std.mem.eql(u8, ciphername, "aes256-ctr")) {
         if (std.mem.eql(u8, kdfname, "bcrypt")) {
@@ -100,7 +105,9 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
                 const salt = try buffer_kdfopt.readU32LenString();
                 const rounds = try buffer_kdfopt.readU32();
                 UNSAFE_TRACEDUMP(.Debug, "salt rounds={d}", .{rounds}, salt);
-                if (salt.len != 16) {
+                if (salt.len != 16 or rounds == 0 or rounds > MaxBcryptRounds or
+                    buffer_kdfopt.off != buffer_kdfopt.payload.len)
+                {
                     return PrivKeyError.BadPrivKey;
                 }
 
@@ -132,6 +139,9 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
     } else {
         if (!std.mem.eql(u8, ciphername, "none")) {
             return PrivKeyError.UnsupportedPrivKey; // aes256-ctr/none are only options we support
+        }
+        if (!std.mem.eql(u8, kdfname, "none") or kdfoptions_section.len != 0) {
+            return PrivKeyError.BadPrivKey;
         }
     }
 
@@ -737,4 +747,50 @@ test "OpenSSH P-384 private key pads short 47-byte positive scalar and rejects m
     defer bad_mldsa44.clear();
     bad_mldsa44.Mldsa44Ed25519.ed25519_seed[0] ^= 0x01;
     try std.testing.expectError(Key.KeyError.InvalidKeyBlob, bad_mldsa44.validate());
+}
+
+test "decodeOpenSshPrivateKey bounds bcrypt rounds and validates unencrypted KDF fields" {
+    var raw_buf: [2048]u8 = undefined;
+    const bin = try decodeAsciiToBinary(testkey_encrypted_valid_passworded, &raw_buf);
+
+    // Locate the 4-byte rounds field inside kdfoptions (16-byte salt length + 16-byte salt = offset after "bcrypt" string)
+    const bcrypt_needle = "\x00\x00\x00\x06bcrypt\x00\x00\x00\x18\x00\x00\x00\x10";
+    const idx = std.mem.indexOf(u8, bin, bcrypt_needle) orelse return error.TestUnexpectedResult;
+    const rounds_off = idx + bcrypt_needle.len + 16;
+
+    for ([_]u32{ 0, MaxBcryptRounds + 1 }) |bad_rounds| {
+        var mutated_bin: [2048]u8 = undefined;
+        @memcpy(mutated_bin[0..bin.len], bin);
+        std.mem.writeInt(u32, mutated_bin[rounds_off..][0..4], bad_rounds, .big);
+
+        var b64_buf: [4096]u8 = undefined;
+        const b64 = std.base64.standard.Encoder.encode(&b64_buf, mutated_bin[0..bin.len]);
+        var pem_buf: [4096]u8 = undefined;
+        const pem = try std.fmt.bufPrint(
+            &pem_buf,
+            "-----BEGIN OPENSSH PRIVATE KEY-----\n{s}\n-----END OPENSSH PRIVATE KEY-----\n",
+            .{b64},
+        );
+        try std.testing.expectError(
+            PrivKeyError.BadPrivKey,
+            decodeOpenSshPrivateKey(pem, testkey_encrypted_valid_password),
+        );
+    }
+
+    // ciphername == "none" with kdfname != "none" must fail with BadPrivKey
+    const unenc_bin = try decodeAsciiToBinary(testkey_valid, &raw_buf);
+    const none_kdf_needle = "\x00\x00\x00\x04none\x00\x00\x00\x04none";
+    const none_idx = std.mem.indexOf(u8, unenc_bin, none_kdf_needle) orelse return error.TestUnexpectedResult;
+    var bad_unenc: [2048]u8 = undefined;
+    @memcpy(bad_unenc[0..unenc_bin.len], unenc_bin);
+    @memcpy(bad_unenc[none_idx + 12 ..][0..4], "fake");
+    var b64_unenc_buf: [4096]u8 = undefined;
+    const b64_unenc = std.base64.standard.Encoder.encode(&b64_unenc_buf, bad_unenc[0..unenc_bin.len]);
+    var pem_unenc_buf: [4096]u8 = undefined;
+    const pem_unenc = try std.fmt.bufPrint(
+        &pem_unenc_buf,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{s}\n-----END OPENSSH PRIVATE KEY-----\n",
+        .{b64_unenc},
+    );
+    try std.testing.expectError(PrivKeyError.BadPrivKey, decodeOpenSshPrivateKey(pem_unenc, null));
 }

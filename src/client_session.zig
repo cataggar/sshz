@@ -47,9 +47,16 @@ const ExitResultSlot = struct {
     result: ?OwnedExitResult = null,
 };
 
-const PendingChannelReply = struct {
-    remote_id: u32,
-    success: bool,
+const PendingChannelReply = union(enum) {
+    RequestReply: struct {
+        remote_id: u32,
+        success: bool,
+    },
+    OpenFailure: struct {
+        recipient: u32,
+        reason_code: u32,
+        description: []const u8,
+    },
 };
 
 pub const SessionState = enum {
@@ -164,6 +171,7 @@ pub const Session = struct {
     auto_session_enabled: bool,
     auto_channel_read_credit_enabled: bool,
     kbd_interactive_response: ?[]u8, // allocated
+    kbd_interactive_num_prompts: u32 = 1,
     is_rekeying: bool,
     rekey_resume_state: ?SessionState,
     client_version: ?[]u8,
@@ -186,6 +194,8 @@ pub const Session = struct {
     negotiated_compression_s2c: Protocol.CompressionAlgorithm,
     pending_server_kexinit: ?[]u8,
     ignore_next_kex_packet: bool,
+    strict_kex: bool = false,
+    saw_non_kex_in_initial_kex: bool = false,
 
     pub fn init(rand: std.Random, username: []const u8, allocator: std.mem.Allocator) !Self {
         return initWithLimits(rand, username, allocator, .{});
@@ -289,6 +299,9 @@ pub const Session = struct {
         self.user_authenticated = false;
         self.encrypted = false;
         self.inbound_encrypted = false;
+        self.kbd_interactive_num_prompts = 1;
+        self.strict_kex = false;
+        self.saw_non_kex_in_initial_kex = false;
     }
 
     pub fn sessionIdSlice(self: *const Self) []const u8 {
@@ -296,7 +309,12 @@ pub const Session = struct {
     }
 
     pub fn effectiveAlgorithmOffers(self: *const Self) Protocol.AlgorithmOffers {
-        return self.algorithm_offers_override orelse Protocol.localAlgorithmOffers(Key.client_hostkey_algorithms);
+        if (self.algorithm_offers_override) |override| return override;
+        var offers = Protocol.localAlgorithmOffers(Key.client_hostkey_algorithms);
+        if (!self.session_id_established) {
+            offers.kex = Protocol.kex_algorithms_client;
+        }
+        return offers;
     }
 
     fn setSharedSecret(self: *Self, slice: []const u8) void {
@@ -690,13 +708,13 @@ pub const Session = struct {
         var next = self.pending_c2s_keys orelse return IoError.UnexpectedResponse;
         self.pending_c2s_keys = null;
         errdefer next.clear();
-        next.seq = self.keydata.c2s.seq;
+        next.seq = if (self.strict_kex) 0 else self.keydata.c2s.seq;
         try next.activateEpoch(self.keydata.c2s.epoch, sshz.keyActivationTime());
         next.compression.applyPendingAlgorithm();
         self.keydata.c2s.clear();
         self.keydata.c2s = next;
         next.clear();
-        if (self.is_rekeying) try self.keydata.c2s.compression.activateDeflate();
+        if (self.user_authenticated) try self.keydata.c2s.compression.activateDeflate();
         self.encrypted = true;
     }
 
@@ -704,13 +722,13 @@ pub const Session = struct {
         var next = self.pending_s2c_keys orelse return IoError.UnexpectedResponse;
         self.pending_s2c_keys = null;
         errdefer next.clear();
-        next.seq = self.keydata.s2c.seq;
+        next.seq = if (self.strict_kex) 0 else self.keydata.s2c.seq;
         try next.activateEpoch(self.keydata.s2c.epoch, sshz.keyActivationTime());
         next.compression.applyPendingAlgorithm();
         self.keydata.s2c.clear();
         self.keydata.s2c = next;
         next.clear();
-        if (self.is_rekeying) try self.keydata.s2c.compression.activateInflate();
+        if (self.user_authenticated) try self.keydata.s2c.compression.activateInflate();
         self.inbound_encrypted = true;
     }
 
@@ -1078,14 +1096,19 @@ pub const Session = struct {
             },
             .KeyboardInteractiveInfoRsp => {
                 defer self.clearAndFreeOptional(&self.kbd_interactive_response);
+                defer self.kbd_interactive_num_prompts = 1;
                 // RFC 4256 §3.4 - send response to info request
                 var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
                 try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_INFO_RESPONSE));
-                try pkt.writeU32(1); // num-responses
-                if (self.kbd_interactive_response) |resp| {
-                    try pkt.writeU32LenString(resp);
+                if (self.kbd_interactive_num_prompts == 0) {
+                    try pkt.writeU32(0); // num-responses
                 } else {
-                    try pkt.writeU32LenString("");
+                    try pkt.writeU32(1); // num-responses
+                    if (self.kbd_interactive_response) |resp| {
+                        try pkt.writeU32LenString(resp);
+                    } else {
+                        try pkt.writeU32LenString("");
+                    }
                 }
                 try sshz.requestWrite(try Protocol.wrapPkt(&self.rand, self.encrypted, outkeys, &pkt, &sshz.iobuf_wr), .Idle);
                 self.setSessionState(.AuthRsp);
@@ -2206,6 +2229,11 @@ pub const Session = struct {
         reason_code: u32,
         description: []const u8,
     ) SshzError!void {
+        if (self.is_rekeying or sshz.local_rekey_pending or sshz.iostate_wr != .Idle) {
+            try self.queueChannelOpenFailure(recipient, reason_code, description);
+            self.setIoSessionState(.ReadPktHdr);
+            return;
+        }
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
         try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
         try pkt.writeU32(recipient);
@@ -2219,7 +2247,24 @@ pub const Session = struct {
         if (self.pending_channel_replies_len >= self.limits.max_channels)
             return IoError.ResourceLimitExceeded;
         const index = (self.pending_channel_replies_head + self.pending_channel_replies_len) % MaxChannels;
-        self.pending_channel_replies[index] = .{ .remote_id = remote_id, .success = success };
+        self.pending_channel_replies[index] = .{ .RequestReply = .{ .remote_id = remote_id, .success = success } };
+        self.pending_channel_replies_len += 1;
+    }
+
+    fn queueChannelOpenFailure(
+        self: *Self,
+        recipient: u32,
+        reason_code: u32,
+        description: []const u8,
+    ) SshzError!void {
+        if (self.pending_channel_replies_len >= self.limits.max_channels)
+            return IoError.ResourceLimitExceeded;
+        const index = (self.pending_channel_replies_head + self.pending_channel_replies_len) % MaxChannels;
+        self.pending_channel_replies[index] = .{ .OpenFailure = .{
+            .recipient = recipient,
+            .reason_code = reason_code,
+            .description = description,
+        } };
         self.pending_channel_replies_len += 1;
     }
 
@@ -2232,11 +2277,22 @@ pub const Session = struct {
 
         const reply = self.pending_channel_replies[self.pending_channel_replies_head];
         var pkt = BufferWriter.init(&sshz.iobuf_wr, Protocol.sizeof_PktHdr);
-        try pkt.writeU8(@backingInt(if (reply.success)
-            Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS
-        else
-            Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE));
-        try pkt.writeU32(reply.remote_id);
+        switch (reply) {
+            .RequestReply => |req| {
+                try pkt.writeU8(@backingInt(if (req.success)
+                    Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS
+                else
+                    Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE));
+                try pkt.writeU32(req.remote_id);
+            },
+            .OpenFailure => |fail| {
+                try pkt.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE));
+                try pkt.writeU32(fail.recipient);
+                try pkt.writeU32(fail.reason_code);
+                try pkt.writeU32LenString(fail.description);
+                try pkt.writeU32LenString("");
+            },
+        }
         try sshz.requestWrite(
             try Protocol.wrapPkt(&self.rand, self.encrypted, &self.keydata.c2s, &pkt, &sshz.iobuf_wr),
             .WriteCompletePreserveState,
@@ -2523,6 +2579,33 @@ pub const Session = struct {
         };
     }
 
+    fn isAwaitingKeyboardInteractiveInfoRequest(self: *const Self) bool {
+        if (!self.isAwaitingUserauthReply()) return false;
+        if (self.current_auth_method) |method| {
+            return method == .KeyboardInteractive;
+        }
+        return switch (self.sessionState) {
+            .KeyboardInteractiveAuthStart,
+            .KeyboardInteractiveAuthReq,
+            .KeyboardInteractiveInfoRsp,
+            => true,
+            else => false,
+        };
+    }
+
+    fn isPeerKexInProgress(self: *const Self) bool {
+        return switch (self.sessionState) {
+            .KexInitWrite => self.pending_server_kexinit != null,
+            .EcdhInitWrite,
+            .EcdhReply,
+            .CheckHostKey,
+            .HostKeyDecision,
+            .NewKeysRead,
+            => true,
+            else => false,
+        };
+    }
+
     /// RFC 4250 §4.1.2 reserves message numbers 80-127 for the connection
     /// protocol, which is only reachable after `ssh-userauth` succeeds. This is
     /// a latch rather than a `sessionState` test because RFC 4253 §9 allows
@@ -2549,7 +2632,7 @@ pub const Session = struct {
 
         if (msgid >= Protocol.connection_protocol_msgid_min and
             msgid <= Protocol.connection_protocol_msgid_max and
-            !self.isAuthenticatedForConnectionProtocol())
+            (!self.isAuthenticatedForConnectionProtocol() or self.isPeerKexInProgress()))
         {
             return IoError.UnexpectedResponse;
         }
@@ -2557,8 +2640,10 @@ pub const Session = struct {
         switch (msgid) {
             @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_SUCCESS),
             @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_FAILURE),
-            @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK),
             => if (!self.isAwaitingUserauthReply()) return IoError.UnexpectedResponse,
+            @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK) => {
+                if (!self.isAwaitingKeyboardInteractiveInfoRequest()) return IoError.UnexpectedResponse;
+            },
             else => {},
         }
 
@@ -2599,6 +2684,12 @@ pub const Session = struct {
                 self.negotiated_compression_c2s = negotiated.compression_c2s;
                 self.negotiated_compression_s2c = negotiated.compression_s2c;
                 self.ignore_next_kex_packet = negotiated.ignore_next_peer_packet;
+                if (initial_kex) {
+                    self.strict_kex = negotiated.strict_kex;
+                    if (self.strict_kex and self.saw_non_kex_in_initial_kex) {
+                        return IoError.UnexpectedResponse;
+                    }
+                }
 
                 if (peer_initiated_rekey) {
                     self.setSessionState(.KexInitWrite);
@@ -2736,9 +2827,11 @@ pub const Session = struct {
                 const instruction = try rdr.readU32LenString();
                 _ = try rdr.readU32LenString(); // language tag
                 const num_prompts = try rdr.readU32();
-                if (num_prompts > 0) {
+                if (num_prompts == 1) {
                     const prompt = try rdr.readU32LenString();
                     const echo = try rdr.readBoolean();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+                    self.kbd_interactive_num_prompts = 1;
                     sshz.requestEvent(.{ .KeyboardInteractive = .{
                         .name = name,
                         .instruction = instruction,
@@ -2746,10 +2839,14 @@ pub const Session = struct {
                         .echo = echo,
                     } }, .Idle);
                     self.setSessionState(.KeyboardInteractiveInfoRsp);
-                } else {
-                    // Zero prompts — send empty response
+                } else if (num_prompts == 0) {
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+                    // Zero prompts — send empty response with num-responses = 0
+                    self.kbd_interactive_num_prompts = 0;
                     self.setSessionState(.KeyboardInteractiveInfoRsp);
                     self.setIoSessionState(.Idle);
+                } else {
+                    return IoError.UnexpectedResponse;
                 }
             },
             @backingInt(Protocol.MsgId.SSH_MSG_REQUEST_SUCCESS) => {
@@ -2932,10 +3029,18 @@ pub const Session = struct {
                 }
             },
             @backingInt(Protocol.MsgId.SSH_MSG_IGNORE) => {
+                if (!self.inbound_encrypted) {
+                    if (self.strict_kex) return IoError.UnexpectedResponse;
+                    if (!self.session_id_established) self.saw_non_kex_in_initial_kex = true;
+                }
                 // RFC 4253 §11.2 - must be silently ignored
                 self.setIoSessionState(.ReadPktHdr);
             },
             @backingInt(Protocol.MsgId.SSH_MSG_DEBUG) => {
+                if (!self.inbound_encrypted) {
+                    if (self.strict_kex) return IoError.UnexpectedResponse;
+                    if (!self.session_id_established) self.saw_non_kex_in_initial_kex = true;
+                }
                 // RFC 4253 §11.3 - may be logged, must not cause protocol failure
                 const always_display = try rdr.readBoolean();
                 const message = try rdr.readU32LenString();
@@ -8885,4 +8990,151 @@ test "client rejects malformed and trailing terminal channel requests" {
             trailing_signal.active(),
         ),
     );
+}
+
+test "client strict KEX rejects unencrypted IGNORE/DEBUG and resets sequence numbers on NEWKEYS" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    m.session.strict_kex = true;
+    m.session.inbound_encrypted = false;
+    var ignore_payload: [16]u8 = undefined;
+    var pw = BufferWriter.init(&ignore_payload, 0);
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_IGNORE));
+    try pw.writeU32LenString("");
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+    try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+
+    var m2 = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m2.deinit();
+    m2.session.strict_kex = true;
+    m2.session.keydata.c2s.seq = 7;
+    m2.session.keydata.s2c.seq = 9;
+    m2.session.pending_c2s_keys = .{ .seq = 0 };
+    m2.session.pending_s2c_keys = .{ .seq = 0 };
+    try m2.session.activatePendingC2sKeys(&m2);
+    try m2.session.activatePendingS2cKeys(&m2);
+    try std.testing.expectEqual(@as(u32, 0), m2.session.keydata.c2s.seq);
+    try std.testing.expectEqual(@as(u32, 0), m2.session.keydata.s2c.seq);
+}
+
+test "client pre-auth rekey does not activate delayed zlib@openssh.com compression" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    m.session.is_rekeying = true;
+    m.session.user_authenticated = false;
+    m.session.pending_c2s_keys = .{ .seq = 0, .compression = .{ .pending_algorithm = .ZlibOpenSsh } };
+    m.session.pending_s2c_keys = .{ .seq = 0, .compression = .{ .pending_algorithm = .ZlibOpenSsh } };
+    try m.session.activatePendingC2sKeys(&m);
+    try m.session.activatePendingS2cKeys(&m);
+    try std.testing.expect(!m.session.keydata.c2s.compression.active);
+    try std.testing.expect(!m.session.keydata.s2c.compression.active);
+}
+
+test "client rejects SSH_MSG_USERAUTH_INFO_REQUEST outside keyboard-interactive and validates num_prompts" {
+    var prng = std.Random.DefaultPrng.init(42);
+    for ([_]AuthMethod{ .None, .PublicKey, .Password }) |other_method| {
+        var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+        defer m.deinit();
+        m.session.current_auth_method = other_method;
+        m.session.setSessionState(.AuthRsp);
+
+        var payload_backing: [64]u8 = undefined;
+        var pw = BufferWriter.init(&payload_backing, 0);
+        try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK));
+        try pw.writeU32LenString("");
+        try pw.writeU32LenString("");
+        try pw.writeU32LenString("");
+        try pw.writeU32(0);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
+
+    // num_prompts == 0 sends num-responses == 0 with no response string
+    {
+        var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+        defer m.deinit();
+        m.session.current_auth_method = .KeyboardInteractive;
+        m.session.setSessionState(.AuthRsp);
+
+        var payload_backing: [64]u8 = undefined;
+        var pw = BufferWriter.init(&payload_backing, 0);
+        try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK));
+        try pw.writeU32LenString("");
+        try pw.writeU32LenString("");
+        try pw.writeU32LenString("");
+        try pw.writeU32(0);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+        try m.advance();
+
+        const out = try m.peek(Protocol.MaxSSHPacket);
+        var rdr = BufferReader.init(unencryptedPayload(out));
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_INFO_RESPONSE), try rdr.readU8());
+        try std.testing.expectEqual(@as(u32, 0), try rdr.readU32());
+        try std.testing.expectEqual(rdr.payload.len, rdr.off);
+    }
+
+    // num_prompts > 1 is rejected cleanly
+    {
+        var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+        defer m.deinit();
+        m.session.current_auth_method = .KeyboardInteractive;
+        m.session.setSessionState(.AuthRsp);
+
+        var payload_backing: [128]u8 = undefined;
+        var pw = BufferWriter.init(&payload_backing, 0);
+        try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_PK_OK));
+        try pw.writeU32LenString("");
+        try pw.writeU32LenString("");
+        try pw.writeU32LenString("");
+        try pw.writeU32(2);
+        try pw.writeU32LenString("Prompt 1: ");
+        try pw.writeBoolean(false);
+        try pw.writeU32LenString("Prompt 2: ");
+        try pw.writeBoolean(false);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
+}
+
+test "client rejects connection messages after peer KEXINIT and defers open failure during local KEXINIT" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzClient.init(prng.random(), "testuser", std.testing.allocator);
+    defer m.deinit();
+
+    m.session.user_authenticated = true;
+    m.session.is_rekeying = true;
+    m.session.rekey_resume_state = .ChannelActive;
+
+    var open_backing: [64]u8 = undefined;
+    var pw = BufferWriter.init(&open_backing, 0);
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU32LenString("session");
+    try pw.writeU32(55);
+    try pw.writeU32(32768);
+    try pw.writeU32(4096);
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+
+    // After peer KEXINIT (e.g. EcdhReply), connection messages violate RFC 4253 §7.1
+    m.session.setSessionState(.EcdhReply);
+    try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+
+    // Before peer KEXINIT (KexInitRead), in-flight open failure is deferred until rekey finishes
+    m.session.setSessionState(.KexInitRead);
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+    try std.testing.expect(m.iostate_wr == .Idle);
+    try std.testing.expectEqual(@as(usize, 1), m.session.pending_channel_replies_len);
+
+    m.session.is_rekeying = false;
+    m.session.rekey_resume_state = null;
+    m.session.setSessionState(.ChannelActive);
+    try std.testing.expect(try m.session.dispatchDeferredChannelWrite(&m));
+    const out = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(out));
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 55), try rdr.readU32());
 }
