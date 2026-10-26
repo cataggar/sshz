@@ -81,7 +81,7 @@ fn isSupportedKeyType(key_type: []const u8) bool {
 fn validatePositiveMpint(value: []const u8) !void {
     if (value.len == 0) return error.MalformedKeyBlob;
     if (value[0] & 0x80 != 0) return error.MalformedKeyBlob;
-    if (value.len > 1 and value[0] == 0 and value[1] & 0x80 == 0) {
+    if (value[0] == 0 and (value.len == 1 or value[1] & 0x80 == 0)) {
         return error.MalformedKeyBlob;
     }
 }
@@ -238,6 +238,10 @@ pub fn checkContents(
         const line = std.mem.trim(u8, untrimmed_line, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
 
+        for (line) |byte| {
+            if ((byte < 0x20 and byte != '\t') or byte == 0x7f) return error.MalformedKnownHostsLine;
+        }
+
         var fields = std.mem.tokenizeAny(u8, line, " \t");
         const host_field = fields.next() orelse return error.MalformedKnownHostsLine;
         if (host_field[0] == '@') return error.UnsupportedMarker;
@@ -282,6 +286,10 @@ pub fn checkContents(
 /// The `known_hosts` line that would trust `raw_key` for `endpoint`,
 /// terminated with a newline. Written into `buffer`.
 pub fn encodeEntry(buffer: []u8, endpoint: []const u8, raw_key: []const u8) ![]const u8 {
+    if (endpoint.len == 0 or endpoint.len > max_endpoint_length) {
+        return error.EndpointTooLong;
+    }
+    try validateHostPattern(endpoint);
     const key_type = try keyType(raw_key);
     const encoded_len = std.base64.standard.Encoder.calcSize(raw_key.len);
     if (encoded_len > std.base64.standard.Encoder.calcSize(max_key_blob_length)) {
@@ -502,4 +510,27 @@ test "known_hosts supports ssh-mldsa87-p384, ssh-mldsa44-ed25519, and ecdsa-sha2
             try std.testing.expectError(error.MalformedKeyBlob, keyType(bad_blob.slice()));
         }
     }
+}
+
+test "rejects 1-byte zero mpint, control characters, and malformed encodeEntry endpoints" {
+    const rsa_zero_exp =
+        "\x00\x00\x00\x07ssh-rsa" ++
+        "\x00\x00\x00\x01\x00" ++
+        "\x00\x00\x00\x02\x00\x80";
+    try std.testing.expectError(error.MalformedKeyBlob, keyType(rsa_zero_exp));
+
+    var line_buffer: [max_line_length]u8 = undefined;
+    const entry = try testLine(&line_buffer, "example.com", "ssh-ed25519", test_ed25519_key);
+    var control_line_buf: [max_line_length]u8 = undefined;
+    const control_line = try std.fmt.bufPrint(&control_line_buf, "{s} bad\x00comment\n", .{entry});
+    try std.testing.expectError(
+        error.MalformedKnownHostsLine,
+        checkContents(control_line, "example.com", test_ed25519_key),
+    );
+
+    var encode_buf: [max_line_length]u8 = undefined;
+    try std.testing.expectError(error.EndpointTooLong, encodeEntry(&encode_buf, "", test_ed25519_key));
+    try std.testing.expectError(error.UnsupportedWildcardHost, encodeEntry(&encode_buf, "*.example.com", test_ed25519_key));
+    try std.testing.expectError(error.UnsupportedHashedHost, encodeEntry(&encode_buf, "|1|salt|hash", test_ed25519_key));
+    try std.testing.expectError(error.MalformedHostPattern, encodeEntry(&encode_buf, "example.com\ninjected", test_ed25519_key));
 }
