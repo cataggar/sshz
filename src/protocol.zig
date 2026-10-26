@@ -109,9 +109,10 @@ pub const KexHashOrder = enum { // https://datatracker.ietf.org/doc/html/rfc5656
 };
 
 // RFC 4253 §6.1 requires support for uncompressed payloads of at least 32768 bytes.
-// This internal bound includes packet framing, maximum padding, and the MAC.
+// This internal bound includes packet framing, maximum padding, and the worst-case MAC (hmac-sha2-512 = 64B).
 pub const MaxSSHPacket = 35000;
-pub const MaxPayload = (MaxSSHPacket - (sizeof_PktHdr + 255 + mac_algo.key_length));
+pub const MaxMacLength = 64;
+pub const MaxPayload = (MaxSSHPacket - (sizeof_PktHdr + 255 + MaxMacLength));
 pub const ChannelDataFramingLen = 1 + 4 + 4;
 pub const ChannelExtendedDataFramingLen = 1 + 4 + 4 + 4;
 
@@ -457,7 +458,11 @@ fn buildEnabledAlgorithmNameList(comptime AlgEnum: type) []const u8 {
     }
 }
 
+pub const kex_strict_client = "kex-strict-c-v00@openssh.com";
+pub const kex_strict_server = "kex-strict-s-v00@openssh.com";
 pub const kex_algorithms = buildEnabledAlgorithmNameList(KexAlgorithm);
+pub const kex_algorithms_client = kex_algorithms ++ "," ++ kex_strict_client;
+pub const kex_algorithms_server = kex_algorithms ++ "," ++ kex_strict_server;
 pub const encryption_algorithms = buildEnabledAlgorithmNameList(CipherAlgorithm);
 pub const mac_algorithms = blk: {
     const list = buildEnabledAlgorithmNameList(MacAlgorithm);
@@ -890,6 +895,7 @@ pub const NegotiatedAlgorithms = struct {
     compression_c2s: CompressionAlgorithm,
     compression_s2c: CompressionAlgorithm,
     ignore_next_peer_packet: bool,
+    strict_kex: bool = false,
 };
 
 pub const MaxNameListEntries: usize = 64;
@@ -928,9 +934,33 @@ fn firstName(namelist: []const u8) []const u8 {
     return std.mem.sliceTo(namelist, ',');
 }
 
+fn isKexSignalingName(name: []const u8) bool {
+    return std.mem.eql(u8, name, kex_strict_client) or
+        std.mem.eql(u8, name, kex_strict_server) or
+        std.mem.eql(u8, name, "ext-info-c") or
+        std.mem.eql(u8, name, "ext-info-s");
+}
+
+fn firstRealKexName(namelist: []const u8) []const u8 {
+    var names = std.mem.splitScalar(u8, namelist, ',');
+    while (names.next()) |name| {
+        if (!isKexSignalingName(name)) return name;
+    }
+    return "";
+}
+
 fn selectClientPreferred(client_namelist: []const u8, server_namelist: []const u8) ?[]const u8 {
     var client_names = std.mem.splitScalar(u8, client_namelist, ',');
     while (client_names.next()) |client_name| {
+        if (nameListContains(server_namelist, client_name)) return client_name;
+    }
+    return null;
+}
+
+fn selectClientPreferredKex(client_namelist: []const u8, server_namelist: []const u8) ?[]const u8 {
+    var client_names = std.mem.splitScalar(u8, client_namelist, ',');
+    while (client_names.next()) |client_name| {
+        if (isKexSignalingName(client_name)) continue;
         if (nameListContains(server_namelist, client_name)) return client_name;
     }
     return null;
@@ -1001,7 +1031,7 @@ pub fn negotiateAlgorithmsWithLocalOffers(
     const client = if (role == .Client) local else peer.offers;
     const server = if (role == .Client) peer.offers else local;
 
-    const selected_kex_name = selectClientPreferred(client.kex, server.kex) orelse
+    const selected_kex_name = selectClientPreferredKex(client.kex, server.kex) orelse
         return IoError.AlgorithmNegotiationFailed;
     const selected_kex = KexAlgorithm.fromName(selected_kex_name) orelse
         return IoError.AlgorithmNegotiationFailed;
@@ -1048,7 +1078,7 @@ pub fn negotiateAlgorithmsWithLocalOffers(
     // only valid when server and client share the same preferred (first) KEX
     // algorithm and the same preferred (first) host key algorithm.
     const peer_guessed_correctly =
-        std.mem.eql(u8, firstName(peer.offers.kex), firstName(local.kex)) and
+        std.mem.eql(u8, firstRealKexName(peer.offers.kex), firstRealKexName(local.kex)) and
         std.mem.eql(u8, firstName(peer.offers.host_key), firstName(local.host_key));
 
     return .{
@@ -1061,6 +1091,8 @@ pub fn negotiateAlgorithmsWithLocalOffers(
         .compression_c2s = CompressionAlgorithm.fromName(selected_compression_c2s) orelse unreachable,
         .compression_s2c = CompressionAlgorithm.fromName(selected_compression_s2c) orelse unreachable,
         .ignore_next_peer_packet = peer.first_kex_packet_follows and !peer_guessed_correctly,
+        .strict_kex = nameListContains(client.kex, kex_strict_client) and
+            nameListContains(server.kex, kex_strict_server),
     };
 }
 
@@ -2124,4 +2156,37 @@ test "encrypted wrap capacity error does not expose plaintext" {
 
     try std.testing.expectError(IoError.tooBig, wrapPayload(&rand, true, &keys, "secret payload", &iobuf));
     try std.testing.expectEqualSlices(u8, &@as([iobuf.len]u8, @splat(0xA5)), &iobuf);
+}
+
+test "strict KEX negotiation requires both client and server signaling pseudo-algorithms" {
+    var client_offers = localAlgorithmOffers("ssh-ed25519");
+    client_offers.kex = kex_strict_client ++ "," ++ kex_algorithms;
+    var server_offers = localAlgorithmOffers("ssh-ed25519");
+    server_offers.kex = kex_strict_server ++ "," ++ kex_algorithms;
+
+    const peer_server = KexInit{
+        .offers = server_offers,
+        .language_c2s = "",
+        .language_s2c = "",
+        .first_kex_packet_follows = true,
+    };
+    const negotiated = try negotiateAlgorithmsWithLocalOffers(peer_server, .Client, client_offers);
+    try std.testing.expect(negotiated.strict_kex);
+    try std.testing.expect(!negotiated.ignore_next_peer_packet);
+
+    var non_strict_server_offers = server_offers;
+    non_strict_server_offers.kex = kex_algorithms;
+    const peer_non_strict = KexInit{
+        .offers = non_strict_server_offers,
+        .language_c2s = "",
+        .language_s2c = "",
+        .first_kex_packet_follows = false,
+    };
+    const non_strict = try negotiateAlgorithmsWithLocalOffers(peer_non_strict, .Client, client_offers);
+    try std.testing.expect(!non_strict.strict_kex);
+}
+
+test "MaxPayload reserves room for 64-byte hmac-sha2-512 MAC tags and maximum padding" {
+    try std.testing.expectEqual(@as(usize, 64), MaxMacLength);
+    try std.testing.expect(MaxPayload + sizeof_PktHdr + 255 + MaxMacLength <= MaxSSHPacket);
 }
