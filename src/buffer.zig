@@ -26,6 +26,11 @@ pub const BufferReader = struct {
         return self.off <= self.payload.len and n <= self.payload.len - self.off;
     }
 
+    pub fn clear(self: *Self) void {
+        self.payload = &.{};
+        self.off = 0;
+    }
+
     pub fn readBoolean(self: *Self) BufferError!bool {
         if (!self.hasRemaining(1)) {
             return BufferError.ReaderOutOfDataErr;
@@ -75,16 +80,36 @@ pub const BufferReader = struct {
     }
 
     pub fn readU32LenString(self: *Self) BufferError![]const u8 {
+        const start_off = self.off;
+        errdefer self.off = start_off;
         const len = try self.readU32();
         return try self.readBytes(len);
     }
 
     pub fn readMpint(self: *Self) BufferError![]const u8 {
-        return self.readU32LenString();
+        const start_off = self.off;
+        errdefer self.off = start_off;
+        const raw = try self.readU32LenString();
+        if (raw.len == 0) return raw;
+        if (raw.len == 1 and raw[0] == 0) return BufferError.ReaderOutOfDataErr;
+        if (raw.len >= 2 and raw[0] == 0x00 and (raw[1] & 0x80) == 0) return BufferError.ReaderOutOfDataErr;
+        if (raw.len >= 2 and raw[0] == 0xff and (raw[1] & 0x80) != 0) return BufferError.ReaderOutOfDataErr;
+        return raw;
+    }
+
+    pub fn readPositiveMpint(self: *Self) BufferError![]const u8 {
+        const start_off = self.off;
+        errdefer self.off = start_off;
+        const raw = try self.readMpint();
+        if (raw.len == 0 or (raw[0] & 0x80) != 0) return BufferError.ReaderOutOfDataErr;
+        if (raw[0] == 0) return raw[1..];
+        return raw;
     }
 
     // for walking lists
     pub fn skipU32LenString(self: *Self) BufferError!void {
+        const start_off = self.off;
+        errdefer self.off = start_off;
         const len = try self.readU32();
         try self.skip(len);
     }
@@ -100,7 +125,8 @@ pub const BufferWriter = struct {
     pre_payload_len: usize = 0,
 
     // get the active part without pre_payload_len
-    pub fn active(self: *Self) []u8 {
+    pub fn active(self: *const Self) []u8 {
+        if (self.payload.len < self.pre_payload_len) return &.{};
         return self.payload[self.pre_payload_len..];
     }
 
@@ -125,15 +151,23 @@ pub const BufferWriter = struct {
         self.payload = self.payload_buf[0..self.off];
     }
 
+    pub fn clear(self: *Self) void {
+        std.crypto.secureZero(u8, self.payload_buf);
+        self.off = @min(self.pre_payload_len, self.payload_buf.len);
+        self.updateUnderlying();
+    }
+
     fn hasCapacity(self: *const Self, n: usize) bool {
         return self.off <= self.payload_buf.len and n <= self.payload_buf.len - self.off;
     }
 
     pub fn discard(self: *Self, n: usize) BufferError!void {
-        if (self.off < n) {
+        if (self.off < self.pre_payload_len or n > self.off - self.pre_payload_len) {
             return BufferError.WriterOutOfDataErr;
         } else {
-            self.off -= n;
+            const new_off = self.off - n;
+            std.crypto.secureZero(u8, self.payload_buf[new_off..self.off]);
+            self.off = new_off;
             self.updateUnderlying();
         }
     }
@@ -371,4 +405,66 @@ test "buffer" {
     try std.testing.expect(std.mem.eql(u8, try rd.readU32LenString(), &[_]u8{ 'M', 'O', 'O', 'F' }));
     // no more available to read
     try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.readU8());
+}
+
+test "buffer reader canonical mpint validation and atomic rollback" {
+    // Non-canonical zero (length 1, byte 0x00)
+    var rd = BufferReader.init(&.{ 0, 0, 0, 1, 0x00 });
+    try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.readMpint());
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+
+    // Redundant leading 0x00 when MSB of next byte is not set
+    rd = BufferReader.init(&.{ 0, 0, 0, 2, 0x00, 0x7f });
+    try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.readMpint());
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+
+    // Redundant leading 0xff when MSB of next byte is set
+    rd = BufferReader.init(&.{ 0, 0, 0, 2, 0xff, 0x80 });
+    try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.readMpint());
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+
+    // Valid canonical zero and positive mpint with leading sign pad
+    rd = BufferReader.init(&.{ 0, 0, 0, 0, 0, 0, 0, 2, 0x00, 0x80 });
+    try std.testing.expectEqualSlices(u8, &.{}, try rd.readMpint());
+    try std.testing.expectEqualSlices(u8, &.{0x80}, try rd.readPositiveMpint());
+
+    // Negative mpint rejected by readPositiveMpint with offset rolled back
+    rd = BufferReader.init(&.{ 0, 0, 0, 1, 0x80 });
+    try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.readPositiveMpint());
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+
+    // Truncated string rolls back offset
+    rd = BufferReader.init(&.{ 0, 0, 0, 5, 'a', 'b' });
+    try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.readU32LenString());
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+    try std.testing.expectError(BufferError.ReaderOutOfDataErr, rd.skipU32LenString());
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+
+    rd.clear();
+    try std.testing.expectEqual(@as(usize, 0), rd.payload.len);
+    try std.testing.expectEqual(@as(usize, 0), rd.off);
+}
+
+test "buffer writer discard and clear zeroize sensitive bytes and respect pre_payload_len" {
+    var backing: [8]u8 = @splat(0xAA);
+    var writer = BufferWriter.init(&backing, 2);
+    try writer.writeBytes("secret");
+    try std.testing.expectEqualSlices(u8, "secret", writer.active());
+
+    // Cannot discard into reserved pre_payload_len
+    try std.testing.expectError(BufferError.WriterOutOfDataErr, writer.discard(7));
+    try std.testing.expectEqualSlices(u8, "secret", writer.active());
+
+    // Discarding trailing bytes scrubs them in backing buffer
+    try writer.discard(3);
+    try std.testing.expectEqualSlices(u8, "sec", writer.active());
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, backing[5..8]);
+
+    // clear() scrubs the entire backing buffer and resets to pre_payload_len
+    writer.clear();
+    try std.testing.expectEqual(@as(usize, 0), writer.active().len);
+    try std.testing.expectEqual(@as(usize, 2), writer.off);
+    for (backing) |b| {
+        try std.testing.expectEqual(@as(u8, 0), b);
+    }
 }

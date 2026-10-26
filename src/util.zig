@@ -44,10 +44,70 @@ pub const version = build_options.version;
 /// Exposed so a build can assert that the default one stays silent.
 pub const traces_are_printed = trace_level != .Off;
 
+pub fn zeroizeBytes(buf: []u8) void {
+    std.crypto.secureZero(u8, buf);
+}
+
+/// Sanitizes untrusted peer text before writing to a terminal or log.
+///
+/// Printable ASCII (`0x20..0x7e`) is preserved. When `allow_newlines` is true,
+/// `\n` and `\t` are preserved and `\r\n` is normalized to `\n`, while bare `\r`
+/// is escaped as `\r` to prevent line-overwrite attacks. All other C0/C1 control
+/// bytes (`0x00..0x1f`, `0x7f..0x9f`, including `\x1b` ESC, `\x9b` CSI, `\x07` BEL)
+/// and non-ASCII bytes (`0x80..0xff`) are escaped as `\r`, `\n`, `\t`, or `\xHH`.
+/// Never writes a partial escape sequence if `out` fills up.
+pub fn sanitizeControlChars(input: []const u8, out: []u8, allow_newlines: bool) []const u8 {
+    const hex = "0123456789abcdef";
+    var pos: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) : (i += 1) {
+        const b = input[i];
+        if (allow_newlines and b == '\r' and i + 1 < input.len and input[i + 1] == '\n') {
+            continue;
+        }
+        if (allow_newlines and (b == '\n' or b == '\t')) {
+            if (pos + 1 > out.len) break;
+            out[pos] = b;
+            pos += 1;
+            continue;
+        }
+        if (b >= 0x20 and b <= 0x7e) {
+            if (pos + 1 > out.len) break;
+            out[pos] = b;
+            pos += 1;
+            continue;
+        }
+        const esc: ?[]const u8 = switch (b) {
+            '\r' => "\\r",
+            '\n' => "\\n",
+            '\t' => "\\t",
+            else => null,
+        };
+        if (esc) |seq| {
+            if (pos + seq.len > out.len) break;
+            @memcpy(out[pos .. pos + seq.len], seq);
+            pos += seq.len;
+        } else {
+            if (pos + 4 > out.len) break;
+            out[pos] = '\\';
+            out[pos + 1] = 'x';
+            out[pos + 2] = hex[b >> 4];
+            out[pos + 3] = hex[b & 0x0f];
+            pos += 4;
+        }
+    }
+    return out[0..pos];
+}
+
 pub fn trace(level: TraceLevel, comptime fmt: []const u8, args: anytype) void {
     if (builtin.os.tag != .freestanding) {
         if (@backingInt(trace_level) >= @backingInt(level)) {
-            std.debug.print(fmt ++ "\n", args);
+            var raw_buf: [1024]u8 = undefined;
+            var safe_buf: [1024]u8 = undefined;
+            const formatted = std.fmt.bufPrint(&raw_buf, fmt, args) catch raw_buf[0..];
+            const trimmed = std.mem.trimEnd(u8, formatted, "\r\n");
+            const sanitized = sanitizeControlChars(trimmed, &safe_buf, false);
+            std.debug.print("{s}\n", .{sanitized});
         }
     }
 }
@@ -196,4 +256,43 @@ test "namedblob" {
     var nb = NamedBlob.init(buffer.active());
     try std.testing.expect(std.mem.eql(u8, try nb.getName(), "MOOF"));
     try std.testing.expect(std.mem.eql(u8, try nb.getBlob(), "blah"));
+}
+
+test "zeroizeBytes clears secret buffer" {
+    var secret = [_]u8{ 's', 'e', 'c', 'r', 'e', 't', 0x42, 0xff };
+    zeroizeBytes(&secret);
+    for (secret) |b| {
+        try std.testing.expectEqual(@as(u8, 0), b);
+    }
+}
+
+test "sanitizeControlChars neutralizes ANSI/OSC escapes and C0/C1 control characters" {
+    var out: [256]u8 = undefined;
+
+    // Single-line mode: escapes ESC, CSI (0x9b), BEL, CR, LF, TAB, NUL, DEL
+    const single = sanitizeControlChars(
+        "prompt\x1b]52;c;evil\x07\rFake:\n\t\x00\x7f\x9b2J",
+        &out,
+        false,
+    );
+    try std.testing.expectEqualStrings(
+        "prompt\\x1b]52;c;evil\\x07\\rFake:\\n\\t\\x00\\x7f\\x9b2J",
+        single,
+    );
+
+    // Multi-line mode: preserves LF and TAB, normalizes CRLF -> LF, but escapes bare CR and ESC/BEL/CSI
+    const multi = sanitizeControlChars(
+        "Banner line 1\r\n\tLine 2\rOverwrite\x1b[31mRed\x07\x9b0m",
+        &out,
+        true,
+    );
+    try std.testing.expectEqualStrings(
+        "Banner line 1\n\tLine 2\\rOverwrite\\x1b[31mRed\\x07\\x9b0m",
+        multi,
+    );
+
+    // Bounded output buffer never emits a partial escape sequence
+    var tiny: [5]u8 = undefined;
+    const bounded = sanitizeControlChars("ab\x1b", &tiny, false);
+    try std.testing.expectEqualStrings("ab", bounded);
 }
