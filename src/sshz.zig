@@ -920,9 +920,11 @@ const DeadlineState = struct {
     initialized: bool = false,
     started_at: u64 = 0,
     phase_started_at: u64 = 0,
+    auth_started_at: ?u64 = null,
     last_activity_at: u64 = 0,
     last_observed_at: u64 = 0,
     phase: DeadlinePhase = .Handshake,
+    rekey_started_since_last_clock: bool = false,
     timeout: ?TimeoutOutcome = null,
 };
 
@@ -1054,6 +1056,7 @@ pub fn SshzImpl(role: Role) type {
                 .initialized = true,
                 .started_at = now,
                 .phase_started_at = now,
+                .auth_started_at = if (phase == .Authentication and !self.session.user_authenticated) now else null,
                 .last_activity_at = now,
                 .last_observed_at = now,
                 .phase = phase,
@@ -1070,9 +1073,45 @@ pub fn SshzImpl(role: Role) type {
             }
         }
 
+        fn armRekeyHandshakeDeadline(self: *Self, now: ?u64) void {
+            if (!self.deadline_state.initialized) return;
+            if (!self.session.user_authenticated and self.deadline_state.auth_started_at == null) {
+                self.deadline_state.auth_started_at = if (self.deadline_state.phase == .Authentication)
+                    self.deadline_state.phase_started_at
+                else
+                    (now orelse self.deadline_state.last_observed_at);
+            }
+            self.deadline_state.phase = .Handshake;
+            if (now) |t| {
+                self.deadline_state.phase_started_at = t;
+                self.deadline_state.rekey_started_since_last_clock = false;
+            } else {
+                self.deadline_state.phase_started_at = self.deadline_state.last_observed_at;
+                self.deadline_state.rekey_started_since_last_clock = true;
+            }
+        }
+
+        fn completeRekeyDeadlinePhase(self: *Self) void {
+            self.deadline_state.rekey_started_since_last_clock = false;
+            if (!self.deadline_state.initialized) return;
+            const phase = self.currentDeadlinePhase();
+            if (phase == .Active or self.session.user_authenticated) {
+                self.deadline_state.auth_started_at = null;
+            }
+            self.deadline_state.phase = phase;
+            self.deadline_state.phase_started_at = switch (phase) {
+                .Authentication => self.deadline_state.auth_started_at orelse self.deadline_state.last_observed_at,
+                .Handshake, .Active => self.deadline_state.last_observed_at,
+            };
+        }
+
         pub fn noteActivity(self: *Self, now: u64) DeadlineError!void {
             try self.observeMonotonic(now);
             self.deadline_state.last_activity_at = now;
+            if (self.deadline_state.rekey_started_since_last_clock) {
+                self.deadline_state.phase_started_at = now;
+                self.deadline_state.rekey_started_since_last_clock = false;
+            }
         }
 
         fn expired(now: u64, since: u64, limit: ?u64) bool {
@@ -1082,6 +1121,7 @@ pub fn SshzImpl(role: Role) type {
         pub fn checkDeadlines(self: *Self, now: u64) DeadlineError!?TimeoutOutcome {
             try self.observeMonotonic(now);
             if (self.deadline_state.timeout) |outcome| return outcome;
+            self.deadline_state.rekey_started_since_last_clock = false;
 
             if (expired(now, self.deadline_state.started_at, self.limits.deadlines.total_session))
                 return .TotalSession;
@@ -1089,9 +1129,23 @@ pub fn SshzImpl(role: Role) type {
                 return .Idle;
 
             const phase = self.currentDeadlinePhase();
+            if (phase == .Active or self.session.user_authenticated) {
+                self.deadline_state.auth_started_at = null;
+            } else if (phase == .Authentication and self.deadline_state.auth_started_at == null) {
+                self.deadline_state.auth_started_at = now;
+            }
             if (phase != self.deadline_state.phase) {
                 self.deadline_state.phase = phase;
-                self.deadline_state.phase_started_at = now;
+                self.deadline_state.phase_started_at = switch (phase) {
+                    .Authentication => self.deadline_state.auth_started_at orelse now,
+                    .Handshake, .Active => now,
+                };
+            }
+            if (!self.session.user_authenticated) {
+                if (self.deadline_state.auth_started_at) |auth_started_at| {
+                    if (expired(now, auth_started_at, self.limits.deadlines.authentication))
+                        return .Authentication;
+                }
             }
             const phase_limit = switch (phase) {
                 .Handshake => self.limits.deadlines.handshake,
@@ -1115,7 +1169,9 @@ pub fn SshzImpl(role: Role) type {
                 self.failClosed();
             } else {
                 self.updateLocalRekeyPending(now);
-                _ = self.maybeStartLocalRekey();
+                if (self.maybeStartLocalRekey()) {
+                    self.armRekeyHandshakeDeadline(now);
+                }
             }
             return outcome;
         }
@@ -1190,6 +1246,7 @@ pub fn SshzImpl(role: Role) type {
             self.iostate_rd = .Idle;
             self.session.startLocalRekey();
             self.local_rekey_pending = false;
+            self.armRekeyHandshakeDeadline(null);
             return true;
         }
 
@@ -1227,6 +1284,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         fn gateApplicationInitiation(self: *Self) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
             if (self.local_rekey_pending or self.session.is_rekeying) return IoError.NotReady;
@@ -1267,7 +1325,7 @@ pub fn SshzImpl(role: Role) type {
             }
             self.packets_received += 1;
 
-            if (self.currentDeadlinePhase() != .Active) {
+            if (!self.session.user_authenticated and self.currentDeadlinePhase() != .Active) {
                 if (self.pre_auth_packets >= self.limits.max_pre_auth_packets) {
                     self.failClosed();
                     return IoError.TooManyPreAuthPackets;
@@ -1353,6 +1411,7 @@ pub fn SshzImpl(role: Role) type {
         /// Allow accepts a public-key probe with PK_OK, but only accepts a signed
         /// public-key request as authentication. All other outcomes remain denied.
         pub fn decideUserAuth(self: *Self, decision: AuthorizationDecision) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             switch (role) {
                 .Client => return IoError.UnimplementedService,
                 .Server => {
@@ -1808,6 +1867,17 @@ pub fn SshzImpl(role: Role) type {
         }
 
         fn advanceIoSession(self: *Self, inkeys: *Protocol.KeyDataUni) SshzError!void {
+            const was_rekeying = self.session.is_rekeying;
+            defer {
+                if (self.session.is_rekeying) {
+                    self.local_rekey_pending = false;
+                    if (!was_rekeying) {
+                        self.armRekeyHandshakeDeadline(null);
+                    }
+                } else if (was_rekeying) {
+                    self.completeRekeyDeadlinePhase();
+                }
+            }
             switch (self.session.ioSessionState) {
                 .Idle => {
                     TRACE(.Debug, "ioSessionState Idle", .{});
@@ -2047,15 +2117,19 @@ pub fn SshzImpl(role: Role) type {
         }
 
         pub fn getChannelWriteBuffer(self: *Self, channel_id: u32) SshzError![]u8 {
+            if (self.terminated) return IoError.SessionTerminated;
             return self.session.getChannelWriteBuffer(channel_id);
         }
 
         pub fn channelWriteComplete(self: *Self, channel_id: u32, nbytes: usize) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             if (self.iostate_wr != .Idle) return IoError.cannotAcceptWrite;
             self.updateLocalRekeyPending(null);
             if (self.local_rekey_pending or self.session.is_rekeying) {
                 _ = try self.session.queueChannelWrite(channel_id, nbytes);
-                _ = self.maybeStartLocalRekey();
+                if (self.maybeStartLocalRekey()) {
+                    try self.advance();
+                }
                 return;
             }
             if (self.iostate_rd != .Idle) {
@@ -2430,6 +2504,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         fn clearPendingChannelOpenRequest(self: *Self, channel_id: u32) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             switch (self.iostate_wr) {
                 .Idle => return,
                 .Active => |iotype| switch (iotype.action) {
@@ -2449,6 +2524,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         fn clearPendingHostKeyEvent(self: *Self) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             return switch (role) {
                 .Server => IoError.UnimplementedService,
                 .Client => switch (self.iostate_wr) {
@@ -2493,6 +2569,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         fn clearPendingTcpipForwardEvent(self: *Self) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             return switch (role) {
                 .Client => IoError.UnimplementedService,
                 .Server => {
@@ -2515,6 +2592,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         fn clearPendingCancelTcpipForwardEvent(self: *Self) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             return switch (role) {
                 .Client => IoError.UnimplementedService,
                 .Server => {
@@ -2626,6 +2704,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         pub fn sendChannelEof(self: *Self, channel_id: u32) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
             self.session.sendChannelEof(channel_id, self) catch |err| {
@@ -2645,6 +2724,7 @@ pub fn SshzImpl(role: Role) type {
         }
 
         pub fn sendChannelClose(self: *Self, channel_id: u32) SshzError!void {
+            if (self.terminated) return IoError.SessionTerminated;
             self.updateLocalRekeyPending(null);
             _ = self.maybeStartLocalRekey();
             self.session.sendChannelClose(channel_id, self) catch |err| {
@@ -5053,4 +5133,162 @@ test "maybeStartLocalRekey disarms uncommitted header read when monotonic rekey 
 
     const next_evt = try client.getNextEvent();
     try std.testing.expect(next_evt == .ReadyToProduce);
+}
+
+test "rekey initiation arms handshake deadline on first subsequent tick" {
+    const tick_rekey_limits = ResourceLimits{
+        .deadlines = .{ .handshake = 5, .idle = 50, .total_session = 100 },
+        .key_lifetime = .{ .rekey_after_monotonic_ticks = 10 },
+    };
+    var prng = std.Random.DefaultPrng.init(101);
+    var by_tick = try SshzClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        tick_rekey_limits,
+    );
+    defer by_tick.deinit();
+    try by_tick.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&by_tick.session.keydata);
+    by_tick.session.encrypted = true;
+    by_tick.session.inbound_encrypted = true;
+    by_tick.session.user_authenticated = true;
+    by_tick.session.setSessionState(.ChannelActive);
+    by_tick.session.setIoSessionState(.ReadPktHdr);
+    try by_tick.initializeDeadlines(100);
+
+    try std.testing.expect((try by_tick.tick(110)) == null);
+    try std.testing.expect(by_tick.session.is_rekeying);
+    try std.testing.expectEqual(DeadlinePhase.Handshake, by_tick.deadline_state.phase);
+    try std.testing.expectEqual(@as(u64, 110), by_tick.deadline_state.phase_started_at);
+    // Peer stalls mid-rekey; the very first tick at the handshake deadline must expire.
+    try std.testing.expectEqual(TimeoutOutcome.Handshake, (try by_tick.tick(115)).?);
+    try std.testing.expect(by_tick.terminated);
+
+    const pkt_rekey_limits = ResourceLimits{
+        .deadlines = .{ .handshake = 5, .idle = 50, .total_session = 100 },
+        .key_lifetime = .{
+            .rekey_after_encrypted_bytes = 1000,
+            .rekey_after_encrypted_packets = 1,
+        },
+    };
+    var by_io = try SshzClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        pkt_rekey_limits,
+    );
+    defer by_io.deinit();
+    try by_io.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&by_io.session.keydata);
+    by_io.session.encrypted = true;
+    by_io.session.inbound_encrypted = true;
+    by_io.session.user_authenticated = true;
+    by_io.session.keydata.c2s.encrypted_packets = 1;
+    by_io.session.setSessionState(.ChannelActive);
+    by_io.session.setIoSessionState(.ReadPktHdr);
+    try by_io.initializeDeadlines(200);
+
+    const ev = try by_io.getNextEvent();
+    try std.testing.expect(ev == .ReadyToProduce);
+    try std.testing.expect(by_io.session.is_rekeying);
+    try by_io.noteActivity(220);
+    try std.testing.expectEqual(@as(u64, 220), by_io.deadline_state.phase_started_at);
+    try std.testing.expect((try by_io.tick(224)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.Handshake, (try by_io.tick(225)).?);
+}
+
+test "pre-auth rekey preserves authentication deadline and post-auth rekey skips pre-auth work limits" {
+    const limits = ResourceLimits{
+        .deadlines = .{ .handshake = 15, .authentication = 20, .idle = 100, .total_session = 200 },
+    };
+    var prng = std.Random.DefaultPrng.init(102);
+    var client = try SshzClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        limits,
+    );
+    defer client.deinit();
+    try client.session.setPeerProtocolVersion("SSH-2.0-test_server");
+    try installAutomaticRekeyTestKeys(&client.session.keydata);
+    client.session.encrypted = true;
+    client.session.inbound_encrypted = true;
+    client.session.user_authenticated = false;
+    client.session.setSessionState(.AuthServReq);
+    client.session.setIoSessionState(.ReadPktHdr);
+    try client.initializeDeadlines(100);
+
+    // Trigger a pre-auth rekey at t=108.
+    client.local_rekey_pending = true;
+    try std.testing.expect(client.maybeStartLocalRekey());
+    client.armRekeyHandshakeDeadline(108);
+    try std.testing.expect(client.session.is_rekeying);
+    try std.testing.expectEqual(@as(?u64, 100), client.deadline_state.auth_started_at);
+
+    // Complete the pre-auth rekey at t=112 and return to .AuthServReq.
+    try client.noteActivity(112);
+    client.session.is_rekeying = false;
+    client.session.rekey_resume_state = null;
+    client.session.setSessionState(.AuthServReq);
+    client.completeRekeyDeadlinePhase();
+
+    // Authentication deadline must still be measured from t=100, not reset to t=112.
+    try std.testing.expect((try client.tick(119)) == null);
+    try std.testing.expectEqual(TimeoutOutcome.Authentication, (try client.tick(120)).?);
+
+    // Post-auth rekeys must not charge packets/work to pre_auth_packets or pre_auth_work.
+    var post_auth = try SshzClient.initWithLimits(
+        prng.random(),
+        "test",
+        std.testing.allocator,
+        .{
+            .max_pre_auth_packets = 1,
+            .max_pre_auth_work = 8,
+            .min_packets_between_rekeys = 0,
+        },
+    );
+    defer post_auth.deinit();
+    post_auth.session.user_authenticated = true;
+    post_auth.session.is_rekeying = true;
+    post_auth.session.setSessionState(.KexInitRead);
+    post_auth.pre_auth_packets = 1;
+    post_auth.pre_auth_work = 8;
+
+    try post_auth.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
+    try post_auth.accountInboundMessage(@backingInt(Protocol.MsgId.SSH_MSG_KEX_ECDH_REPLY));
+    try std.testing.expectEqual(@as(u32, 1), post_auth.pre_auth_packets);
+    try std.testing.expectEqual(@as(u32, 8), post_auth.pre_auth_work);
+}
+
+test "terminated session fails closed with SessionTerminated across channel and event APIs" {
+    const privkey = @import("privkey.zig");
+    var prng = std.Random.DefaultPrng.init(103);
+    var client = try SshzClient.init(prng.random(), "test", std.testing.allocator);
+    defer client.deinit();
+    client.failClosed();
+
+    try std.testing.expectError(IoError.SessionTerminated, client.getChannelWriteBuffer(0));
+    try std.testing.expectError(IoError.SessionTerminated, client.channelWriteComplete(0, 1));
+    try std.testing.expectError(IoError.SessionTerminated, client.sendChannelEof(0));
+    try std.testing.expectError(IoError.SessionTerminated, client.sendChannelClose(0));
+    try std.testing.expectError(IoError.SessionTerminated, client.openSessionChannel());
+    try std.testing.expectError(IoError.SessionTerminated, client.acceptHostKey());
+    try std.testing.expectError(IoError.SessionTerminated, client.rejectHostKey());
+
+    var server = try SshzServer.init(prng.random(), privkey.testkey_valid, std.testing.allocator);
+    defer server.deinit();
+    server.failClosed();
+
+    try std.testing.expectError(IoError.SessionTerminated, server.getChannelWriteBuffer(0));
+    try std.testing.expectError(IoError.SessionTerminated, server.channelWriteComplete(0, 1));
+    try std.testing.expectError(IoError.SessionTerminated, server.sendChannelEof(0));
+    try std.testing.expectError(IoError.SessionTerminated, server.sendChannelClose(0));
+    try std.testing.expectError(IoError.SessionTerminated, server.acceptChannelOpen(0));
+    try std.testing.expectError(IoError.SessionTerminated, server.rejectChannelOpen(0, 1, "closed"));
+    try std.testing.expectError(IoError.SessionTerminated, server.decideUserAuth(.Deny));
+    try std.testing.expectError(IoError.SessionTerminated, server.acceptTcpipForward(8080));
+    try std.testing.expectError(IoError.SessionTerminated, server.rejectTcpipForward());
+    try std.testing.expectError(IoError.SessionTerminated, server.acceptCancelTcpipForward());
+    try std.testing.expectError(IoError.SessionTerminated, server.rejectCancelTcpipForward());
 }
