@@ -62,12 +62,42 @@ pub const ChannelType = enum {
     }
 };
 
+pub const MaxForwardHostLen: usize = 255;
+
 pub const TcpipOpen = struct {
     host: []const u8 = "",
     port: u32 = 0,
     originator_host: []const u8 = "",
     originator_port: u32 = 0,
 };
+
+pub fn isValidForwardHost(host: []const u8, allow_empty: bool) bool {
+    if (!allow_empty and host.len == 0) return false;
+    if (host.len > MaxForwardHostLen) return false;
+    for (host) |c| {
+        if (c <= 0x20 or c >= 0x7f) return false;
+    }
+    return true;
+}
+
+pub fn validateForwardingEndpoint(
+    host: []const u8,
+    port: u32,
+    originator_host: []const u8,
+    originator_port: u32,
+) bool {
+    if (!isValidForwardHost(host, false)) return false;
+    if (!isValidForwardHost(originator_host, false)) return false;
+    if (port == 0 or port > std.math.maxInt(u16)) return false;
+    if (originator_port == 0 or originator_port > std.math.maxInt(u16)) return false;
+    return true;
+}
+
+pub fn validateBindEndpoint(bind_address: []const u8, bind_port: u32) bool {
+    if (!isValidForwardHost(bind_address, true)) return false;
+    if (bind_port > std.math.maxInt(u16)) return false;
+    return true;
+}
 
 pub const ChannelState = enum {
     OpenWrite,
@@ -1166,4 +1196,31 @@ test "eof_sent and eof_received start false" {
     const ch = Channel.init(0, 1, 32768, 32768);
     try std.testing.expect(!ch.eof_sent);
     try std.testing.expect(!ch.eof_received);
+}
+
+test "validateForwardingEndpoint and validateBindEndpoint enforce host and port bounds" {
+    try std.testing.expect(validateForwardingEndpoint("127.0.0.1", 22, "::1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("", 22, "127.0.0.1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 22, "", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 0, "::1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 65536, "::1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 22, "::1", 0));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 22, "::1", 65536));
+    try std.testing.expect(!validateForwardingEndpoint("bad\x00host", 22, "::1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("bad\nhost", 22, "::1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("bad host", 22, "::1", 54321));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 22, "bad\x7fhost", 54321));
+
+    const max_host: [MaxForwardHostLen]u8 = @splat('a');
+    const oversized_host: [MaxForwardHostLen + 1]u8 = @splat('a');
+    try std.testing.expect(validateForwardingEndpoint(&max_host, 65535, &max_host, 1));
+    try std.testing.expect(!validateForwardingEndpoint(&oversized_host, 22, "127.0.0.1", 1000));
+    try std.testing.expect(!validateForwardingEndpoint("127.0.0.1", 22, &oversized_host, 1000));
+
+    try std.testing.expect(validateBindEndpoint("", 0));
+    try std.testing.expect(validateBindEndpoint("0.0.0.0", 0));
+    try std.testing.expect(validateBindEndpoint("localhost", 65535));
+    try std.testing.expect(!validateBindEndpoint("localhost", 65536));
+    try std.testing.expect(!validateBindEndpoint("bad\x00bind", 8080));
+    try std.testing.expect(!validateBindEndpoint(&oversized_host, 8080));
 }
