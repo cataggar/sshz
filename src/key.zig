@@ -216,6 +216,7 @@ pub const Blob = struct {
     len: usize = 0,
 
     pub fn set(self: *Blob, bytes: []const u8) KeyError!void {
+        self.clear();
         if (bytes.len > self.buf.len) return error.InvalidKeyBlob;
         @memcpy(self.buf[0..bytes.len], bytes);
         self.len = bytes.len;
@@ -325,6 +326,7 @@ pub const PublicKey = union(KeyAlgorithm) {
                 _ = EcdsaP384.PublicKey.fromSec1(&sec1) catch return error.InvalidKeyBlob;
             },
             .EcdsaP256 => |sec1| {
+                if (sec1[0] != 0x04) return error.InvalidKeyBlob;
                 _ = EcdsaP256.PublicKey.fromSec1(&sec1) catch return error.InvalidKeyBlob;
             },
             .Rsa => |rsa| try validateRsaPublicComponents(rsa.n.slice(), rsa.e.slice()),
@@ -453,6 +455,7 @@ pub const PrivateKey = union(KeyAlgorithm) {
                 if (!std.mem.eql(u8, &keypair.public_key.toBytes(), &key.ed25519_public)) return error.InvalidKeyBlob;
             },
             .Ed25519 => |*key| {
+                _ = Ed25519.PublicKey.fromBytes(key.public) catch return error.InvalidKeyBlob;
                 var secret = Ed25519.SecretKey.fromBytes(key.secret) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
                 var keypair = Ed25519.KeyPair.fromSecretKey(secret) catch return error.InvalidKeyBlob;
@@ -469,6 +472,8 @@ pub const PrivateKey = union(KeyAlgorithm) {
                 if (!std.mem.eql(u8, &keypair.public_key.toUncompressedSec1(), &key.public_sec1)) return error.InvalidKeyBlob;
             },
             .EcdsaP256 => |*key| {
+                if (key.public_sec1[0] != 0x04) return error.InvalidKeyBlob;
+                _ = EcdsaP256.PublicKey.fromSec1(&key.public_sec1) catch return error.InvalidKeyBlob;
                 var secret = EcdsaP256.SecretKey.fromBytes(key.secret_scalar) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
                 var keypair = EcdsaP256.KeyPair.fromSecretKey(secret) catch return error.InvalidKeyBlob;
@@ -555,10 +560,12 @@ pub const PrivateKey = union(KeyAlgorithm) {
                 signature_payload = signature_payload_buf[0..total_len];
             },
             .Ed25519 => |*key| {
+                _ = Ed25519.PublicKey.fromBytes(key.public) catch return error.InvalidKeyBlob;
                 var secret = Ed25519.SecretKey.fromBytes(key.secret) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
                 var keypair = Ed25519.KeyPair.fromSecretKey(secret) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&keypair));
+                if (!std.mem.eql(u8, &keypair.public_key.toBytes(), &key.public)) return error.InvalidKeyBlob;
                 var sig = keypair.sign(msg, null) catch return error.SigningFailed;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&sig));
                 var sigbytes = sig.toBytes();
@@ -567,6 +574,8 @@ pub const PrivateKey = union(KeyAlgorithm) {
                 signature_payload = signature_payload_buf[0..sigbytes.len];
             },
             .EcdsaP384 => |*key| {
+                if (key.public_sec1[0] != 0x04) return error.InvalidKeyBlob;
+                _ = EcdsaP384.PublicKey.fromSec1(&key.public_sec1) catch return error.InvalidKeyBlob;
                 var secret = EcdsaP384.SecretKey.fromBytes(key.secret_scalar) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
                 var keypair = EcdsaP384.KeyPair.fromSecretKey(secret) catch return error.InvalidKeyBlob;
@@ -580,10 +589,13 @@ pub const PrivateKey = union(KeyAlgorithm) {
                 signature_payload = inner.active();
             },
             .EcdsaP256 => |*key| {
+                if (key.public_sec1[0] != 0x04) return error.InvalidKeyBlob;
+                _ = EcdsaP256.PublicKey.fromSec1(&key.public_sec1) catch return error.InvalidKeyBlob;
                 var secret = EcdsaP256.SecretKey.fromBytes(key.secret_scalar) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&secret));
                 var keypair = EcdsaP256.KeyPair.fromSecretKey(secret) catch return error.InvalidKeyBlob;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&keypair));
+                if (!std.mem.eql(u8, &keypair.public_key.toUncompressedSec1(), &key.public_sec1)) return error.InvalidKeyBlob;
                 var sig = keypair.sign(msg, null) catch return error.SigningFailed;
                 defer std.crypto.secureZero(u8, std.mem.asBytes(&sig));
                 var sigbytes = sig.toBytes();
@@ -727,6 +739,19 @@ test "failed RSA component replacement clears the previous value" {
     try expectZeroed(std.mem.asBytes(&component));
 }
 
+test "failed public key blob operations clear caller output" {
+    var out: Blob = .{};
+    try out.set("previous-public-blob");
+    var oversized: [MaxKeyBlobLen + 1]u8 = @splat(0x5A);
+    try std.testing.expectError(error.InvalidKeyBlob, out.set(&oversized));
+    try expectZeroed(std.mem.asBytes(&out));
+
+    try out.set("previous-public-blob");
+    const invalid_pub: PublicKey = .{ .EcdsaP256 = @splat(0) };
+    try std.testing.expectError(error.InvalidKeyBlob, writePublicKeyBlob(invalid_pub, &out));
+    try expectZeroed(std.mem.asBytes(&out));
+}
+
 pub fn parsePublicKeyBlob(blob: []const u8) KeyError!PublicKey {
     var r = BufferReader.init(blob);
     const alg = try r.readU32LenString();
@@ -787,7 +812,9 @@ pub fn parsePublicKeyBlob(blob: []const u8) KeyError!PublicKey {
         const curve = try r.readU32LenString();
         if (!std.mem.eql(u8, curve, ecdsa_p256_curve_name)) return error.UnsupportedKeyAlgorithm;
         const sec1 = try r.readU32LenString();
-        if (sec1.len != EcdsaP256.PublicKey.uncompressed_sec1_encoded_length) return error.InvalidKeyBlob;
+        if (sec1.len != EcdsaP256.PublicKey.uncompressed_sec1_encoded_length or sec1[0] != 0x04) {
+            return error.InvalidKeyBlob;
+        }
         _ = EcdsaP256.PublicKey.fromSec1(sec1) catch return error.InvalidKeyBlob;
         if (r.off != r.payload.len) return error.InvalidKeyBlob;
         return .{ .EcdsaP256 = sec1[0..EcdsaP256.PublicKey.uncompressed_sec1_encoded_length].* };
@@ -796,8 +823,8 @@ pub fn parsePublicKeyBlob(blob: []const u8) KeyError!PublicKey {
     if (std.mem.eql(u8, alg, rsa_key_name)) {
         var e: RsaComponent = .{};
         var n: RsaComponent = .{};
-        try e.set(try r.readU32LenString());
-        try n.set(try r.readU32LenString());
+        try e.set(try parsePositiveMpint(try r.readU32LenString(), error.InvalidKeyBlob));
+        try n.set(try parsePositiveMpint(try r.readU32LenString(), error.InvalidKeyBlob));
         try validateRsaPublicComponents(n.slice(), e.slice());
         if (r.off != r.payload.len) return error.InvalidKeyBlob;
         return .{ .Rsa = .{ .n = n, .e = e } };
@@ -864,6 +891,7 @@ pub fn verifySignature(public_key: PublicKey, typed_signature: []const u8, msg: 
             sig.verify(msg, pubkey) catch return error.InvalidSignature;
         },
         .EcdsaP256 => |sec1| {
+            if (sec1[0] != 0x04) return error.InvalidKeyBlob;
             const pubkey = EcdsaP256.PublicKey.fromSec1(&sec1) catch return error.InvalidKeyBlob;
             const sig = try parseEcdsaSignature(EcdsaP256, sig_payload);
             sig.verify(msg, pubkey) catch return error.InvalidSignature;
@@ -881,12 +909,16 @@ pub fn verifySignature(public_key: PublicKey, typed_signature: []const u8, msg: 
 pub fn signatureAlgorithm(typed_signature: []const u8) KeyError!SignatureAlgorithm {
     var r = BufferReader.init(typed_signature);
     const sig_name = try r.readU32LenString();
+    _ = try r.readU32LenString();
+    if (r.off != r.payload.len) return error.InvalidSignature;
     const alg = SignatureAlgorithm.fromName(sig_name) orelse return error.UnsupportedKeyAlgorithm;
     if (!alg.isEnabled()) return error.UnsupportedKeyAlgorithm;
     return alg;
 }
 
 pub fn writePublicKeyBlob(public_key: PublicKey, out: *Blob) KeyError![]const u8 {
+    out.clear();
+    errdefer out.clear();
     try public_key.validate();
     var w = BufferWriter.init(&out.buf, 0);
     switch (public_key) {
@@ -1010,10 +1042,10 @@ fn parseEcdsaSignature(comptime EcdsaScheme: type, sig_payload: []const u8) KeyE
 fn validateRsaPublicComponents(n: []const u8, e: []const u8) KeyError!void {
     if (n.len < MinRsaBytes) return error.RsaKeyTooSmall;
     if (n.len > MaxRsaBytes) return error.RsaComponentTooLarge;
+    if (n[0] == 0 or e.len == 0 or e.len > 8 or e[0] == 0) return error.InvalidKeyBlob;
     const leading_bits: usize = 8 - @clz(n[0]);
     const modulus_bits = (n.len - 1) * 8 + leading_bits;
     if (modulus_bits < MinRsaBits) return error.RsaKeyTooSmall;
-    if (e.len == 0 or e.len > 8) return error.InvalidKeyBlob;
     if ((n[n.len - 1] & 1) == 0) return error.InvalidKeyBlob;
     if ((e[e.len - 1] & 1) == 0) return error.InvalidKeyBlob;
     if (e.len == 1 and e[0] < 3) return error.InvalidKeyBlob;
@@ -1045,14 +1077,14 @@ fn rsaVerify(comptime Hash: type, n: []const u8, e: []const u8, sig: []const u8,
     const s = Modulus.Fe.fromBytes(modulus, sig, .big) catch return error.InvalidSignature;
     const m = modulus.powWithEncodedPublicExponent(s, e, .big) catch return error.InvalidSignature;
 
-    var decoded: [MaxRsaBytes]u8 = undefined;
+    var decoded: [MaxRsaBytes]u8 = @splat(0);
     defer std.crypto.secureZero(u8, &decoded);
     m.toBytes(decoded[0..n.len], .big) catch return error.InvalidSignature;
 
-    var expected: [MaxRsaBytes]u8 = undefined;
+    var expected: [MaxRsaBytes]u8 = @splat(0);
     defer std.crypto.secureZero(u8, &expected);
     try pkcs1v15Encode(Hash, msg, expected[0..n.len]);
-    if (!constantTimeEql(decoded[0..n.len], expected[0..n.len])) return error.InvalidSignature;
+    if (!std.crypto.timing_safe.eql([MaxRsaBytes]u8, decoded, expected)) return error.InvalidSignature;
 }
 
 fn pkcs1v15Encode(comptime Hash: type, msg: []const u8, em: []u8) KeyError!void {
@@ -1087,13 +1119,6 @@ fn digestInfoPrefix(comptime Hash: type) []const u8 {
         },
         else => @compileError("unsupported RSA hash"),
     };
-}
-
-fn constantTimeEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var acc: u8 = 0;
-    for (a, b) |x, y| acc |= x ^ y;
-    return acc == 0;
 }
 
 test "nameListContains finds algorithm names exactly" {
@@ -1355,5 +1380,67 @@ test "composite signature tamper rejection for ssh-mldsa87-p384 and ssh-mldsa44-
             error.InvalidSignature,
             verifySignature(pub_key, sig, "sshz composite signature test messagf"),
         );
+    }
+}
+
+test "parsePublicKeyBlob and verifySignature reject non-canonical mpints, legacy ssh-rsa, and trailing bytes" {
+    var modulus_2048: [MinRsaBytes]u8 = @splat(0xff);
+    modulus_2048[0] = 0x80;
+
+    // Negative RSA modulus mpint (missing leading 0x00 sign pad byte when high bit is set)
+    var neg_n_backing: [MaxRsaPublicKeyBlobLen]u8 = undefined;
+    var neg_n_blob = BufferWriter.init(&neg_n_backing, 0);
+    try neg_n_blob.writeU32LenString(rsa_key_name);
+    try writeMpint(&neg_n_blob, &.{ 1, 0, 1 });
+    try neg_n_blob.writeU32LenString(&modulus_2048);
+    try std.testing.expectError(error.InvalidKeyBlob, parsePublicKeyBlob(neg_n_blob.active()));
+
+    // Excess leading zero on RSA exponent mpint (0x00, 0x01, 0x00, 0x01)
+    var pad_e_backing: [MaxRsaPublicKeyBlobLen]u8 = undefined;
+    var pad_e_blob = BufferWriter.init(&pad_e_backing, 0);
+    try pad_e_blob.writeU32LenString(rsa_key_name);
+    try pad_e_blob.writeU32LenString(&.{ 0x00, 0x01, 0x00, 0x01 });
+    try writeMpint(&pad_e_blob, &modulus_2048);
+    try std.testing.expectError(error.InvalidKeyBlob, parsePublicKeyBlob(pad_e_blob.active()));
+
+    // Legacy ssh-rsa (SHA-1) signature is rejected
+    var legacy_sig_backing: [64]u8 = undefined;
+    var legacy_sig = BufferWriter.init(&legacy_sig_backing, 0);
+    try legacy_sig.writeU32LenString(rsa_key_name);
+    try legacy_sig.writeU32LenString("sha1sig");
+    try std.testing.expectError(error.UnsupportedKeyAlgorithm, signatureAlgorithm(legacy_sig.active()));
+
+    // Trailing byte on outer signature is rejected by signatureAlgorithm
+    var trailing_sig_backing: [64]u8 = undefined;
+    var trailing_sig = BufferWriter.init(&trailing_sig_backing, 0);
+    try trailing_sig.writeU32LenString(ed25519_name);
+    try trailing_sig.writeU32LenString(&.{ 0, 0, 0, 0 });
+    try trailing_sig.writeU8(0x00);
+    try std.testing.expectError(error.InvalidSignature, signatureAlgorithm(trailing_sig.active()));
+
+    // Non-canonical ECDSA signature r/s mpints (zero, negative, excess leading zero, trailing bytes)
+    const PrivKey = @import("privkey.zig");
+    var p384_priv = PrivKey.testKeyEcdsaP384();
+    defer p384_priv.clear();
+    const p384_pub = p384_priv.publicKey();
+
+    const bad_mpints = [_][]const u8{
+        &.{},
+        &.{0x00},
+        &.{0x80},
+        &.{ 0x00, 0x01 },
+        &.{ 0x00, 0x00, 0x80 },
+    };
+    for (bad_mpints) |bad_r| {
+        var inner_buf: [128]u8 = undefined;
+        var inner_w = BufferWriter.init(&inner_buf, 0);
+        try inner_w.writeU32LenString(bad_r);
+        try inner_w.writeU32LenString(&.{0x01});
+
+        var outer_buf: [192]u8 = undefined;
+        var outer_w = BufferWriter.init(&outer_buf, 0);
+        try outer_w.writeU32LenString(ecdsa_p384_name);
+        try outer_w.writeU32LenString(inner_w.active());
+        try std.testing.expectError(error.InvalidSignature, verifySignature(p384_pub, outer_w.active(), "msg"));
     }
 }

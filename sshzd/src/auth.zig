@@ -130,19 +130,20 @@ pub const AuthorizedKeys = struct {
 };
 
 fn timingSafeAuthorizedValueEql(expected: []const u8, supplied: []const u8) bool {
-    // Blob length and key type are public SSH encoding properties. Once lengths
-    // agree, compare the authorization-sensitive value without an early exit.
-    if (expected.len != supplied.len or expected.len > MaxKeyBlobBytes) return false;
+    if (expected.len > MaxKeyBlobBytes or supplied.len > MaxKeyBlobBytes) return false;
 
     var expected_padded: [MaxKeyBlobBytes]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &expected_padded);
     var supplied_padded: [MaxKeyBlobBytes]u8 = @splat(0);
+    defer std.crypto.secureZero(u8, &supplied_padded);
     @memcpy(expected_padded[0..expected.len], expected);
     @memcpy(supplied_padded[0..supplied.len], supplied);
-    return std.crypto.timing_safe.eql(
+    const bytes_eql = std.crypto.timing_safe.eql(
         [MaxKeyBlobBytes]u8,
         expected_padded,
         supplied_padded,
     );
+    return bytes_eql and (expected.len == supplied.len);
 }
 
 pub const PublicKeyAttempt = struct {
@@ -176,7 +177,7 @@ pub const Policy = union(enum) {
                 else => false,
             },
             .insecure_demo => switch (attempt) {
-                .password => |password| std.mem.eql(u8, username, password),
+                .password => |password| timingSafeAuthorizedValueEql(username, password),
                 .public_key => true,
                 .none => false,
             },
@@ -209,10 +210,7 @@ fn decodeEntry(raw_line: []const u8, output: *[MaxKeyBlobBytes]u8) EntryError!?[
     var position: usize = 0;
     const textual_type = nextToken(line, &position) orelse return error.UnsupportedKeyType;
     const expected_kind = keyKindFromAuthorizedKeysName(textual_type) orelse {
-        if (textual_type[0] == '@' or
-            std.mem.indexOfScalar(u8, textual_type, '=') != null or
-            std.mem.indexOfScalar(u8, textual_type, ',') != null)
-        {
+        if (isLeadingOptionOrMarker(textual_type, line[position..])) {
             return error.OptionsOrMarkersUnsupported;
         }
         return error.UnsupportedKeyType;
@@ -266,6 +264,38 @@ fn keyKindFromAuthorizedKeysName(name: []const u8) ?KeyKind {
     if (std.mem.eql(u8, name, ecdsa_name)) return .ecdsa_p256;
     if (std.mem.eql(u8, name, rsa_name)) return .rsa;
     return null;
+}
+
+fn isLeadingOptionOrMarker(first_token: []const u8, remainder: []const u8) bool {
+    if (first_token[0] == '@' or
+        std.mem.indexOfAny(u8, first_token, "=,\"") != null)
+    {
+        return true;
+    }
+
+    const known_flag_options = [_][]const u8{
+        "restrict",
+        "cert-authority",
+        "no-agent-forwarding",
+        "no-port-forwarding",
+        "no-pty",
+        "no-user-rc",
+        "no-X11-forwarding",
+        "agent-forwarding",
+        "port-forwarding",
+        "pty",
+        "user-rc",
+        "X11-forwarding",
+    };
+    for (known_flag_options) |opt| {
+        if (std.ascii.eqlIgnoreCase(first_token, opt)) return true;
+    }
+
+    var pos: usize = 0;
+    if (nextToken(remainder, &pos)) |second_token| {
+        if (keyKindFromAuthorizedKeysName(second_token) != null) return true;
+    }
+    return false;
 }
 
 const BlobValidationError = error{
@@ -325,7 +355,7 @@ fn validateKeyBlob(blob: []const u8, expected_kind: ?KeyKind) BlobValidationErro
             const curve = readString(blob, &position) orelse return error.MalformedKeyBlob;
             if (!std.mem.eql(u8, curve, ecdsa_p384_curve_name)) return error.MalformedKeyBlob;
             const sec1 = readString(blob, &position) orelse return error.MalformedKeyBlob;
-            if (sec1.len != std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.uncompressed_sec1_encoded_length) {
+            if (sec1.len != std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.uncompressed_sec1_encoded_length or sec1[0] != 0x04) {
                 return error.MalformedKeyBlob;
             }
             _ = std.crypto.sign.ecdsa.EcdsaP384Sha384.PublicKey.fromSec1(sec1) catch {
@@ -336,7 +366,7 @@ fn validateKeyBlob(blob: []const u8, expected_kind: ?KeyKind) BlobValidationErro
             const curve = readString(blob, &position) orelse return error.MalformedKeyBlob;
             if (!std.mem.eql(u8, curve, ecdsa_curve_name)) return error.MalformedKeyBlob;
             const sec1 = readString(blob, &position) orelse return error.MalformedKeyBlob;
-            if (sec1.len != std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length) {
+            if (sec1.len != std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length or sec1[0] != 0x04) {
                 return error.MalformedKeyBlob;
             }
             _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(sec1) catch {
@@ -351,10 +381,13 @@ fn validateKeyBlob(blob: []const u8, expected_kind: ?KeyKind) BlobValidationErro
             }
             const exponent = trimMpint(exponent_encoded);
             const modulus = trimMpint(modulus_encoded);
-            if (exponent.len == 0 or exponent.len > 8 or modulus.len < 64 or modulus.len > 512) {
+            if (exponent.len == 0 or exponent.len > 8 or modulus.len < 256 or modulus.len > 512) {
                 return error.MalformedKeyBlob;
             }
             if ((exponent[exponent.len - 1] & 1) == 0 or (modulus[modulus.len - 1] & 1) == 0) {
+                return error.MalformedKeyBlob;
+            }
+            if (exponent.len == 1 and exponent[0] < 3) {
                 return error.MalformedKeyBlob;
             }
         },
@@ -482,18 +515,23 @@ test "authorized_keys parser rejects trailing public-key blob data" {
 }
 
 test "authorized_keys options and markers are explicitly unsupported" {
-    var result = try AuthorizedKeys.parse(
-        std.testing.allocator,
+    const cases = [_][]const u8{
         "from=\"192.0.2.1\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER\n",
-    );
-    switch (result) {
-        .invalid => |failure| {
-            try std.testing.expectEqual(ParseFailureReason.options_or_markers_unsupported, failure.reason);
-        },
-        .authorized_keys => |*keys| {
-            keys.deinit();
-            return error.TestUnexpectedResult;
-        },
+        "restrict ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER\n",
+        "no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER\n",
+        "@cert-authority *.example.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBERERERERERERERERERERERERERERERERERERERERER\n",
+    };
+    for (cases) |line| {
+        var result = try AuthorizedKeys.parse(std.testing.allocator, line);
+        switch (result) {
+            .invalid => |failure| {
+                try std.testing.expectEqual(ParseFailureReason.options_or_markers_unsupported, failure.reason);
+            },
+            .authorized_keys => |*keys| {
+                keys.deinit();
+                return error.TestUnexpectedResult;
+            },
+        }
     }
 }
 

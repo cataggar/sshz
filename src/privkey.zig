@@ -98,9 +98,12 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
         return PrivKeyError.BadPrivKey;
     }
 
-    if (std.mem.eql(u8, ciphername, "aes256-ctr")) {
+    const block_size: usize = if (std.mem.eql(u8, ciphername, "aes256-ctr")) blk: {
         if (std.mem.eql(u8, kdfname, "bcrypt")) {
             if (passphrase_opt) |passphrase| {
+                if (enc_section.len < 16 or enc_section.len % 16 != 0) {
+                    return PrivKeyError.BadPrivKey;
+                }
                 var buffer_kdfopt = BufferReader.init(kdfoptions_section);
                 const salt = try buffer_kdfopt.readU32LenString();
                 const rounds = try buffer_kdfopt.readU32();
@@ -130,20 +133,25 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
                 UNSAFE_TRACEDUMP(.Debug, "dec", .{}, dec[0..enc_section.len]);
                 // copy decrypted area over original encrypted
                 @memcpy(keydata_bin_buf[enc_section_off .. enc_section_off + enc_section.len], dec[0..enc_section.len]);
+                break :blk 16;
             } else {
                 return PrivKeyError.InvalidKeyDecrypt;
             }
         } else {
             return PrivKeyError.UnsupportedPrivKey;
         }
-    } else {
+    } else blk: {
         if (!std.mem.eql(u8, ciphername, "none")) {
             return PrivKeyError.UnsupportedPrivKey; // aes256-ctr/none are only options we support
         }
         if (!std.mem.eql(u8, kdfname, "none") or kdfoptions_section.len != 0) {
             return PrivKeyError.BadPrivKey;
         }
-    }
+        if (enc_section.len < 8 or enc_section.len % 8 != 0) {
+            return PrivKeyError.BadPrivKey;
+        }
+        break :blk 8;
+    };
 
     UNSAFE_TRACEDUMP(.Debug, "enc_section", .{}, enc_section);
     var encbuffer = BufferReader.init(enc_section);
@@ -163,9 +171,22 @@ pub fn decodeOpenSshPrivateKey(keydata_ascii: []const u8, passphrase_opt: ?[]con
 
     var private_key = try parsePrivateSectionKey(key_algo, &encbuffer);
     errdefer private_key.clear();
+
+    const comment = encbuffer.readU32LenString() catch return PrivKeyError.BadPrivKey;
+    _ = comment;
+
+    const pad = encbuffer.payload[encbuffer.off..];
+    if (pad.len >= block_size) return PrivKeyError.BadPrivKey;
+    for (pad, 0..) |b, i| {
+        if (b != @as(u8, @intCast(i + 1))) {
+            return PrivKeyError.BadPrivKey;
+        }
+    }
+
     private_key.validate() catch return PrivKeyError.BadPrivKey;
 
     var private_pubkey_blob: Key.Blob = .{};
+    defer private_pubkey_blob.clear();
     const generated_pubkey = try private_key.publicBlob(&private_pubkey_blob);
     if (!std.mem.eql(u8, generated_pubkey, pubkey)) {
         return PrivKeyError.BadPrivKey;
@@ -316,12 +337,13 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
         const curve = try encbuffer.readU32LenString();
         if (!std.mem.eql(u8, curve, Key.ecdsa_p256_curve_name)) return PrivKeyError.UnsupportedPrivKey;
         const sec1 = try encbuffer.readU32LenString();
-        if (sec1.len != std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length) {
+        if (sec1.len != std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.uncompressed_sec1_encoded_length or sec1[0] != 0x04) {
             return PrivKeyError.BadPrivKey;
         }
         const secret_mpint = try encbuffer.readU32LenString();
         var secret_scalar = try mpintToFixed(std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.encoded_length, secret_mpint);
         defer crypto.secureZero(u8, &secret_scalar);
+        _ = std.crypto.sign.ecdsa.EcdsaP256Sha256.PublicKey.fromSec1(sec1) catch return PrivKeyError.BadPrivKey;
         var secret_key = std.crypto.sign.ecdsa.EcdsaP256Sha256.SecretKey.fromBytes(secret_scalar) catch return PrivKeyError.BadPrivKey;
         defer crypto.secureZero(u8, std.mem.asBytes(&secret_key));
         var keypair = std.crypto.sign.ecdsa.EcdsaP256Sha256.KeyPair.fromSecretKey(secret_key) catch return PrivKeyError.BadPrivKey;
@@ -336,12 +358,12 @@ fn parsePrivateSectionKey(key_algo: []const u8, encbuffer: *BufferReader) PrivKe
     if (std.mem.eql(u8, key_algo, Key.rsa_key_name)) {
         var private_key: Key.PrivateKey = .{ .Rsa = .{} };
         errdefer private_key.clear();
-        try private_key.Rsa.n.set(try encbuffer.readU32LenString());
-        try private_key.Rsa.e.set(try encbuffer.readU32LenString());
-        try private_key.Rsa.d.set(try encbuffer.readU32LenString());
-        try private_key.Rsa.iqmp.set(try encbuffer.readU32LenString());
-        try private_key.Rsa.p.set(try encbuffer.readU32LenString());
-        try private_key.Rsa.q.set(try encbuffer.readU32LenString());
+        try private_key.Rsa.n.set(Key.parsePositiveMpint(try encbuffer.readU32LenString(), error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey);
+        try private_key.Rsa.e.set(Key.parsePositiveMpint(try encbuffer.readU32LenString(), error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey);
+        try private_key.Rsa.d.set(Key.parsePositiveMpint(try encbuffer.readU32LenString(), error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey);
+        try private_key.Rsa.iqmp.set(Key.parsePositiveMpint(try encbuffer.readU32LenString(), error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey);
+        try private_key.Rsa.p.set(Key.parsePositiveMpint(try encbuffer.readU32LenString(), error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey);
+        try private_key.Rsa.q.set(Key.parsePositiveMpint(try encbuffer.readU32LenString(), error.InvalidKeyBlob) catch return PrivKeyError.BadPrivKey);
         return private_key;
     }
 
@@ -793,4 +815,16 @@ test "decodeOpenSshPrivateKey bounds bcrypt rounds and validates unencrypted KDF
         .{b64_unenc},
     );
     try std.testing.expectError(PrivKeyError.BadPrivKey, decodeOpenSshPrivateKey(pem_unenc, null));
+
+    // Corrupted deterministic padding byte at the end of the private section must fail with BadPrivKey
+    var bad_pad_bin: [2048]u8 = undefined;
+    @memcpy(bad_pad_bin[0..unenc_bin.len], unenc_bin);
+    bad_pad_bin[unenc_bin.len - 1] ^= 0xff;
+    const b64_bad_pad = std.base64.standard.Encoder.encode(&b64_unenc_buf, bad_pad_bin[0..unenc_bin.len]);
+    const pem_bad_pad = try std.fmt.bufPrint(
+        &pem_unenc_buf,
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{s}\n-----END OPENSSH PRIVATE KEY-----\n",
+        .{b64_bad_pad},
+    );
+    try std.testing.expectError(PrivKeyError.BadPrivKey, decodeOpenSshPrivateKey(pem_bad_pad, null));
 }
