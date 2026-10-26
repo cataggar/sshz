@@ -24,6 +24,8 @@ const ChannelTable = @import("channel.zig").ChannelTable;
 const ChannelState = @import("channel.zig").ChannelState;
 const ChannelType = @import("channel.zig").ChannelType;
 const TcpipOpen = @import("channel.zig").TcpipOpen;
+const validateForwardingEndpoint = @import("channel.zig").validateForwardingEndpoint;
+const validateBindEndpoint = @import("channel.zig").validateBindEndpoint;
 
 const supported_auth_methods = "password,publickey";
 
@@ -390,8 +392,23 @@ pub const Session = struct {
         self.setIoSessionState(.Idle);
     }
 
+    fn canAcceptPeerRekey(self: *const Self) bool {
+        if (!self.session_id_established or self.is_rekeying or self.isPeerKexInProgress()) return false;
+        return switch (self.sessionState) {
+            .Init,
+            .KexInitRead,
+            .KexInitWrite,
+            .EcdhInitRead,
+            .EcdhReplyWrite,
+            .NewKeysWrite,
+            .NewKeysRead,
+            => false,
+            else => true,
+        };
+    }
+
     fn startPeerRekey(self: *Self) SshzError!void {
-        if (self.is_rekeying) return IoError.UnexpectedResponse;
+        if (!self.canAcceptPeerRekey()) return IoError.UnexpectedResponse;
         self.resetKexHasherForRekey();
         self.clearAndFreeOptional(&self.pending_server_kexinit);
         self.rekey_resume_state = self.sessionState;
@@ -912,6 +929,9 @@ pub const Session = struct {
         originator_host: []const u8,
         originator_port: u32,
     ) SshzError!u32 {
+        if (!validateForwardingEndpoint(connected_host, connected_port, originator_host, originator_port)) {
+            return IoError.InvalidChannelParameters;
+        }
         if (sshz.iostate_wr != .Idle or self.active_channel_id != null) {
             return IoError.cannotAcceptWrite;
         }
@@ -1495,6 +1515,9 @@ pub const Session = struct {
     pub fn acceptTcpipForward(self: *Self, sshz: *SshzServer, bound_port: u32) SshzError!void {
         const pending = self.pending_global_request orelse return IoError.UnexpectedResponse;
         if (pending.kind != .TcpipForward) return IoError.UnexpectedResponse;
+        if (pending.bind_port == 0 and (bound_port == 0 or bound_port > std.math.maxInt(u16))) {
+            return IoError.InvalidChannelParameters;
+        }
         if (pending.want_reply and sshz.iostate_wr != .Idle and !self.is_rekeying and !sshz.local_rekey_pending)
             return IoError.cannotAcceptWrite;
         self.pending_global_request = null;
@@ -1549,11 +1572,18 @@ pub const Session = struct {
     }
 
     fn readTcpipOpen(rdr: *BufferReader) SshzError!TcpipOpen {
+        const host = try rdr.readU32LenString();
+        const port = try rdr.readU32();
+        const originator_host = try rdr.readU32LenString();
+        const originator_port = try rdr.readU32();
+        if (!validateForwardingEndpoint(host, port, originator_host, originator_port)) {
+            return IoError.UnexpectedResponse;
+        }
         return .{
-            .host = try rdr.readU32LenString(),
-            .port = try rdr.readU32(),
-            .originator_host = try rdr.readU32LenString(),
-            .originator_port = try rdr.readU32(),
+            .host = host,
+            .port = port,
+            .originator_host = originator_host,
+            .originator_port = originator_port,
         };
     }
 
@@ -1617,6 +1647,16 @@ pub const Session = struct {
             return;
         };
         const tcpip_open = if (channel_type.hasTcpipOpenPayload()) try readTcpipOpen(rdr) else TcpipOpen{};
+        if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+        if (channel_type == .ForwardedTcpip) {
+            try self.sendChannelOpenFailure(
+                sshz,
+                remote_id,
+                SshOpenFailureReason.AdministrativelyProhibited,
+                "server does not accept forwarded-tcpip channel opens",
+            );
+            return;
+        }
 
         const chan = self.channel_table.allocChannel(remote_id, peer_window, max_packet_size) orelse {
             try self.sendChannelOpenFailure(
@@ -1642,6 +1682,12 @@ pub const Session = struct {
         const want_reply = try rdr.readBoolean();
 
         if (std.mem.eql(u8, request_name, "tcpip-forward") or std.mem.eql(u8, request_name, "cancel-tcpip-forward")) {
+            const bind_address = try rdr.readU32LenString();
+            const bind_port = try rdr.readU32();
+            if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
+            if (!validateBindEndpoint(bind_address, bind_port)) {
+                return IoError.UnexpectedResponse;
+            }
             if (self.pending_global_request != null) {
                 if (want_reply) {
                     try self.sendGlobalRequestFailure(sshz);
@@ -1651,8 +1697,6 @@ pub const Session = struct {
                 return;
             }
 
-            const bind_address = try rdr.readU32LenString();
-            const bind_port = try rdr.readU32();
             if (bind_address.len > self.pending_global_request_bind_address.len) {
                 return IoError.tooBig;
             }
@@ -1693,6 +1737,7 @@ pub const Session = struct {
         const sender = try rdr.readU32();
         const peer_window = try rdr.readU32();
         const max_packet_size = try rdr.readU32();
+        if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
         try self.validatePeerChannel(peer_window, max_packet_size);
         if (self.channel_table.findByLocalId(recipient)) |chan| {
             if (!chan.expectsOpenReply()) return IoError.UnexpectedResponse;
@@ -1726,6 +1771,7 @@ pub const Session = struct {
         const reason_code = try rdr.readU32();
         const description = try rdr.readU32LenString();
         _ = try rdr.readU32LenString(); // language tag
+        if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
 
         if (self.channel_table.findByLocalId(recipient)) |chan| {
             if (!chan.expectsOpenReply()) return IoError.UnexpectedResponse;
@@ -1790,6 +1836,10 @@ pub const Session = struct {
             msgid <= Protocol.connection_protocol_msgid_max and
             (!self.isAuthenticatedForConnectionProtocol() or self.isPeerKexInProgress()))
         {
+            return IoError.UnexpectedResponse;
+        }
+
+        if (msgid >= 50 and msgid <= 79 and (self.user_authenticated or self.isPeerKexInProgress())) {
             return IoError.UnexpectedResponse;
         }
 
@@ -1876,6 +1926,7 @@ pub const Session = struct {
             },
             @backingInt(Protocol.MsgId.SSH_MSG_NEWKEYS) => {
                 if (self.sessionState == .NewKeysRead) {
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     try self.activatePendingC2sKeys(sshz);
                     if (self.is_rekeying) {
                         const resume_state = self.rekey_resume_state orelse .ChannelActive;
@@ -1894,6 +1945,7 @@ pub const Session = struct {
             @backingInt(Protocol.MsgId.SSH_MSG_SERVICE_REQUEST) => {
                 if (self.sessionState == .AuthRead) {
                     const svcname = try rdr.readU32LenString();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     if (std.mem.eql(u8, svcname, "ssh-userauth")) {
                         self.setSessionState(.AuthRspServReqSuccess);
                         self.setIoSessionState(.Idle);
@@ -2045,7 +2097,7 @@ pub const Session = struct {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 };
-                if (!chan.canReceiveRequestPacket()) {
+                if (!chan.canReceiveRequestPacket() or chan.close_received) {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 }
@@ -2053,7 +2105,7 @@ pub const Session = struct {
                 const wantreply = try rdr.readBoolean();
                 if ((chan.kind != .Session or chan.channel_type != .Session) and isSessionChannelRequest(typ)) {
                     self.active_channel_id = chan.local_id;
-                    chan.state = if (wantreply) .RspFailureWrite else .Data;
+                    chan.state = if (wantreply and !chan.close_pending and !chan.close_sent) .RspFailureWrite else .Data;
                     self.resumeChannelActive();
                     self.setIoSessionState(.Idle);
                     return;
@@ -2083,25 +2135,30 @@ pub const Session = struct {
                     }
                 } else if (std.mem.eql(u8, typ, "shell")) {
                     // RFC 4254 §6.5 — interactive shell
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .ChannelRequest = .{ .channel = chan.local_id, .request = .Shell } }, .Idle);
                     if (!wantreply) return;
                 } else if (std.mem.eql(u8, typ, "exec")) {
                     // RFC 4254 §6.5 — single command execution
                     const command = try rdr.readU32LenString();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .ChannelRequest = .{ .channel = chan.local_id, .request = .{ .Exec = command } } }, .Idle);
                     if (!wantreply) return;
                 } else if (std.mem.eql(u8, typ, "subsystem")) {
                     // RFC 4254 §6.5 — named subsystem (e.g. sftp)
                     const subsystem = try rdr.readU32LenString();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .ChannelRequest = .{ .channel = chan.local_id, .request = .{ .Subsystem = subsystem } } }, .Idle);
                     if (!wantreply) return;
                 } else if (std.mem.eql(u8, typ, "env")) {
                     // RFC 4254 §6.4 — set environment variable
                     const name = try rdr.readU32LenString();
                     const value = try rdr.readU32LenString();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .ChannelRequest = .{ .channel = chan.local_id, .request = .{ .Env = .{ .name = name, .value = value } } } }, .Idle);
                     if (!wantreply) return;
                 } else if (std.mem.eql(u8, typ, Protocol.channel_request_auth_agent)) {
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .ChannelRequest = .{ .channel = chan.local_id, .request = .AgentForward } }, .Idle);
                     if (!wantreply) return;
                 } else if (std.mem.eql(u8, typ, "window-change")) {
@@ -2110,6 +2167,7 @@ pub const Session = struct {
                     const rows = try rdr.readU32();
                     const widthpx = try rdr.readU32();
                     const heightpx = try rdr.readU32();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .WindowChange = .{
                         .channel = chan.local_id,
                         .cols = cols,
@@ -2121,6 +2179,7 @@ pub const Session = struct {
                 } else if (std.mem.eql(u8, typ, "signal")) {
                     // RFC 4254 §6.9
                     const signal_name = try rdr.readU32LenString();
+                    if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                     sshz.requestEvent(.{ .Signal = .{ .channel = chan.local_id, .name = signal_name } }, .Idle);
                     return;
                 } else {
@@ -2130,7 +2189,7 @@ pub const Session = struct {
                     }
                 }
 
-                if (wantreply) {
+                if (wantreply and !chan.close_pending and !chan.close_sent) {
                     self.active_channel_id = chan.local_id;
                     chan.state = .RspWrite;
                     self.resumeChannelActive();
@@ -2141,23 +2200,26 @@ pub const Session = struct {
                     self.setIoSessionState(.Idle);
                 }
             },
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_SUCCESS),
+            @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_FAILURE),
+            => return IoError.UnexpectedResponse,
             @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA) => {
                 const channelnum = try rdr.readU32();
+                const s = try rdr.readU32LenString();
+                if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 const chan = self.channel_table.findByLocalId(channelnum) orelse {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 };
+                if (!chan.canReceiveDataPacket()) {
+                    return IoError.UnexpectedResponse;
+                }
                 if (chan.eof_received) {
                     // Peer sent EOF then data — protocol violation, silently discard
                     TRACE(.Debug, "discarding data after EOF on channel {d}", .{channelnum});
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 }
-                if (!chan.canReceiveDataPacket()) {
-                    return IoError.UnexpectedResponse;
-                }
-                const s = try rdr.readU32LenString();
-                if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 try chan.consumeReceivedData(s.len);
                 sshz.requestEvent(.{ .RxData = .{ .channel = chan.local_id, .data = s } }, .Idle);
                 chan.state = .Data;
@@ -2166,21 +2228,21 @@ pub const Session = struct {
             },
             @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_EXTENDED_DATA) => {
                 const channelnum = try rdr.readU32();
+                const data_type = try rdr.readU32();
+                const s = try rdr.readU32LenString();
+                if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 const chan = self.channel_table.findByLocalId(channelnum) orelse {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 };
+                if (!chan.canReceiveDataPacket()) {
+                    return IoError.UnexpectedResponse;
+                }
                 if (chan.eof_received) {
                     TRACE(.Debug, "discarding extended data after EOF on channel {d}", .{channelnum});
                     self.setIoSessionState(.ReadPktHdr);
                     return;
                 }
-                if (!chan.canReceiveDataPacket()) {
-                    return IoError.UnexpectedResponse;
-                }
-                const data_type = try rdr.readU32();
-                const s = try rdr.readU32LenString();
-                if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 try chan.consumeReceivedData(s.len);
                 sshz.requestEvent(.{ .RxExtendedData = .{ .channel = chan.local_id, .data_type = data_type, .data = s } }, .Idle);
                 chan.state = .Data;
@@ -2224,6 +2286,7 @@ pub const Session = struct {
             },
             @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_CLOSE) => {
                 const channelnum = try rdr.readU32();
+                if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 const chan = self.channel_table.findByLocalId(channelnum) orelse {
                     self.setIoSessionState(.ReadPktHdr);
                     return;
@@ -2283,8 +2346,9 @@ pub const Session = struct {
             @backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_WINDOW_ADJUST) => {
                 // RFC 4254 §5.2 - peer is granting more window
                 const channelnum = try rdr.readU32();
+                const bytes_to_add = try rdr.readU32();
+                if (rdr.off != rdr.payload.len) return IoError.UnexpectedResponse;
                 if (self.channel_table.findByLocalId(channelnum)) |chan| {
-                    const bytes_to_add = try rdr.readU32();
                     if (!chan.canReceiveWindowAdjustPacket()) return IoError.UnexpectedResponse;
                     try chan.adjustPeerWindow(bytes_to_add, self.limits.max_channel_window);
                     if (chan.write_buf_nbytes > 0) {
@@ -2293,12 +2357,13 @@ pub const Session = struct {
                         self.setIoSessionState(.Idle);
                         return;
                     }
-                } else {
-                    _ = try rdr.readU32();
                 }
                 self.setIoSessionState(.ReadPktHdr);
             },
             else => {
+                if (msgid >= 50 and msgid <= 79) {
+                    return IoError.UnexpectedResponse;
+                }
                 // unhandled packet type
                 TRACE(.Info, "Unhandled msg id={d}", .{msgid});
                 self.setIoSessionState(.ReadPktHdr); // read again
@@ -5134,4 +5199,119 @@ test "server rejects connection messages after peer KEXINIT and defers global re
     const out = try m.peek(Protocol.MaxSSHPacket);
     var rdr = BufferReader.init(unencryptedPayload(out));
     try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_REQUEST_FAILURE), try rdr.readU8());
+}
+
+test "server rejects trailing bytes on channel packets and guards channel states" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    const channel = try activeServerForTest(&m, 64, 32);
+    const chan = m.session.channel_table.findByLocalId(channel).?;
+    chan.eof_received = true;
+
+    // Trailing byte on CHANNEL_DATA must fail closed even when eof_received is true
+    {
+        var backing: [32]u8 = undefined;
+        var pw = BufferWriter.init(&backing, 0);
+        try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_DATA));
+        try pw.writeU32(channel);
+        try pw.writeU32LenString("abc");
+        try pw.writeU8(0xff);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
+
+    // Trailing byte on CHANNEL_CLOSE, CHANNEL_WINDOW_ADJUST, and CHANNEL_REQUEST ("shell") must fail closed
+    for ([_]Protocol.MsgId{ .SSH_MSG_CHANNEL_CLOSE, .SSH_MSG_CHANNEL_WINDOW_ADJUST }) |msg_id| {
+        var backing: [32]u8 = undefined;
+        var pw = BufferWriter.init(&backing, 0);
+        try pw.writeU8(@backingInt(msg_id));
+        try pw.writeU32(channel);
+        if (msg_id == .SSH_MSG_CHANNEL_WINDOW_ADJUST) try pw.writeU32(16);
+        try pw.writeU8(0xff);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
+    {
+        var backing: [32]u8 = undefined;
+        var pw = BufferWriter.init(&backing, 0);
+        try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_REQUEST));
+        try pw.writeU32(channel);
+        try pw.writeU32LenString("shell");
+        try pw.writeBoolean(true);
+        try pw.writeU8(0xff);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
+
+    // Unexpected CHANNEL_SUCCESS / CHANNEL_FAILURE on server is rejected
+    for ([_]Protocol.MsgId{ .SSH_MSG_CHANNEL_SUCCESS, .SSH_MSG_CHANNEL_FAILURE }) |msg_id| {
+        var backing: [16]u8 = undefined;
+        var pw = BufferWriter.init(&backing, 0);
+        try pw.writeU8(@backingInt(msg_id));
+        try pw.writeU32(channel);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
+}
+
+test "server validates forwarding endpoints and rejects inbound forwarded-tcpip open" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.Authenticated);
+    try std.testing.expectError(IoError.InvalidChannelParameters, m.openForwardedTcpipChannel("", 8080, "127.0.0.1", 12345));
+    try std.testing.expectError(IoError.InvalidChannelParameters, m.openForwardedTcpipChannel("127.0.0.1", 0, "127.0.0.1", 12345));
+    try std.testing.expectError(IoError.InvalidChannelParameters, m.openForwardedTcpipChannel("127.0.0.1", 8080, "127.0.0.1", 70000));
+
+    // Inbound forwarded-tcpip from client must be rejected with AdministrativelyProhibited
+    var open_backing: [128]u8 = undefined;
+    var pw = BufferWriter.init(&open_backing, 0);
+    try pw.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN));
+    try pw.writeU32LenString("forwarded-tcpip");
+    try pw.writeU32(99);
+    try pw.writeU32(32768);
+    try pw.writeU32(4096);
+    try pw.writeU32LenString("127.0.0.1");
+    try pw.writeU32(8080);
+    try pw.writeU32LenString("10.0.0.1");
+    try pw.writeU32(54321);
+    const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+    try m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m);
+    try m.advance();
+
+    const out = try m.peek(Protocol.MaxSSHPacket);
+    var rdr = BufferReader.init(unencryptedPayload(out));
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_CHANNEL_OPEN_FAILURE), try rdr.readU8());
+    try std.testing.expectEqual(@as(u32, 99), try rdr.readU32());
+    try std.testing.expectEqual(SshOpenFailureReason.AdministrativelyProhibited, try rdr.readU32());
+}
+
+test "server rejects post-auth userauth messages and premature peer KEXINIT during initial handshake" {
+    var prng = std.Random.DefaultPrng.init(42);
+    var m = try SshzServer.init(prng.random(), @import("privkey.zig").testkey_valid, std.testing.allocator);
+    defer m.deinit();
+
+    // Peer KEXINIT during NewKeysRead before initial KEX finishes is rejected
+    m.session.session_id_established = true;
+    m.session.setSessionState(.NewKeysRead);
+    try std.testing.expectError(IoError.UnexpectedResponse, m.session.startPeerRekey());
+
+    // Post-auth userauth messages (50..79) are rejected
+    m.session.user_authenticated = true;
+    m.session.setSessionState(.ChannelActive);
+    for ([_]u8{
+        @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_REQUEST),
+        @backingInt(Protocol.MsgId.SSH_MSG_USERAUTH_INFO_RESPONSE),
+        79,
+    }) |msgid| {
+        var backing: [16]u8 = undefined;
+        var pw = BufferWriter.init(&backing, 0);
+        try pw.writeU8(msgid);
+        const pkt_len = buildUnencryptedPacket(&m.iobuf_rd, pw.active());
+        try std.testing.expectError(IoError.UnexpectedResponse, m.session.handlePacket(m.iobuf_rd[0..pkt_len], &m));
+    }
 }
