@@ -530,3 +530,60 @@ test "peer rekey received during OPEN retains serialized KEX write continuations
         try std.testing.expectEqual(.OpenSent, fixture.endpoint.session.channel_table.findByLocalId(opened).?.state);
     }
 }
+
+test "peer KEXINIT clears local_rekey_pending and channelWriteComplete advances local rekey" {
+    inline for (.{ Open.session, Open.forwarded }) |opening| {
+        var prng = std.Random.DefaultPrng.init(920);
+        var fixture: Fixture(opening) = undefined;
+        try fixture.init(prng.random());
+        defer fixture.deinit();
+        try fixture.warmup();
+
+        // Set threshold so the inbound KEXINIT packet itself crosses rekey_after_encrypted_packets.
+        fixture.endpoint.limits.key_lifetime.rekey_after_encrypted_packets = 5;
+        var payload: [2048]u8 = undefined;
+        var writer = BufferWriter.init(&payload, 0);
+        try writer.writeU8(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT));
+        try writer.writeBytes(&@as([16]u8, @splat(0)));
+        const offers = Protocol.localAlgorithmOffers(@import("key.zig").client_hostkey_algorithms);
+        inline for (@typeInfo(Protocol.AlgorithmOffers).@"struct".field_names) |name| {
+            try writer.writeU32LenString(@field(offers, name));
+        }
+        try writer.writeU32LenString("");
+        try writer.writeU32LenString("");
+        try writer.writeBoolean(false);
+        try writer.writeU32(0);
+
+        try fixture.feed(try fixture.packet(writer.active()));
+        _ = try fixture.drain(Protocol.MaxSSHPacket);
+        var response = try fixture.readOutput();
+        try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT), try response.readU8());
+        try std.testing.expect(fixture.endpoint.session.is_rekeying);
+        try std.testing.expect(!fixture.endpoint.local_rekey_pending);
+        const status = fixture.endpoint.keyLifetimeStatus();
+        try std.testing.expect(status.rekey_in_progress);
+        try std.testing.expect(!status.local_rekey_pending);
+    }
+
+    var prng = std.Random.DefaultPrng.init(921);
+    var fixture: Fixture(.session) = undefined;
+    try fixture.init(prng.random());
+    defer fixture.deinit();
+    try fixture.warmup();
+
+    // Arm an uncommitted header read via getNextEvent(), then trigger local rekey on channelWriteComplete.
+    const ready_before = try fixture.endpoint.getNextEvent();
+    try std.testing.expect(ready_before == .ReadyToConsume);
+    fixture.endpoint.limits.key_lifetime.rekey_after_encrypted_packets = 4;
+
+    const write_buf = try fixture.endpoint.getChannelWriteBuffer(fixture.channel);
+    @memcpy(write_buf[0..4], "ping");
+    try fixture.endpoint.channelWriteComplete(fixture.channel, 4);
+
+    try std.testing.expect(fixture.endpoint.session.is_rekeying);
+    try std.testing.expect(!fixture.endpoint.local_rekey_pending);
+    try std.testing.expect(fixture.endpoint.iostate_wr == .Active);
+    _ = try fixture.drain(Protocol.MaxSSHPacket);
+    var kex = try fixture.readOutput();
+    try std.testing.expectEqual(@backingInt(Protocol.MsgId.SSH_MSG_KEXINIT), try kex.readU8());
+}
